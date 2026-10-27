@@ -50,6 +50,7 @@ nav:
     - Online Competition: challenge/online_competition.md
   - Planning:
     - Fast Re-planning: planning/fast_replanning.md
+    - Incremental Re-planning: planning/incremental_replanning.md
   - Python API:
     - Control:
       - control/index.md
