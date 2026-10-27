@@ -215,6 +215,9 @@ python scripts/debug_run.py --config level1.toml --controller my_controller.py
 # several episodes with a success rate and mean time
 python scripts/debug_run.py --config level1.toml --controller my_controller.py --n_runs 10
 
+# what the drone can actually do: lines, circles, corners and lateral steps, measured
+python scripts/characterize.py
+
 # rendered flight (the configs enable the GUI by default)
 python scripts/sim.py --config level0.toml
 

@@ -60,6 +60,8 @@ nav:
       - control.path_planning: control/path_planning.md
       - control.astar: control/astar.md
       - control.my_controller: control/my_controller.md
+      - control.scenario_path: control/scenario_path.md
+      - Characterisation: control/characterisation.md
     - Environments:
       - envs/index.md
       - envs.drone_race: envs/drone_race.md

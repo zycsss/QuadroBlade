@@ -51,6 +51,7 @@ from scipy.spatial.transform import Rotation as R
 from lsy_drone_racing.control import Controller
 from lsy_drone_racing.control.path_planning import (
     ArcPath,
+    PathInfo,
     PathPlanner,
     path_config_from,
     track_reference,
@@ -437,6 +438,7 @@ class MPCCController(Controller):
             config: The configuration of the environment.
         """
         super().__init__(obs, info, config)
+        self._config = config
         self._freq = float(config.env.freq)
         # The strict gate handling (straight passages, gate-frame avoidance, slower gate approach,
         # strong gate centring) only pays off when the gate poses are randomized: it costs lap time,
@@ -488,16 +490,28 @@ class MPCCController(Controller):
 
     # region lifecycle
 
-    def _init_episode(self, obs: dict[str, NDArray[np.floating]]):
-        """Plan the path and reset all controller memory for a new episode."""
+    def _init_episode(self, obs: dict[str, NDArray[np.floating]], reason: str = "episode start"):
+        """Plan the path and reset all controller memory for a new episode.
+
+        Args:
+            obs: The current observation.
+            reason: What to record as the reason for the path in the plan log.
+        """
         self._plan_origin = np.asarray(obs["pos"], dtype=float).copy()
-        self._path, info = self._planner.plan(obs, self._plan_origin)
-        self._path_info = info
-        self._gate_centers = info.gate_centers
-        self._obstacles = info.obstacles
-        self._draw_points = self._path.pos(np.linspace(0.0, self._path.length, 200))
-        self._build_speed_limit()
-        self._apply_progress_bound()
+        path, info = self._planner.plan(obs, self._plan_origin)
+        self._install_path(path, info)
+        self._reset_state(obs, reason)
+
+    def _reset_state(self, obs: dict[str, NDArray[np.floating]], reason: str):
+        """Reset all per-episode controller memory once a path is installed.
+
+        Split out of [MPCCController._init_episode][] so a controller that supplies its own path
+        (the scenario controller) resets exactly the same state in exactly the same order.
+
+        Args:
+            obs: The current observation.
+            reason: What to record as the reason for the path in the plan log.
+        """
         self._seed_visited_flags(obs)
         self._reproject_wide = False
         self._projection_window = (-0.15, 0.6)
@@ -520,7 +534,40 @@ class MPCCController(Controller):
         self._needs_plan = False
         self._solver.reset()
         # Last, so the entry sees the reset progress and tick, not the previous episode's.
-        self._record_plan("episode start", obs)
+        self._record_plan(reason, obs)
+
+    def _install_path(self, path: ArcPath, info: PathInfo):
+        """Make a path the active reference and rebuild everything that depends on it.
+
+        Shared by the race planner and by a scenario controller that injects an analytic path
+        instead of planning one, so both go through exactly the same reference machinery.
+
+        Args:
+            path: The path to follow.
+            info: Its metadata, holding the gate centres and obstacles the reference weights use.
+        """
+        self._path = path
+        self._path_info = info
+        self._gate_centers = info.gate_centers
+        self._obstacles = info.obstacles
+        self._draw_points = path.pos(np.linspace(0.0, path.length, 200))
+        self._build_speed_limit()
+        self._apply_progress_bound()
+
+    def _reference(
+        self, thetas: NDArray[np.floating]
+    ) -> tuple[NDArray[np.floating], NDArray[np.floating], NDArray[np.floating]]:
+        """Evaluate the per-stage reference for a set of path progress values.
+
+        Args:
+            thetas: Arc length parameters, shape ``(n, )``.
+
+        Returns:
+            The reference positions ``(n, 3)``, unit tangents ``(n, 3)`` and contouring weights
+            ``(n, )``, all as used by the MPCC stage parameters.
+        """
+        assert self._path is not None
+        return track_reference(self._path, thetas, self._gate_centers, self._obstacles)
 
     def _record_plan(self, reason: str, obs: dict[str, NDArray[np.floating]]):
         """Append the plan that is now active to the plan log.
@@ -636,13 +683,7 @@ class MPCCController(Controller):
             reason: Why the path is re-planned, recorded in the plan log.
         """
         path, info = self._planner.plan(obs, self._plan_origin)
-        self._path = path
-        self._path_info = info
-        self._gate_centers = info.gate_centers
-        self._obstacles = info.obstacles
-        self._draw_points = path.pos(np.linspace(0.0, path.length, 200))
-        self._build_speed_limit()
-        self._apply_progress_bound()
+        self._install_path(path, info)
         self._reproject_wide = True
         self._slowdown_until = self._tick + int(round(self._mpcc.replan_slowdown_time * self._freq))
         self.replans += 1
@@ -771,9 +812,7 @@ class MPCCController(Controller):
         """
         cfg = self._mpcc
         assert self._path is not None
-        _, _, weight = track_reference(
-            self._path, np.array([theta]), self._gate_centers, self._obstacles
-        )
+        _, _, weight = self._reference(np.array([theta]))
         speed = cfg.mu_speed / (2.0 * (cfg.w_speed_gate * float(weight[0]) + cfg.r_vtheta))
         speed = min(speed, speed_actual + cfg.v_lead)
         speed = min(speed, float(np.interp(theta, self._speed_grid, self._speed_limit)))
@@ -850,9 +889,7 @@ class MPCCController(Controller):
         thetas = np.clip(
             theta + np.arange(self._mpcc.N + 1) * self._mpcc.dt * speed, 0.0, self._path.length
         )
-        positions, tangents, weights = track_reference(
-            self._path, thetas, self._gate_centers, self._obstacles
-        )
+        positions, tangents, weights = self._reference(thetas)
         self._horizon_points = positions
         for k in range(self._mpcc.N + 1):
             params = np.concatenate((positions[k], tangents[k], [weights[k]]))
