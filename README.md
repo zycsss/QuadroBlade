@@ -180,6 +180,30 @@ halves the reference speed for that long each time. The gate margins only tighte
 fast setting (tightest pass 9.7 cm against the 20 cm half opening), so the speed is not being bought
 with accuracy. All four knobs live in the `[controller]` section of the config file.
 
+**Run logs.** `debug_run.py` writes one `.npz` plus a `.json` summary per episode into `logs/`
+(gitignored; `--no-log` disables it, `--log_dir` moves it). The `.npz` holds, per control step:
+`t`, `pos`, `vel`, `acc`, `quat`, `ang_vel`, the applied attitude command `des`, `speed`, `n` (gates
+passed), and the controller's own `theta`, `v_ref`, `solver_ms`, `solver_status`, `mass_ratio`,
+`replans`, `thrust`, `roll_cmd`, `pitch_cmd`, `yaw_cmd`. Acceleration is a finite difference of the
+recorded velocity, because the environment does not observe it. The track is stored too, both nominal
+(`gates_pos`, `obstacles_pos`) and the pose the drone actually faced (`true_gates_pos`,
+`true_obstacles_pos`).
+
+Every path the controller committed to is stored as `plan_*`: `plan_t`, `plan_tick`, `plan_reason`
+(`episode start`, or which objects moved and by how much), `plan_drone_pos`, `plan_theta`,
+`plan_length`, `plan_n_waypoints`, and `plan_points` with 200 samples of the path itself. The
+per-step `replans` counter is the index of the active plan, so a run can be replayed against the plan
+that was in force at any moment.
+
+```python
+import numpy as np
+
+log = np.load("logs/level2_my_controller_seed0.npz")
+print(log["plan_reason"])         # e.g. "re-plan: gate 1 moved 11.6 cm"
+print(log["solver_ms"].mean())    # MPCC solve time, and .max() for the worst step
+print(log["plan_points"][3])      # the fourth path it committed to, 200 x 3
+```
+
 ```bash
 # headless flight with a per-episode verdict and the flown trajectory, coloured by speed
 python scripts/debug_run.py --config level1.toml --controller my_controller.py

@@ -173,7 +173,17 @@ def run_episode(
     bounds_low = np.asarray(env.unwrapped.data.pos_limit_low, dtype=float)
     bounds_high = np.asarray(env.unwrapped.data.pos_limit_high, dtype=float)
 
-    rec: dict[str, list] = {"t": [], "pos": [], "vel": [], "des": [], "n": [], "speed": []}
+    rec: dict[str, list] = {
+        "t": [],
+        "pos": [],
+        "vel": [],
+        "quat": [],
+        "ang_vel": [],
+        "des": [],
+        "n": [],
+        "speed": [],
+    }
+    diag: list[dict[str, float]] = []
     n_steps = 0
     terminated = truncated = stopped = False
     try:
@@ -183,11 +193,18 @@ def run_episode(
             rec["t"].append(n_steps / config.env.freq)
             rec["pos"].append(pos)
             rec["vel"].append(vel)
+            rec["quat"].append(np.asarray(obs["quat"], dtype=float))
+            rec["ang_vel"].append(np.asarray(obs["ang_vel"], dtype=float))
             rec["n"].append(int(obs["n_gates_passed"]))
             rec["speed"].append(float(np.linalg.norm(vel)))
 
             action = np.asarray(controller.compute_control(obs, info), dtype=float)
             rec["des"].append(action[:3].copy())
+            # Whatever the controller exposes about its own step, e.g. path progress, reference
+            # speed, solve time and solver status. Optional, so other controllers still work.
+            step_diagnostics = getattr(controller, "diagnostics", None)
+            if step_diagnostics is not None:
+                diag.append(dict(step_diagnostics()))
             obs, reward, terminated, truncated, info = env.step(action)
             finished = controller.step_callback(action, obs, reward, terminated, truncated, info)
             n_steps += 1
@@ -204,9 +221,19 @@ def run_episode(
 
     rec["pos"] = np.array(rec["pos"])
     rec["vel"] = np.array(rec["vel"])
+    rec["quat"] = np.array(rec["quat"])
+    rec["ang_vel"] = np.array(rec["ang_vel"])
     rec["des"] = np.array(rec["des"])
     rec["n"] = np.array(rec["n"])
     rec["speed"] = np.array(rec["speed"])
+    rec["t"] = np.array(rec["t"])
+    # The environment only reports position and velocity, so the acceleration is a finite difference
+    # of the recorded velocity at the control rate.
+    rec["acc"] = (
+        np.gradient(rec["vel"], rec["t"], axis=0) if len(rec["t"]) > 1 else np.zeros((0, 3))
+    )
+    for key in diag[0] if diag else ():
+        rec[key] = np.array([entry[key] for entry in diag])
 
     n_final = int(np.asarray(obs["n_gates_passed"]))
     if stopped and n_final < len(gate_sequence):
@@ -256,6 +283,8 @@ def run_episode(
         # randomized track. The controller only learns them within the sensor range.
         "true_gates_pos": np.asarray(env.unwrapped.data.gates_pos[0], dtype=float),
         "true_obstacles_pos": np.asarray(env.unwrapped.data.obstacles_pos[0], dtype=float),
+        # Every path the controller committed to, with when, where and why.
+        "plan_log": list(getattr(controller, "plan_log", [])),
         "record": rec,
         "gates_pos": gates_pos,
         "gates_quat": gates_quat,
@@ -264,6 +293,74 @@ def run_episode(
         "bounds_low": bounds_low,
         "bounds_high": bounds_high,
     }
+
+
+def write_log(ep: dict[str, Any], out_path: Path, meta: dict[str, Any]) -> Path:
+    """Write the recorded time series of an episode to ``.npz`` next to a ``.json`` summary.
+
+    The arrays hold per control step: time, position, velocity, acceleration (a finite difference of
+    the recorded velocity, since acceleration is not observed), attitude, angular rate, the applied
+    attitude command, the achieved speed, the number of gates passed, and whatever the controller
+    reports through its ``diagnostics``. Every path the controller committed to is stored separately
+    as ``plan_*`` arrays, with the time, tick, reason, drone position, path progress and 200 samples
+    of the path itself, so a run can be replayed against the plan that was active at any step. The
+    controller's ``replans`` counter is the index of the active plan.
+
+    Args:
+        ep: The episode record returned by `run_episode`.
+        out_path: Path of the ``.npz``. The summary is written next to it with a ``.json`` suffix.
+        meta: Extra metadata for the summary, e.g. config, controller file and seed.
+
+    Returns:
+        The path of the written ``.npz``.
+    """
+    import json
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    rec = ep["record"]
+    arrays: dict[str, Any] = {key: np.asarray(value) for key, value in rec.items()}
+    arrays.update(
+        {
+            "gates_pos": ep["gates_pos"],
+            "gates_quat": ep["gates_quat"],
+            "obstacles_pos": ep["obstacles_pos"],
+            "true_gates_pos": ep["true_gates_pos"],
+            "true_obstacles_pos": ep["true_obstacles_pos"],
+            "gate_sequence": ep["gate_sequence"],
+            "bounds_low": ep["bounds_low"],
+            "bounds_high": ep["bounds_high"],
+        }
+    )
+    plans = ep["plan_log"]
+    arrays["plan_reason"] = np.array([plan["reason"] for plan in plans], dtype="<U120")
+    for key in ("t", "tick", "theta", "length", "n_waypoints"):
+        arrays[f"plan_{key}"] = np.array([plan[key] for plan in plans], dtype=float)
+    arrays["plan_drone_pos"] = np.array([plan["drone_pos"] for plan in plans], dtype=float)
+    arrays["plan_points"] = np.array([plan["points"] for plan in plans], dtype=float)
+    np.savez_compressed(out_path, **arrays)
+
+    solver_ms = rec.get("solver_ms", np.zeros(0))
+    summary = {
+        **meta,
+        "verdict": ep["verdict"],
+        "detail": ep["detail"],
+        "sim_time": ep["sim_time"],
+        "steps": ep["steps"],
+        "n_final": ep["n_final"],
+        "n_required": ep["n_required"],
+        "crossings": ep["crossings"],
+        "n_plans": len(plans),
+        "plan_reasons": [plan["reason"] for plan in plans],
+        "solver_ms_mean": float(np.mean(solver_ms)) if len(solver_ms) else None,
+        "solver_ms_p95": float(np.percentile(solver_ms, 95)) if len(solver_ms) else None,
+        "solver_failures": int(np.sum(np.asarray(rec.get("solver_status", [0])) != 0)),
+        "speed_max": float(np.max(rec["speed"])) if len(rec["speed"]) else None,
+        "acc_max": float(np.max(np.linalg.norm(rec["acc"], axis=1))) if len(rec["acc"]) else None,
+        "arrays": sorted(arrays),
+    }
+    (out_path.with_suffix(".json")).write_text(json.dumps(summary, indent=2, default=float))
+    return out_path
 
 
 def plot_episode(ep: dict[str, Any], out_path: Path, title: str, config: Any) -> None:
@@ -339,6 +436,8 @@ def main(
     seed: int = 0,
     plot: bool = True,
     out_dir: str = "plots",
+    log: bool = True,
+    log_dir: str = "logs",
     verbose: bool = True,
     device: str = "cpu",
     control_mode: str | None = None,
@@ -353,6 +452,8 @@ def main(
         seed: Base random seed. Episode ``i`` uses ``seed + i``.
         plot: Whether to write a PNG per episode.
         out_dir: Directory for plots (``plots/`` is gitignored).
+        log: Whether to write an ``.npz`` of the run and a ``.json`` summary per episode.
+        log_dir: Directory for those logs (``logs/`` is gitignored).
         verbose: Print per-gate-pass margins.
         device: ``"cpu"`` or ``"gpu"``. The environment defaults to CPU and the TOML config cannot
             change this, so it must be requested explicitly.
@@ -388,6 +489,26 @@ def main(
             out = Path(out_dir) / f"{stem}.png"
             plot_episode(ep, out, f"{config_path.stem} / {controller_file} / seed {ep_seed}", cfg)
             print(f"          plot -> {out}")
+        if log:
+            stem = f"{config_path.stem}_{Path(controller_file).stem}_seed{ep_seed}"
+            written = write_log(
+                ep,
+                Path(log_dir) / f"{stem}.npz",
+                {
+                    "config": config,
+                    "controller": controller_file,
+                    "seed": ep_seed,
+                    "device": device,
+                    "control_mode": cfg.env.control_mode,
+                },
+            )
+            solver_ms = ep["record"].get("solver_ms", np.zeros(0))
+            print(
+                f"          log  -> {written}  ({len(ep['plan_log'])} plans, "
+                f"{len(ep['record']['t'])} steps, solver "
+                + (f"{np.mean(solver_ms):.1f} ms mean" if len(solver_ms) else "n/a")
+                + ")"
+            )
 
     n_ok = sum(ep["verdict"] == "FINISHED" for ep in results)
     times = [ep["sim_time"] for ep in results if ep["verdict"] == "FINISHED"]

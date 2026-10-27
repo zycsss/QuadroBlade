@@ -492,6 +492,7 @@ class MPCCController(Controller):
         """Plan the path and reset all controller memory for a new episode."""
         self._plan_origin = np.asarray(obs["pos"], dtype=float).copy()
         self._path, info = self._planner.plan(obs, self._plan_origin)
+        self._path_info = info
         self._gate_centers = info.gate_centers
         self._obstacles = info.obstacles
         self._draw_points = self._path.pos(np.linspace(0.0, self._path.length, 200))
@@ -502,6 +503,8 @@ class MPCCController(Controller):
         self._projection_window = (-0.15, 0.6)
         self._slowdown_until = 0
         self.replans = 0
+        self.plan_log: list[dict[str, object]] = []
+        self._last_v_ref = 0.0
         self._last_f_col = self._hover_thrust
         self._last_f_cmd = self._hover_thrust
         self._last_rpy_cmd = np.zeros(3)
@@ -516,6 +519,54 @@ class MPCCController(Controller):
         self._stall_reported = False
         self._needs_plan = False
         self._solver.reset()
+        # Last, so the entry sees the reset progress and tick, not the previous episode's.
+        self._record_plan("episode start", obs)
+
+    def _record_plan(self, reason: str, obs: dict[str, NDArray[np.floating]]):
+        """Append the plan that is now active to the plan log.
+
+        The log is what makes a run analysable after the fact: it holds every path the controller
+        committed to, when it did so, where the drone was, and what triggered it.
+
+        Args:
+            reason: Why the path was planned, e.g. ``"episode start"`` or the objects that moved.
+            obs: The observation the plan was made from.
+        """
+        assert self._path is not None
+        self.plan_log.append(
+            {
+                "tick": self._tick,
+                "t": self._tick / self._freq,
+                "reason": reason,
+                "drone_pos": np.asarray(obs["pos"], dtype=float).copy(),
+                "theta": float(self._theta),
+                "length": float(self._path.length),
+                "n_waypoints": int(len(self._path_info.waypoints)),
+                "points": np.asarray(self._draw_points, dtype=float).copy(),
+            }
+        )
+
+    def diagnostics(self) -> dict[str, float]:
+        """Return the controller's per-step state for logging.
+
+        Returns:
+            One entry per logged quantity: path progress ``theta``, the reference speed the
+            controller asked for, the solve time in milliseconds, the solver status, the online mass
+            estimate as a ratio of the nominal mass, the number of re-plans so far, and the command
+            that was applied.
+        """
+        return {
+            "theta": float(self._theta),
+            "v_ref": float(self._last_v_ref),
+            "solver_ms": float(self.solve_time) * 1e3,
+            "solver_status": float(self.status),
+            "mass_ratio": float(self._mass_ratio),
+            "replans": float(self.replans),
+            "thrust": float(self._last_f_cmd),
+            "roll_cmd": float(self._last_rpy_cmd[0]),
+            "pitch_cmd": float(self._last_rpy_cmd[1]),
+            "yaw_cmd": float(self._last_rpy_cmd[2]),
+        }
 
     def _seed_visited_flags(self, obs: dict[str, NDArray[np.floating]]):
         """Initialize the reveal latch from the current observation.
@@ -532,8 +583,8 @@ class MPCCController(Controller):
         self._last_gates_pos = np.asarray(obs["gates_pos"], dtype=float).copy()
         self._last_obstacles_pos = np.asarray(obs["obstacles_pos"], dtype=float).copy()
 
-    def _track_info_changed(self, obs: dict[str, NDArray[np.floating]]) -> bool:
-        """Return whether the observed gate or obstacle poses changed since the previous step.
+    def _track_info_changed(self, obs: dict[str, NDArray[np.floating]]) -> list[str]:
+        """Describe how the observed gate or obstacle poses changed since the previous step.
 
         The environment reports nominal poses until the drone comes within the sensor range and the
         true pose afterwards, so a change of the observed pose is exactly the moment at which more
@@ -546,7 +597,8 @@ class MPCCController(Controller):
             obs: The current observation.
 
         Returns:
-            ``True`` if at least one observed gate or obstacle pose changed in this step.
+            One human readable entry per changed object, empty if nothing changed. A non-empty list
+            is truthy, so the caller can still use it as a condition.
         """
         gates = np.asarray(obs["gates_pos"], dtype=float)
         obstacles = np.asarray(obs["obstacles_pos"], dtype=float)
@@ -561,12 +613,17 @@ class MPCCController(Controller):
         self._last_obstacles_pos = obstacles.copy()
         self._last_gate_flags, self._last_obstacle_flags = gates_visited, obstacles_visited
         if gates.shape != previous_gates.shape or obstacles.shape != previous_obstacles.shape:
-            return False
-        gate_changed = float(np.max(np.abs(gates - previous_gates), initial=0.0)) > 1e-6
-        obstacle_changed = float(np.max(np.abs(obstacles - previous_obstacles), initial=0.0)) > 1e-6
-        return bool(gate_changed or obstacle_changed)
+            return []
+        changes = []
+        for gate_id, shift in enumerate(np.linalg.norm(gates - previous_gates, axis=1)):
+            if shift > 1e-6:
+                changes.append(f"gate {gate_id} moved {shift * 100:.1f} cm")
+        for pole_id, shift in enumerate(np.linalg.norm(obstacles - previous_obstacles, axis=1)):
+            if shift > 1e-6:
+                changes.append(f"pole {pole_id} moved {shift * 100:.1f} cm")
+        return changes
 
-    def _replan(self, obs: dict[str, NDArray[np.floating]]):
+    def _replan(self, obs: dict[str, NDArray[np.floating]], reason: str = "sensor update"):
         """Re-plan the path with the newly revealed gate and obstacle poses.
 
         Only the path reference changes: the optimal control problem and its solver are untouched,
@@ -576,9 +633,11 @@ class MPCCController(Controller):
 
         Args:
             obs: The current observation.
+            reason: Why the path is re-planned, recorded in the plan log.
         """
         path, info = self._planner.plan(obs, self._plan_origin)
         self._path = path
+        self._path_info = info
         self._gate_centers = info.gate_centers
         self._obstacles = info.obstacles
         self._draw_points = path.pos(np.linspace(0.0, path.length, 200))
@@ -587,6 +646,7 @@ class MPCCController(Controller):
         self._reproject_wide = True
         self._slowdown_until = self._tick + int(round(self._mpcc.replan_slowdown_time * self._freq))
         self.replans += 1
+        self._record_plan(f"re-plan: {reason}", obs)
         logger.info(
             "Re-planned path after sensor update: %.2f m (replan %d)", path.length, self.replans
         )
@@ -781,10 +841,12 @@ class MPCCController(Controller):
 
         pos = np.asarray(obs["pos"], dtype=float)
         self._update_mass_estimate(obs)
-        if self._track_info_changed(obs):
-            self._replan(obs)
+        changes = self._track_info_changed(obs)
+        if changes:
+            self._replan(obs, ", ".join(changes))
         theta = self._progress(pos)
         speed = self._reference_speed(theta, float(np.linalg.norm(np.asarray(obs["vel"], float))))
+        self._last_v_ref = float(speed)
         thetas = np.clip(
             theta + np.arange(self._mpcc.N + 1) * self._mpcc.dt * speed, 0.0, self._path.length
         )
