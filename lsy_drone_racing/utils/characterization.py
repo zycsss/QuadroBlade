@@ -292,7 +292,7 @@ def run_scenario(
 
     Args:
         spec: The scenario specification.
-        config: The loaded race configuration for ``config/scenario.toml``. Mutated per run.
+        config: The loaded configuration for ``scenarios/characterisation.toml``. Mutated per run.
         seed: Environment seed.
         device: ``"cpu"`` or ``"gpu"``.
         verbose: Print the step where the environment ends the run unexpectedly.

@@ -90,9 +90,12 @@ Consequences for everything below:
   scratch config rather than a race config.
 - The `PathConfig` defaults (`use_astar = True`, `safety_distance = 0.15`) carry the planner settings,
   so A* needs no config edit either.
-- New files are not compared, because they have no reference line count. `config/scenario.toml` is
-  ours and fine on that basis; if a future submission complains about the directory listing rather
-  than a specific file, move it out of `config/`.
+- Our own configs live outside `config/` for the same reason: `scenarios/characterisation.toml` is the
+  deterministic arena the characterisation runs in, and it is nowhere near the provided files.
+  `config/` now contains only provided configs.
+- The permitted edits are exactly two keys per file: `controller.file` and `env.control_mode`. Audit
+  any submission with `git diff --stat <baseline> HEAD -- config/`, which must show no provided
+  config at all.
 
 Verified after the restore: level 2 seeds 0-19 still give **13/20 at 8.17 s**, so moving the tuning
 changed no behaviour.

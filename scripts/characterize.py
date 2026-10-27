@@ -99,7 +99,7 @@ def main(
         device: ``"cpu"`` or ``"gpu"``.
         verbose: Print each scenario as it finishes.
     """
-    config = load_config(REPO_ROOT / "config" / "scenario.toml")
+    config = load_config(REPO_ROOT / "scenarios" / "characterisation.toml")
     matrix = default_matrix()
     if only:
         matrix = [spec for spec in matrix if only in spec]
@@ -130,7 +130,7 @@ def main(
                 f"v={metrics['speed_mean']:4.2f} "
                 f"err={metrics['tracking_rms'] * 1000:5.1f}mm "
                 f"a={metrics['a_lat_mean']:4.1f} "
-                f"tilt={metrics['tilt_max']:4.1f}deg "
+                f"tilt={metrics['tilt_cruise']:4.1f}deg "
                 f"-> {figure.name}"
             )
 
