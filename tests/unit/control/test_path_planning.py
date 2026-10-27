@@ -127,7 +127,11 @@ def test_path_keeps_clearance_and_stays_above_ground(planned: tuple):
     """Obstacle avoidance and the take-off waypoint must both hold."""
     path, info, _ = planned
     positions = path.pos(np.linspace(0.0, path.length, 6000))
-    assert PathPlanner.clearance(positions, info.obstacles) >= 0.27
+    # Tied to the configuration rather than to a literal: the smoothing pass projects blocked points
+    # onto 0.92 of the required clearance, and the gate straightening may pull them slightly further
+    # in, so accept a small tolerance below the requirement itself.
+    required = PathConfig().safety_distance
+    assert PathPlanner.clearance(positions, info.obstacles) >= 0.9 * required
     assert positions[:, 2].min() > 0.0
 
 

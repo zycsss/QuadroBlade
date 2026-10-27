@@ -457,7 +457,15 @@ class MPCCController(Controller):
             if randomized_track
             else PathConfig(gate_straight_length=0.0, gate_frame_clearance=0.0)
         )
-        self._planner = PathPlanner(path_config)
+        # Optional planner overrides from the `[controller]` section of the race config, so the
+        # route search and the required clearance can be A/B tested from a config instead of code.
+        controller_cfg = config.get("controller") or {}
+        planner_overrides = {
+            key: controller_cfg[key]
+            for key in ("use_astar", "astar_resolution", "safety_distance")
+            if key in controller_cfg
+        }
+        self._planner = PathPlanner(replace(path_config, **planner_overrides))
         self._solver, _ = get_solver(self._mpcc, self._params)
         self._nominal_mass = float(self._params["mass"])
         self._mass_ratio = 1.0

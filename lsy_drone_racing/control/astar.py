@@ -20,8 +20,9 @@ what makes the search affordable inside the control loop.
 
 The grid models two kinds of obstacle:
 
-* Poles, as circles inflated by the drone radius, the padding pole radius and the required safety
-  distance.
+* Poles, as circles of the required clearance around the pole centre. That clearance is the
+  planner's ``safety_distance`` and already contains the drone and pole radii, so they are not added
+  again.
 * Gate frames, as the two side posts of every gate, inflated by the drone radius and a small
   margin. The frames have to be in the grid: two gates of this track are less than a metre apart,
   so a route that ignores the posts threads straight through a frame it is not passing. Only the
@@ -66,18 +67,27 @@ class AstarConfig:
     Attributes:
         resolution: Edge length [m] of one grid cell. Finer grids find shorter routes but cost
             quadratically more time.
-        pole_clearance: Required XY clearance [m] between the drone and a pole. This is the
-            planner's `safety_distance`, so the search and the smooth path agree on the requirement.
+        pole_clearance: Required clearance [m] between the path and a pole centre. This is the
+            planner's `safety_distance`, in the same centre-to-centre convention as
+            [PathPlanner.clearance][lsy_drone_racing.control.path_planning.PathPlanner.clearance],
+            so the search and the smooth path agree on the requirement. The drone and pole radii
+            are part of that number, not added on top of it.
         frame_margin: Additional XY clearance [m] on top of the drone radius that the route keeps
-            from a gate post.
+            from a gate post. Only here are the radii added explicitly, because the posts are
+            modelled as bare centrelines rather than as solids.
+        overshoot: Factor applied to ``pole_clearance``. The planner smooths the route afterwards
+            and the Laplacian relaxation cuts inside a corner, so a route that only just satisfies
+            the clearance ends up below it. This mirrors ``PathConfig.push_scale``, which places the
+            heuristic detour waypoints farther out for the same reason.
         bounds_low: Lower corner of the arena in XY [m].
         bounds_high: Upper corner of the arena in XY [m].
         shortcut: Whether to simplify the staircase path with a line-of-sight shortcut.
     """
 
     resolution: float = 0.10
-    pole_clearance: float = 0.30
+    pole_clearance: float = 0.15
     frame_margin: float = 0.02
+    overshoot: float = 1.0
     bounds_low: tuple[float, float] = (-2.45, -1.45)
     bounds_high: tuple[float, float] = (2.45, 1.45)
     shortcut: bool = True
@@ -229,7 +239,7 @@ class ArenaGrid:
         """
         self.config = config or AstarConfig()
         self._poles = np.asarray(obstacles_pos, dtype=float).reshape(-1, 3)[:, :2]
-        self.pole_inflate = POLE_RADIUS + DRONE_RADIUS + self.config.pole_clearance
+        self.pole_inflate = self.config.pole_clearance * self.config.overshoot
         self.frame_pad = DRONE_RADIUS + self.config.frame_margin
         self._frame_segments = _gate_posts(
             np.asarray(gates_pos, dtype=float).reshape(-1, 3),

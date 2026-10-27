@@ -5,6 +5,11 @@
 # | `level2.toml`       | *Yes*                          | *Yes*                       | *No*              | Learning, re-planning |
 [controller]
 file = "my_controller.py" # Put your controller file name here. Specifying a controller as argument to scripts will override this setting. Controllers are located in `lsy_drone_racing/control/`
+# Optional path planner overrides (see `PathConfig`): route the path around the poles with a 2D A*
+# search instead of the push-out heuristic, and set the required clearance between path and pole
+# centers. Off by default because the A* route has not beaten the heuristic in closed loop yet.
+use_astar = true
+# safety_distance = 0.15
 
 [deploy]
 ### Settings only relevant for deployment

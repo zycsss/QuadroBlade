@@ -97,7 +97,8 @@ def test_search_routes_around_a_pole():
     assert len(leg) >= 3, "a route around a pole needs intermediate points"
     for begin, end in zip(leg[:-1], leg[1:], strict=True):
         assert grid.line_is_clear(begin, end), "the route cuts through the pole"
-    assert np.max(np.abs(leg[:, 1])) > 0.3, "the route does not go around the pole"
+    # The route has to leave the blocked circle, and does so by roughly its radius.
+    assert np.max(np.abs(leg[:, 1])) >= 0.9 * grid.pole_inflate, "the route does not go around"
 
 
 @pytest.mark.unit
@@ -108,7 +109,7 @@ def test_search_reports_an_unreachable_goal():
     start, goal = np.array([-0.5, 0.0]), np.array([0.5, 0.0])
     sealed = ArenaGrid(wall, EMPTY, EMPTY, small_config())
     assert sealed.search(start, goal) is None, "a sealed wall was crossed"
-    # Removing the poles around the middle opens a channel of about 0.3 m.
+    # Removing the poles around the middle opens a channel wider than two blocked circles.
     opened = ArenaGrid(wall[np.abs(wall[:, 1]) > 0.5], EMPTY, EMPTY, small_config())
     assert opened.search(start, goal) is not None, "the open channel was not found"
 

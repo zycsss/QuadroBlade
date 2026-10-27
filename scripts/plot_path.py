@@ -246,6 +246,9 @@ def main(
             AstarConfig(
                 resolution=resolution,
                 pole_clearance=base.safety_distance,
+                # Must match what the planner passes, or the drawn occupancy is more optimistic
+                # than the grid the route was actually searched on.
+                overshoot=base.push_scale,
                 bounds_low=base.astar_bounds[0],
                 bounds_high=base.astar_bounds[1],
             ),
@@ -401,7 +404,7 @@ def main(
     print(f"{config}: {len(obs['gate_sequence'])} gate passes, {len(obs['obstacles_pos'])} poles")
     print(
         f"safety_distance = {base.safety_distance:.2f} m, A* pole radius = "
-        f"{POLE_RADIUS + 0.09 + base.safety_distance:.2f} m"
+        f"{base.safety_distance * base.push_scale:.2f} m (clearance x push_scale)"
     )
     print(f"{'mode':12s} {'length':>9s} {'min clear':>10s} {'at arc':>8s} {'plan':>9s}")
     for record in records:

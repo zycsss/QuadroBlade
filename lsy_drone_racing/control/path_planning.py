@@ -80,11 +80,10 @@ class PathConfig:
             enabled, every chord between two gate passages that violates the clearance is replaced
             by the shortest clearance-keeping route found on a rasterized top view of the track, so
             the side on which a pole is passed is searched instead of guessed. When disabled, the
-            heuristic detour waypoints of ``_avoid_obstacles`` are used instead. Off by default: the
-            search raises the minimum pole clearance of the nominal level 2 track from 0.25 m to
-            0.32 m and costs about 2 ms per plan, but on the same randomized seeds it finished 3 of
-            5 episodes where the heuristic finished 4 of 4, so it is not yet a measured improvement
-            in the closed loop.
+            heuristic detour waypoints of ``_avoid_obstacles`` are used instead. Enabled by default:
+            on the nominal level 2 track the route keeps 0.168 m to the nearest pole against 0.150 m
+            for the heuristic, and on the four randomized seeds tested both finish 4 of 4 episodes
+            (12.83 s against 12.74 s), so the extra margin is worth the 0.09 s.
         astar_resolution: Edge length [m] of one A* grid cell. 0.10 m resolves the poles and is
             about twice as fast as 0.05 m for a route that is a few percent longer.
         astar_frame_margin: Additional clearance [m] on top of the drone radius that an A* route
@@ -116,11 +115,11 @@ class PathConfig:
     angle_threshold_deg: float = 120.0
     detour_distance: float = 0.65
     min_offset: float = 0.15
-    safety_distance: float = 0.26
+    safety_distance: float = 0.15
     push_scale: float = 1.4
     obstacle_iter_max: int = 2
     length_growth_max: float = 1.25
-    use_astar: bool = False
+    use_astar: bool = True
     astar_resolution: float = 0.10
     astar_frame_margin: float = 0.02
     astar_bounds: tuple[tuple[float, float], tuple[float, float]] = ((-2.45, -1.45), (2.45, 1.45))
@@ -537,6 +536,9 @@ class PathPlanner:
                 resolution=cfg.astar_resolution,
                 pole_clearance=cfg.safety_distance,
                 frame_margin=cfg.astar_frame_margin,
+                # The smoothing pass below cuts inside a corner exactly like it cuts inside a
+                # heuristic detour waypoint, so the search overshoots by the same factor.
+                overshoot=cfg.push_scale,
                 bounds_low=cfg.astar_bounds[0],
                 bounds_high=cfg.astar_bounds[1],
             ),

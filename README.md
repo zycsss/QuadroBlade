@@ -97,22 +97,40 @@ path, which is what makes level 2 (randomized, only locally revealed poses) work
 tracks the planner also forces a straight passage through every gate and keeps the path out of the
 solid gate frames it is not passing through.
 
-**Obstacle routing.** The side on which the path passes a pole can be decided by a two dimensional A*
+**Obstacle routing.** The side on which the path passes a pole is decided by a two dimensional A*
 search over a rasterized top view of the track
 ([`lsy_drone_racing/control/astar.py`](lsy_drone_racing/control/astar.py)) instead of by the local
 push-out heuristic alone. Only the chords *between* two consecutive gate passages are rerouted; the
 passages themselves stay on the gate normal, because a path that leaves the normal inside the opening
 clips the frame. The search is two dimensional for a reason: the obstacles are vertical cylinders
 spanning the whole flight altitude band and the gate altitudes are prescribed by the gate order, so
-there is nothing to discover in `z`. On the nominal level 2 track it costs about 2 ms per plan at
-10 cm cells and raises the minimum pole clearance from 0.25 m to 0.32 m, i.e. from just inside the
-0.26 m safety distance to comfortably outside it.
+there is nothing to discover in `z`. It costs about 2 ms per plan at 10 cm cells.
 
-It is **off by default** (`PathConfig.use_astar = False`) because the clearance gain does not
-translate into a better success rate yet: on the same randomized seeds the search finished 3 of 5
-level 2 episodes at 12.9 s mean, the heuristic 4 of 4 at 12.6 s mean. The two failures look like
-tracking problems on the sharper routed geometry (one contact after the third gate, one gate hit)
-rather than collisions with a pole, which is where the next step is.
+The required clearance between the path and a pole centre is `PathConfig.safety_distance`, 0.15 m,
+measured centre to centre — about 4.5 cm of air around a 0.09 m drone and a 0.015 m pole. Both
+planner layers use that one number. The A* grid blocks a circle of `safety_distance * push_scale`
+around each pole rather than the clearance itself, for the same reason the heuristic detour waypoints
+are placed farther out: the smoothing pass cuts inside a corner, so a route that only just satisfies
+the clearance ends up below it. `[controller]` in a race config may override `use_astar`,
+`astar_resolution` and `safety_distance` without code changes.
+
+Measured on level 2, seeds 0-3 (`debug_run.py --n_runs 4`):
+
+| clearance | route | finished | mean time | path | min clearance |
+| --- | --- | --- | --- | --- | --- |
+| 0.26 m | heuristic | 4/4 | 12.55 s | 13.49 m | 0.251 m |
+| 0.26 m | A* | 2/4 | 12.92 s | 13.51 m | 0.324 m |
+| 0.15 m | heuristic | 4/4 | 12.74 s | 13.57 m | 0.150 m |
+| 0.15 m | A* | 4/4 | 12.83 s | 13.64 m | 0.168 m |
+
+Two things this table says. With the wide 0.26 m clearance the A* route was *worse* in closed loop,
+because the grid added the drone and pole radii on top of the clearance and so enforced 0.365 m where
+the heuristic enforced 0.26 m — 10 cm of extra margin on a track where two gates are 0.74 m apart.
+With the clearance at 0.15 m the two are tied on success and the A* route keeps 18 mm more margin for
+0.09 s of lap time, which is why it is enabled by default. Note what the search actually enforces
+now: `safety_distance * push_scale` = 0.21 m, i.e. 40 % outside the requirement, which is the same
+deliberate overshoot the heuristic detour waypoints use and what keeps the route above 0.15 m after
+the smoothing pass.
 
 ```bash
 # headless flight with a per-episode verdict and trajectory plot
