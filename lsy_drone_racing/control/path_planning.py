@@ -125,7 +125,7 @@ class PathConfig:
     astar_bounds: tuple[tuple[float, float], tuple[float, float]] = ((-2.45, -1.45), (2.45, 1.45))
     smooth_iterations: int = 600
     anchor_window: float = 0.25
-    gate_straight_length: float = 0.55
+    gate_straight_length: float = 0.275
     gate_straight_blend: float = 0.25
     gate_frame_clearance: float = 0.55
     gate_frame_window: float = 0.3

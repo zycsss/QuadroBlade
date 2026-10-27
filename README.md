@@ -116,21 +116,31 @@ the clearance ends up below it. `[controller]` in a race config may override `us
 
 Measured on level 2, seeds 0-3 (`debug_run.py --n_runs 4`):
 
-| clearance | route | finished | mean time | path | min clearance |
-| --- | --- | --- | --- | --- | --- |
-| 0.26 m | heuristic | 4/4 | 12.55 s | 13.49 m | 0.251 m |
-| 0.26 m | A* | 2/4 | 12.92 s | 13.51 m | 0.324 m |
-| 0.15 m | heuristic | 4/4 | 12.74 s | 13.57 m | 0.150 m |
-| 0.15 m | A* | 4/4 | 12.83 s | 13.64 m | 0.168 m |
+| route | finished | mean time | path | min clearance |
+| --- | --- | --- | --- | --- |
+| heuristic push-out | 4/4 | 12.62 s | 13.48 m | 0.150 m |
+| A* route | 4/4 | 12.68 s | 13.51 m | 0.217 m |
 
-Two things this table says. With the wide 0.26 m clearance the A* route was *worse* in closed loop,
-because the grid added the drone and pole radii on top of the clearance and so enforced 0.365 m where
-the heuristic enforced 0.26 m — 10 cm of extra margin on a track where two gates are 0.74 m apart.
-With the clearance at 0.15 m the two are tied on success and the A* route keeps 18 mm more margin for
-0.09 s of lap time, which is why it is enabled by default. Note what the search actually enforces
-now: `safety_distance * push_scale` = 0.21 m, i.e. 40 % outside the requirement, which is the same
-deliberate overshoot the heuristic detour waypoints use and what keeps the route above 0.15 m after
-the smoothing pass.
+The two are a wash on lap time; the A* route keeps 67 mm more clearance to the nearest pole for 60 ms,
+which is why it is enabled by default. Note what the search actually enforces: `safety_distance *
+push_scale` = 0.21 m, i.e. 40 % outside the requirement, which is the same deliberate overshoot the
+heuristic detour waypoints use and what keeps the route above 0.15 m after the smoothing pass.
+
+**Gate passages and corners.** `gate_straight_length` is the length over which the path is forced
+straight through a gate. It is the parameter that controls how tight the corners next to a gate get:
+halving it from 0.55 m to 0.275 m cuts the peak curvature of the A* route from 14.6 1/m to 5.9 1/m,
+so the sharpest corner goes from a 6.9 cm to a 16.9 cm radius, and the curvature speed limit there
+(`v <= sqrt(a_lat_max / curvature)` with `a_lat_max` 4.0) rises from 0.52 m/s to 0.82 m/s. The minimum
+pole clearance improves with it, from 0.168 m to 0.217 m, and the lap time drops from 12.83 s to
+12.68 s.
+
+`approach_distance`, the +-0.6 m in/out waypoints along the gate normal, is *not* the lever for this:
+halving it to 0.3 m shortens the path by 1.2 m but pushes the 95th-percentile curvature from 3.5 to
+4.6 1/m, i.e. it makes the corners tighter rather than looser. Shortening `gate_straight_blend` from
+0.25 m to 0.10 m is worse still for the sharpest corner (5.9 to 10.1 1/m), so it stays at 0.25 m.
+Halving *both* the straight passage and `approach_distance` is the best configuration measured
+statically — 12.18 m path and a 95th-percentile curvature of 3.07 1/m — but it gives up peak
+clearance (0.217 m to 0.162 m), so it is the next thing to try in closed loop rather than the default.
 
 ```bash
 # headless flight with a per-episode verdict and trajectory plot
