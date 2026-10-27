@@ -184,6 +184,40 @@ class PathInfo:
     obstacles: NDArray[np.floating]
 
 
+def path_config_from(config: object = None, **overrides: object) -> PathConfig:
+    """Build the planner configuration for a race configuration.
+
+    Two things depend on the race configuration rather than on the planner: a track that does not
+    randomize its gates and obstacles does not need the strict gate handling, which costs lap time
+    and buys nothing when the poses are exact, and a config may override individual planner fields
+    in its [controller] section.
+
+    Args:
+        config: A loaded race configuration, or ``None`` to get the plain defaults.
+        **overrides: Fields that win over both the defaults and the config file, e.g.
+            ``use_astar=False``.
+
+    Returns:
+        The planner configuration.
+    """
+    settings: dict[str, object] = {}
+    randomized_track = True
+    if config is not None:
+        randomizations = config.env.get("randomizations") or {}
+        randomized_track = any(
+            key in randomizations for key in ("gate_pos", "gate_rpy", "obstacle_pos")
+        )
+        controller = config.get("controller") or {}
+        for key in ("use_astar", "astar_resolution", "safety_distance"):
+            if key in controller:
+                settings[key] = controller[key]
+    if not randomized_track:
+        settings["gate_straight_length"] = 0.0
+        settings["gate_frame_clearance"] = 0.0
+    settings.update(overrides)
+    return PathConfig(**settings)
+
+
 class ArcPath:
     """Arc-length parameterized, continuously differentiable 3D path.
 

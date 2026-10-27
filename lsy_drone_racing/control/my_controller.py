@@ -49,7 +49,12 @@ from crazyflow.dynamics import Dynamics, load_params
 from scipy.spatial.transform import Rotation as R
 
 from lsy_drone_racing.control import Controller
-from lsy_drone_racing.control.path_planning import ArcPath, PathConfig, PathPlanner, track_reference
+from lsy_drone_racing.control.path_planning import (
+    ArcPath,
+    PathPlanner,
+    path_config_from,
+    track_reference,
+)
 
 if TYPE_CHECKING:
     from crazyflow import Sim
@@ -451,21 +456,9 @@ class MPCCController(Controller):
         )
         # The strict gate handling (straight passages and gate-frame avoidance) only pays off when
         # the gate poses are randomized: it costs lap time, and on a perfectly known track the path
-        # already passes the gates cleanly. Enable it only for configs that randomize the track.
-        path_config = (
-            PathConfig()
-            if randomized_track
-            else PathConfig(gate_straight_length=0.0, gate_frame_clearance=0.0)
-        )
-        # Optional planner overrides from the `[controller]` section of the race config, so the
-        # route search and the required clearance can be A/B tested from a config instead of code.
-        controller_cfg = config.get("controller") or {}
-        planner_overrides = {
-            key: controller_cfg[key]
-            for key in ("use_astar", "astar_resolution", "safety_distance")
-            if key in controller_cfg
-        }
-        self._planner = PathPlanner(replace(path_config, **planner_overrides))
+        # already passes the gates cleanly. `path_config_from` applies that rule and the config
+        # overrides of the race config in one place.
+        self._planner = PathPlanner(path_config_from(config))
         self._solver, _ = get_solver(self._mpcc, self._params)
         self._nominal_mass = float(self._params["mass"])
         self._mass_ratio = 1.0

@@ -262,110 +262,34 @@ def run_episode(
     }
 
 
-def plot_episode(ep: dict[str, Any], out_path: Path, title: str) -> None:
-    """Plot the top-down track, altitude/progress and speed of one episode."""
-    import matplotlib
+def plot_episode(ep: dict[str, Any], out_path: Path, title: str, config: Any) -> None:
+    """Plot the planned paths of the track with the achieved trajectory of the episode on top.
 
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    Uses the same figure as `scripts/plot_path.py`; the episode's flown trajectory is overlaid so a
+    CONTACT or HIT_GATE verdict can be read off the same picture as the plan it was tracking.
 
-    rec = ep["record"]
-    pos = rec["pos"]
-    gates_pos, gates_quat = ep["gates_pos"], ep["gates_quat"]
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5.2), gridspec_kw={"width_ratios": [1.25, 1, 1]})
+    Args:
+        ep: The episode record returned by `run_episode`.
+        out_path: Where to write the image.
+        title: Figure title.
+        config: The loaded race configuration, for the planner settings it overrides.
+    """
+    from lsy_drone_racing.utils.path_plot import observation_from_config, plot_paths
 
-    # --- Panel 1: top-down track -------------------------------------------------------------
-    ax = axes[0]
-    pass_ids = rec["n"]
-    sc = ax.scatter(pos[:, 0], pos[:, 1], c=pass_ids, cmap="viridis", s=7, zorder=3)
-    ax.plot(pos[:, 0], pos[:, 1], color="0.6", lw=0.7, zorder=2)
-    ax.plot(pos[0, 0], pos[0, 1], "o", color="tab:green", ms=9, label="start", zorder=5)
-    ax.plot(pos[-1, 0], pos[-1, 1], "X", color="tab:red", ms=11, label="last live pose", zorder=5)
-    for gid, (gp, gq) in enumerate(zip(gates_pos, gates_quat)):
-        rot = R.from_quat(gq)
-        y_axis = rot.apply([0, 1, 0])
-        x_axis = rot.apply([1, 0, 0])
-        half = GATE_OPENING / 2
-        ends = np.stack([gp - half * y_axis, gp + half * y_axis])
-        ax.plot(ends[:, 0], ends[:, 1], color="tab:orange", lw=4, solid_capstyle="butt", zorder=4)
-        ax.annotate(
-            f"g{gid}",
-            xy=(gp[0], gp[1]),
-            xytext=(gp[0] + 0.12, gp[1] + 0.12),
-            color="tab:orange",
-            fontsize=9,
-            zorder=6,
-        )
-        ax.arrow(
-            gp[0],
-            gp[1],
-            0.28 * x_axis[0],
-            0.28 * x_axis[1],
-            color="tab:orange",
-            width=0.008,
-            head_width=0.06,
-            zorder=4,
-        )
-    for oid, op in enumerate(ep["obstacles_pos"]):
-        ax.plot(op[0], op[1], "s", color="tab:purple", ms=5, zorder=4)
-        ax.annotate(
-            f"o{oid}",
-            xy=(op[0], op[1]),
-            xytext=(op[0] + 0.1, op[1] - 0.14),
-            color="tab:purple",
-            fontsize=8,
-            zorder=6,
-        )
-    ax.add_patch(
-        plt.Rectangle(
-            (ep["bounds_low"][0], ep["bounds_low"][1]),
-            ep["bounds_high"][0] - ep["bounds_low"][0],
-            ep["bounds_high"][1] - ep["bounds_low"][1],
-            fill=False,
-            ec="0.7",
-            ls="--",
-            lw=1,
-        )
+    obs = observation_from_config(config)
+    # The episode saw the revealed poses, which on a randomized track differ from the nominal ones.
+    obs["gates_pos"] = ep["gates_pos"]
+    obs["gates_quat"] = ep["gates_quat"]
+    obs["obstacles_pos"] = ep["obstacles_pos"]
+    obs["pos"] = ep["record"]["pos"][0]
+    plot_paths(
+        obs,
+        out_path,
+        flown=ep["record"]["pos"],
+        title=title,
+        subtitle=f"{ep['verdict']}: {ep['detail']}",
+        config=config,
     )
-    ax.set_aspect("equal")
-    ax.set_xlabel("x [m]")
-    ax.set_ylabel("y [m]")
-    ax.set_title("Top-down track (colour = passes completed)\narrows = gate crossing direction")
-    ax.legend(loc="lower left", fontsize=8)
-    ax.grid(alpha=0.3)
-    plt.colorbar(sc, ax=ax, label="n_gates_passed", shrink=0.8)
-
-    # --- Panel 2: altitude and gate progress -------------------------------------------------
-    ax = axes[1]
-    ax.plot(rec["t"], pos[:, 2], color="tab:blue", lw=1.3)
-    ax.axhline(0.0, color="tab:red", ls=":", lw=1)
-    ax.set_xlabel("t [s]")
-    ax.set_ylabel("z [m]", color="tab:blue")
-    ax.tick_params(axis="y", labelcolor="tab:blue")
-    ax.grid(alpha=0.3)
-    ax2 = ax.twinx()
-    ax2.step(rec["t"], rec["n"], where="post", color="tab:green", lw=1.6)
-    ax2.set_ylabel("n_gates_passed", color="tab:green")
-    ax2.tick_params(axis="y", labelcolor="tab:green")
-    ax2.set_ylim(-0.2, ep["n_required"] + 0.2)
-    ax.set_title("Altitude (red dotted = floor) and gate progress")
-
-    # --- Panel 3: reference vs achieved ------------------------------------------------------
-    ax = axes[2]
-    for i, name in enumerate(["x", "y", "z"]):
-        ax.plot(rec["t"], rec["pos"][:, i], lw=1.2, label=f"p{name}")
-        ax.plot(rec["t"], rec["des"][:, i], lw=0.9, ls="--", alpha=0.8, label=f"p{name} setpoint")
-    ax.set_xlabel("t [s]")
-    ax.set_ylabel("position [m]")
-    ax.grid(alpha=0.3)
-    ax.legend(fontsize=7, ncol=2)
-    ax.set_title("Position vs. commanded setpoint\n(gap = inner-loop tracking error)")
-
-    fig.suptitle(f"{title}\n{ep['verdict']}: {ep['detail']}", fontsize=11)
-    fig.tight_layout()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=130)
-    plt.close(fig)
 
 
 def resolve_device(device: str) -> str:
@@ -453,7 +377,7 @@ def main(
         if plot:
             stem = f"{config_path.stem}_{Path(controller_file).stem}_seed{ep_seed}"
             out = Path(out_dir) / f"{stem}.png"
-            plot_episode(ep, out, f"{config_path.stem} / {controller_file} / seed {ep_seed}")
+            plot_episode(ep, out, f"{config_path.stem} / {controller_file} / seed {ep_seed}", cfg)
             print(f"          plot -> {out}")
 
     n_ok = sum(ep["verdict"] == "FINISHED" for ep in results)

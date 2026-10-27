@@ -147,7 +147,7 @@ statically — 12.18 m path and a 95th-percentile curvature of 3.07 1/m — but 
 clearance (0.217 m to 0.162 m), so it is the next thing to try in closed loop rather than the default.
 
 ```bash
-# headless flight with a per-episode verdict and trajectory plot
+# headless flight with a per-episode verdict and the planned path + flown trajectory
 python scripts/debug_run.py --config level1.toml --controller my_controller.py
 
 # several episodes with a success rate and mean time
@@ -156,7 +156,7 @@ python scripts/debug_run.py --config level1.toml --controller my_controller.py -
 # rendered flight (the configs enable the GUI by default)
 python scripts/sim.py --config level0.toml
 
-# what the planner decided, without flying: top view, clearance and altitude per route
+# what the planner decided, without flying (the same figure debug_run.py writes per episode)
 python scripts/plot_path.py --config level2.toml
 ```
 

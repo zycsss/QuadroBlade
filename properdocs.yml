@@ -67,6 +67,7 @@ nav:
     - Utils:
       - utils/index.md
       - utils.checks: utils/checks.md
+      - utils.path_plot: utils/path_plot.md
       - utils.utils: utils/utils.md
 
 plugins:
