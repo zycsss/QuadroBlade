@@ -447,6 +447,13 @@ class MPCCController(Controller):
             key in randomizations for key in ("gate_pos", "gate_rpy", "obstacle_pos")
         )
         mpcc_overrides = {} if randomized_track else {"w_speed_gate": 9.0, "q_contour_peak": 2000.0}
+        # Any `[controller]` entry that names an MPCCConfig field overrides it, so the
+        # aggressiveness knobs can be swept from a config file. `w_speed_gate` and `a_lat_max`
+        # are the two that actually set the pace; see the speed budget in the README.
+        controller_cfg = config.get("controller") or {}
+        for key in MPCCConfig.__dataclass_fields__:
+            if key in controller_cfg:
+                mpcc_overrides[key] = controller_cfg[key]
         self._mpcc = replace(MPCCConfig(dt=1.0 / self._freq), **mpcc_overrides)
         self._params = load_params(Dynamics.so_rpy, config.sim.drone)
         self._hover_thrust = float(self._params["mass"]) * (-float(self._params["gravity_vec"][-1]))

@@ -146,6 +146,40 @@ Halving *both* the straight passage and `approach_distance` is the best configur
 statically — 12.18 m path and a 95th-percentile curvature of 3.07 1/m — but it gives up peak
 clearance (0.217 m to 0.162 m), so it is the next thing to try in closed loop rather than the default.
 
+**What sets the lap time.** The reference speed the MPCC asks for is
+
+```text
+v = mu_speed / (2 * (w_speed_gate * gate_weight + r_vtheta))
+```
+
+with `gate_weight` in `[0, 0.4]` peaking at a gate, clipped to `v_max` and to the curvature limit
+`sqrt(a_lat_max / curvature)`. So `w_speed_gate` throttles the drone at the gates, `a_lat_max` in the
+corners, and `v_max` almost never binds. Integrating that closed form along the 13.52 m level 2 path
+ranks the knobs without flying:
+
+| change from the default | ideal lap |
+| --- | --- |
+| baseline | 9.98 s |
+| `w_speed_gate` 18 -> 9 | 8.26 s |
+| `mu_speed` 10 -> 20 | 8.21 s |
+| `a_lat_max` 4 -> 8 | 8.82 s |
+| `v_max` 2.3 -> 3.0 | 9.83 s |
+
+`mu_speed` and `w_speed_gate` are the same knob from opposite ends; `v_max` on its own is worth a
+sixth of `w_speed_gate`. Measured on level 2, seeds 0-3, `debug_run.py --n_runs 4 --plot=False`:
+
+| settings | finished | mean time |
+| --- | --- | --- |
+| defaults | 4/4 | 12.34 s |
+| `w_speed_gate 6`, `a_lat_max 6`, `v_max 3.0` | 4/4 | 9.82 s (seed 0; the plot write aborted the run) |
+| + `replan_slowdown_time 0.3` | 4/4 | 8.70 s |
+| `w_speed_gate 4`, `a_lat_max 8`, `v_max 3.5`, `replan_slowdown_time 0.3` | 4/4 | **8.16 s** |
+
+`replan_slowdown_time` is worth 1.1 s on its own because level 2 re-plans on every revealed pose and
+halves the reference speed for that long each time. The gate margins only tighten by 1-2 cm at the
+fast setting (tightest pass 9.7 cm against the 20 cm half opening), so the speed is not being bought
+with accuracy. All four knobs live in the `[controller]` section of the config file.
+
 ```bash
 # headless flight with a per-episode verdict and the planned path + flown trajectory
 python scripts/debug_run.py --config level1.toml --controller my_controller.py
