@@ -1,64 +1,87 @@
-"""Script for visualizing the planned path of a race configuration.
+"""Script for drawing a run from the log that ``debug_run.py`` wrote.
 
-This script plans the nominal track of a configuration without running the simulation and draws it,
-using the same figure that ``scripts/debug_run.py`` writes per episode (see
-``lsy_drone_racing.utils.path_plot``). Since it never flies, it shows the plan only; the per-episode
-figure is the one that also shows how the drone flew it.
+The figure is built entirely from the recorded data, so it can be regenerated offline, compared
+between runs, and never disagrees with the numbers it came from. See
+``lsy_drone_racing.utils.path_plot``.
 
 Run it from the repository root, e.g.
 
-    pixi run python scripts/plot_path.py --config level2.toml
+    pixi run python scripts/plot_path.py --log logs/level2_my_controller_seed0.npz
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import fire
-import numpy as np
 
-from lsy_drone_racing.utils import load_config
-from lsy_drone_racing.utils.path_plot import observation_from_config, plot_paths
+from lsy_drone_racing.utils.path_plot import plot_run
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def main(
-    config: str = "level2.toml",
-    out: str | None = None,
-    resolution: float = 0.10,
-    grid: bool = True,
-    dpi: int = 140,
-) -> None:
-    """Plot the planned path of a race configuration.
+def newest_log(directory: Path) -> Path:
+    """Return the most recently written run log in a directory.
 
     Args:
-        config: Name of the race configuration. Assumed to be in `config/`.
-        out: Output image path. Defaults to `plots/path_<config>.png`.
-        resolution: Edge length [m] of the A* grid cell used for the occupancy overlay.
+        directory: Directory to search.
+
+    Returns:
+        The newest ``.npz``.
+
+    Raises:
+        FileNotFoundError: If the directory holds no run logs.
+    """
+    logs = sorted(directory.glob("*.npz"), key=lambda path: path.stat().st_mtime)
+    if not logs:
+        raise FileNotFoundError(f"no .npz run logs in {directory}; run scripts/debug_run.py first")
+    return logs[-1]
+
+
+def main(
+    log: str | None = None,
+    out: str | None = None,
+    planned: bool = False,
+    grid: bool = True,
+    resolution: float = 0.10,
+    dpi: int = 140,
+) -> None:
+    """Draw one logged run.
+
+    Args:
+        log: Path of the ``.npz`` written by ``debug_run.py``. Defaults to the newest in `logs/`.
+        out: Output image path. Defaults to `plots/<log name>.png`.
+        planned: Whether to draw the last path the controller committed to, from the log.
         grid: Whether to draw the occupancy overlay of the A* search.
+        resolution: Edge length [m] of the A* grid cell used for the occupancy overlay.
         dpi: Resolution of the saved figure.
     """
-    conf = load_config(REPO_ROOT / "config" / config)
-    obs = observation_from_config(conf)
-    out_path = REPO_ROOT / "plots" / f"path_{Path(config).stem}.png" if out is None else Path(out)
-    record = plot_paths(
-        obs,
-        out_path,
-        resolution=resolution,
-        grid=grid,
-        dpi=dpi,
-        config=conf,
-        title=f"Path planning on {config}",
+    log_path = Path(log) if log is not None else newest_log(REPO_ROOT / "logs")
+    out_path = Path(out) if out is not None else REPO_ROOT / "plots" / f"{log_path.stem}.png"
+    written = plot_run(
+        log_path, out_path, planned=planned, grid=grid, resolution=resolution, dpi=dpi
     )
 
-    index = int(np.argmin(record.clearance))
-    print(f"{config}: {len(obs['gate_sequence'])} gate passes, {len(obs['obstacles_pos'])} poles")
-    print(f"  route      {'astar' if record.use_astar else 'heuristic'}")
-    print(f"  length     {record.path.length:.2f} m")
-    print(f"  clearance  {record.clearance[index]:.3f} m at arc {record.arc[index]:.2f} m")
-    print(f"  plan time  {record.plan_ms:.1f} ms")
-    print(f"\nplot -> {out_path}")
+    summary_path = log_path.with_suffix(".json")
+    if summary_path.exists():
+        summary = json.loads(summary_path.read_text())
+        print(f"{log_path.name}")
+        print(
+            f"  verdict    {summary.get('verdict')} "
+            f"({summary.get('n_final')}/{summary.get('n_required')} passes)"
+        )
+        print(f"  finish     {summary.get('sim_time'):.2f} s over {summary.get('steps')} steps")
+        print(f"  plans      {summary.get('n_plans')}")
+        print(
+            f"  solver     {summary.get('solver_ms_mean'):.2f} ms mean, "
+            f"{summary.get('solver_ms_p95'):.2f} ms p95, "
+            f"{summary.get('solver_failures')} failures"
+        )
+        print(
+            f"  peaks      {summary.get('speed_max'):.2f} m/s, {summary.get('acc_max'):.1f} m/s^2"
+        )
+    print(f"\nplot -> {written}")
 
 
 if __name__ == "__main__":

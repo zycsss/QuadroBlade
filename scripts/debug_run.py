@@ -295,8 +295,8 @@ def run_episode(
     }
 
 
-def write_log(ep: dict[str, Any], out_path: Path, meta: dict[str, Any]) -> Path:
-    """Write the recorded time series of an episode to ``.npz`` next to a ``.json`` summary.
+def episode_arrays(ep: dict[str, Any]) -> dict[str, Any]:
+    """Assemble the arrays of an episode, exactly as they are written to a run log.
 
     The arrays hold per control step: time, position, velocity, acceleration (a finite difference of
     the recorded velocity, since acceleration is not observed), attitude, angular rate, the applied
@@ -308,16 +308,10 @@ def write_log(ep: dict[str, Any], out_path: Path, meta: dict[str, Any]) -> Path:
 
     Args:
         ep: The episode record returned by `run_episode`.
-        out_path: Path of the ``.npz``. The summary is written next to it with a ``.json`` suffix.
-        meta: Extra metadata for the summary, e.g. config, controller file and seed.
 
     Returns:
-        The path of the written ``.npz``.
+        The arrays, ready for `numpy.savez_compressed` and for the plot.
     """
-    import json
-
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
     rec = ep["record"]
     arrays: dict[str, Any] = {key: np.asarray(value) for key, value in rec.items()}
     arrays.update(
@@ -338,8 +332,31 @@ def write_log(ep: dict[str, Any], out_path: Path, meta: dict[str, Any]) -> Path:
         arrays[f"plan_{key}"] = np.array([plan[key] for plan in plans], dtype=float)
     arrays["plan_drone_pos"] = np.array([plan["drone_pos"] for plan in plans], dtype=float)
     arrays["plan_points"] = np.array([plan["points"] for plan in plans], dtype=float)
+    return arrays
+
+
+def write_log(
+    ep: dict[str, Any], arrays: dict[str, Any], out_path: Path, meta: dict[str, Any]
+) -> Path:
+    """Write the arrays of an episode to ``.npz`` next to a ``.json`` summary.
+
+    Args:
+        ep: The episode record returned by `run_episode`.
+        arrays: The arrays of the episode, see [episode_arrays][...episode_arrays].
+        out_path: Path of the ``.npz``. The summary is written next to it with a ``.json`` suffix.
+        meta: Extra metadata for the summary, e.g. config, controller file and seed.
+
+    Returns:
+        The path of the written ``.npz``.
+    """
+    import json
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(out_path, **arrays)
 
+    rec = ep["record"]
+    plans = ep["plan_log"]
     solver_ms = rec.get("solver_ms", np.zeros(0))
     summary = {
         **meta,
@@ -363,38 +380,27 @@ def write_log(ep: dict[str, Any], out_path: Path, meta: dict[str, Any]) -> Path:
     return out_path
 
 
-def plot_episode(ep: dict[str, Any], out_path: Path, title: str, config: Any) -> None:
-    """Plot how the episode actually flew, over the track it actually faced.
-
-    Uses the same figure as `scripts/plot_path.py`, but with the gate and obstacle poses the drone
-    faced rather than the nominal ones from the config, and with no planned path at all: the stored
-    trajectory is coloured by speed, so the picture answers how the flight went rather than how it
-    was supposed to go.
+def plot_episode(ep: dict[str, Any], arrays: dict[str, Any], out_path: Path, title: str) -> Path:
+    """Plot how the episode actually flew, from the same arrays the log holds.
 
     Args:
         ep: The episode record returned by `run_episode`.
+        arrays: The arrays of the episode, see [episode_arrays][...episode_arrays].
         out_path: Where to write the image.
         title: Figure title.
-        config: The loaded race configuration, for the planner settings it overrides.
-    """
-    from lsy_drone_racing.utils.path_plot import observation_from_config, plot_paths
 
-    obs = observation_from_config(config)
-    # The episode faced the revealed poses; on a randomized track they differ from the nominal ones
-    # the controller planned against at t=0.
-    obs["gates_pos"] = ep["true_gates_pos"]
-    obs["obstacles_pos"] = ep["true_obstacles_pos"]
-    obs["pos"] = ep["record"]["pos"][0]
-    plot_paths(
-        obs,
+    Returns:
+        The path of the written image.
+    """
+    from lsy_drone_racing.utils.path_plot import plot_arrays
+
+    return plot_arrays(
+        arrays,
         out_path,
-        flown=ep["record"]["pos"],
-        flown_speed=np.asarray(ep["record"]["speed"], dtype=float),
-        planned=False,
         title=title,
         subtitle=f"{ep['verdict']}: {ep['detail']}",
-        config=config,
         heading="Track from above: colour = how it flew",
+        finish=ep["sim_time"],
     )
 
 
@@ -484,31 +490,36 @@ def main(
             f"[seed {ep_seed}] {ep['verdict']:<13} {ep['n_final']}/{ep['n_required']} passes  "
             f"t={ep['sim_time']:.2f}s  | {ep['detail']}"
         )
-        if plot:
+        if plot or log:
             stem = f"{config_path.stem}_{Path(controller_file).stem}_seed{ep_seed}"
-            out = Path(out_dir) / f"{stem}.png"
-            plot_episode(ep, out, f"{config_path.stem} / {controller_file} / seed {ep_seed}", cfg)
-            print(f"          plot -> {out}")
-        if log:
-            stem = f"{config_path.stem}_{Path(controller_file).stem}_seed{ep_seed}"
-            written = write_log(
-                ep,
-                Path(log_dir) / f"{stem}.npz",
-                {
-                    "config": config,
-                    "controller": controller_file,
-                    "seed": ep_seed,
-                    "device": device,
-                    "control_mode": cfg.env.control_mode,
-                },
-            )
-            solver_ms = ep["record"].get("solver_ms", np.zeros(0))
-            print(
-                f"          log  -> {written}  ({len(ep['plan_log'])} plans, "
-                f"{len(ep['record']['t'])} steps, solver "
-                + (f"{np.mean(solver_ms):.1f} ms mean" if len(solver_ms) else "n/a")
-                + ")"
-            )
+            arrays = episode_arrays(ep)
+            # The log is written first, so the figure always has a file that reproduces it.
+            if log:
+                written = write_log(
+                    ep,
+                    arrays,
+                    Path(log_dir) / f"{stem}.npz",
+                    {
+                        "config": config,
+                        "controller": controller_file,
+                        "seed": ep_seed,
+                        "device": device,
+                        "control_mode": cfg.env.control_mode,
+                    },
+                )
+                solver_ms = ep["record"].get("solver_ms", np.zeros(0))
+                print(
+                    f"          log  -> {written}  ({len(ep['plan_log'])} plans, "
+                    f"{len(ep['record']['t'])} steps, solver "
+                    + (f"{np.mean(solver_ms):.1f} ms mean" if len(solver_ms) else "n/a")
+                    + ")"
+                )
+            if plot:
+                out = Path(out_dir) / f"{stem}.png"
+                plot_episode(
+                    ep, arrays, out, f"{config_path.stem} / {controller_file} / seed {ep_seed}"
+                )
+                print(f"          plot -> {out}")
 
     n_ok = sum(ep["verdict"] == "FINISHED" for ep in results)
     times = [ep["sim_time"] for ep in results if ep["verdict"] == "FINISHED"]

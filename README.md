@@ -195,6 +195,10 @@ Every path the controller committed to is stored as `plan_*`: `plan_t`, `plan_ti
 per-step `replans` counter is the index of the active plan, so a run can be replayed against the plan
 that was in force at any moment.
 
+`scripts/plot_path.py` draws the figure straight from one of these logs, so any run can be redrawn
+offline and two runs are always drawn from the same data. The title carries the finishing time, and
+`--planned` adds the remaining part of the last plan the controller committed to.
+
 ```python
 import numpy as np
 
@@ -214,8 +218,8 @@ python scripts/debug_run.py --config level1.toml --controller my_controller.py -
 # rendered flight (the configs enable the GUI by default)
 python scripts/sim.py --config level0.toml
 
-# what the planner produces, without flying: the planned path over the same track view
-python scripts/plot_path.py --config level2.toml
+# redraw a logged run offline, exactly as recorded (defaults to the newest log)
+python scripts/plot_path.py --log logs/level2_my_controller_seed0.npz
 ```
 
 `python` has to resolve to the repository's pixi environment; from a plain shell use

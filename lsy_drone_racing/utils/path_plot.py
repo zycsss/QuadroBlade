@@ -1,29 +1,28 @@
-"""Figures for a planned path.
+"""Figures for a logged run.
 
-The planner decides the route through the track, but the simulation output did not show that
-decision, and it did not show how the drone actually flew it either. This module draws both, for
-``scripts/plot_path.py`` and for the per-episode figures of ``scripts/debug_run.py``, so there is a
-single implementation of the picture.
+The planner decides the route through the track and the controller decides how to fly it, but the
+simulation output showed neither. This module draws a run from the ``.npz`` that
+``scripts/debug_run.py`` writes, so the picture can be regenerated offline, compared between runs,
+and never disagrees with the data it came from.
 
-One view from above, showing
+One view from above, over the track the drone actually faced:
 
-* the planned path as a black line, over the occupancy grid the A* search sees, with the gates and
-  their crossing direction;
-* the achieved trajectory of an episode, when there is one, coloured by its speed — the quantity
-  that says how the flight went, rather than how it was supposed to go;
-* every pole with two circles: the solid one is ``safety_distance``, the clearance the path has to
-  keep, and the dotted one is the slightly larger radius the A* search blocks so that its route
-  survives the smoothing pass. Drawing only the larger radius made the path look as if it cut
-  through its own constraint.
+* the achieved trajectory, coloured by its speed — the quantity that says how the flight went
+  rather than how it was supposed to go, with the finishing time in the title and beside the finish
+  marker;
+* every pole with a circle at ``POLE_RADIUS + DRONE_RADIUS``: the distance at which the drone would
+  touch it. The planner's safety margin and the radius its A* search blocks are deliberately not
+  drawn, because they made a 3 cm pole look like a 42 cm one;
+* optionally the last path the controller committed to, which the log stores as ``plan_points``.
 
 The legend sits outside the axes so it never covers the track.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -35,121 +34,64 @@ from lsy_drone_racing.control.astar import (
     ArenaGrid,
     AstarConfig,
 )
-from lsy_drone_racing.control.path_planning import GateFrames, PathPlanner, path_config_from
 
 if TYPE_CHECKING:
     from matplotlib.axes import Axes
-    from ml_collections import ConfigDict
-    from numpy.typing import NDArray
+
+#: Planner defaults used only to place the A* occupancy overlay. The log does not record the planner
+#: settings, and the overlay is a hint about what the search saw, not part of the measurement.
+_OVERLAY_CLEARANCE = 0.15
+_OVERLAY_OVERSHOOT = 1.4
+_OVERLAY_BOUNDS = ((-2.45, -1.45), (2.45, 1.45))
 
 
-@dataclass
-class PathRecord:
-    """One planned route and the numbers the summaries need.
-
-    Attributes:
-        use_astar: Whether this route came from the A* search rather than the push-out heuristic.
-        path: The planned path.
-        gate_centers: Gate centres in passing order, shape ``(n_passes, 3)``.
-        obstacles: Obstacle positions used for the plan, shape ``(n_obstacles, 3)``.
-        arc: Arc length samples, shape ``(n, )``.
-        points: Path positions at ``arc``, shape ``(n, 3)``.
-        clearance: XY distance to the nearest pole at every sample, shape ``(n, )``.
-        plan_ms: Wall-clock time of the plan in milliseconds.
-    """
-
-    use_astar: bool
-    path: object
-    gate_centers: NDArray[np.floating]
-    obstacles: NDArray[np.floating]
-    arc: NDArray[np.floating]
-    points: NDArray[np.floating]
-    clearance: NDArray[np.floating]
-    plan_ms: float
-
-
-def observation_from_config(config: ConfigDict) -> dict[str, NDArray[np.floating]]:
-    """Build the observation the planner needs from the nominal track of a configuration.
+def load_log(path: str | Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Read one run log.
 
     Args:
-        config: The loaded race configuration.
+        path: Path of the ``.npz`` written by ``scripts/debug_run.py``. A ``.json`` of the same name
+            next to it is read too when present, for the verdict and the timing.
 
     Returns:
-        A dictionary with the observation keys the planner reads.
+        The arrays of the run and its summary. The summary is empty if there is no ``.json``.
+
+    Raises:
+        FileNotFoundError: If the ``.npz`` does not exist.
     """
-    from lsy_drone_racing.envs.utils import load_gate_order, load_track
-
-    gates, obstacles, drones = load_track(config.env.track)
-    order, sign = load_gate_order(config.env.track, len(config.env.track.gates))
-    return {
-        "pos": np.asarray(drones.pos[0], dtype=float),
-        "vel": np.zeros(3),
-        "quat": np.array([0.0, 0.0, 0.0, 1.0]),
-        "gates_pos": np.asarray(gates.pos, dtype=float),
-        "gates_quat": np.asarray(gates.quat, dtype=float),
-        "obstacles_pos": np.asarray(obstacles.pos, dtype=float),
-        "gate_sequence": order,
-        "gate_sequence_direction": sign,
-    }
+    log_path = Path(path)
+    if not log_path.exists():
+        raise FileNotFoundError(f"no run log at {log_path}")
+    with np.load(log_path) as data:
+        arrays = {key: data[key] for key in data.files}
+    summary_path = log_path.with_suffix(".json")
+    summary = json.loads(summary_path.read_text()) if summary_path.exists() else {}
+    return arrays, summary
 
 
-def pole_clearance(
-    points: NDArray[np.floating], obstacles: NDArray[np.floating]
-) -> NDArray[np.floating]:
-    """Return the XY distance from every path point to the nearest obstacle.
+def finish_time(arrays: dict[str, Any], summary: dict[str, Any]) -> float:
+    """Return the finishing time of a run in seconds.
 
     Args:
-        points: Path points, shape ``(n, 3)``.
-        obstacles: Obstacle positions, shape ``(m, 3)``.
+        arrays: The arrays of the run.
+        summary: Its summary, empty if there was no ``.json``.
 
     Returns:
-        The clearance of every point, shape ``(n, )``, or all ``inf`` without obstacles.
+        The simulated time at the end of the run.
     """
-    if len(obstacles) == 0:
-        return np.full(len(points), np.inf)
-    delta = points[:, None, :2] - np.asarray(obstacles, dtype=float)[None, :, :2]
-    return np.linalg.norm(delta, axis=-1).min(axis=1)
+    if "sim_time" in summary:
+        return float(summary["sim_time"])
+    times = np.asarray(arrays["t"], dtype=float)
+    if not len(times):
+        return 0.0
+    step = float(np.median(np.diff(times))) if len(times) > 1 else 0.0
+    return float(times[-1] + step)
 
 
-def plan_route(
-    obs: dict[str, NDArray[np.floating]], config: ConfigDict | None = None, samples: int = 4000
-) -> PathRecord:
-    """Plan one route with the configured planner and collect what the figure and the summary need.
-
-    Args:
-        obs: Observation dictionary, see [observation_from_config][...observation_from_config].
-        config: Race configuration whose planner settings apply, or ``None`` for the defaults.
-        samples: Number of arc length samples to evaluate.
-
-    Returns:
-        The planned route.
-    """
-    import time
-
-    settings = path_config_from(config)
-    planner = PathPlanner(settings)
-    start = time.perf_counter()
-    path, info = planner.plan(obs, obs["pos"])
-    elapsed = (time.perf_counter() - start) * 1e3
-    arc = np.linspace(0.0, path.length, samples)
-    points = path.pos(arc)
-    return PathRecord(
-        use_astar=settings.use_astar,
-        path=path,
-        gate_centers=info.gate_centers,
-        obstacles=info.obstacles,
-        arc=arc,
-        points=points,
-        clearance=pole_clearance(points, info.obstacles),
-        plan_ms=elapsed,
-    )
-
-
-def _draw_gates(ax: Axes, obs: dict[str, NDArray[np.floating]]) -> None:
+def _draw_gates(ax: Axes, gates_pos: np.ndarray, gates_quat: np.ndarray) -> None:
     """Draw the gate frames, their opening and their crossing direction."""
     from scipy.spatial.transform import Rotation as R
 
-    for gate_id, (centre, quat) in enumerate(zip(obs["gates_pos"], obs["gates_quat"], strict=True)):
+    for gate_id, (centre, quat) in enumerate(zip(gates_pos, gates_quat, strict=True)):
         rotation = R.from_quat(quat)
         lateral = rotation.apply([0.0, 1.0, 0.0])
         normal = rotation.apply([1.0, 0.0, 0.0])
@@ -166,7 +108,7 @@ def _draw_gates(ax: Axes, obs: dict[str, NDArray[np.floating]]) -> None:
         opening = np.stack(
             [centre - GATE_OPENING_HALF * lateral, centre + GATE_OPENING_HALF * lateral]
         )
-        ax.plot(opening[:, 0], opening[:, 1], color="tab:orange", lw=1.3, ls=":", zorder=4)
+        ax.plot(opening[:, 0], opening[:, 1], color="tab:grey", lw=1.3, ls=":", zorder=4)
         ax.annotate(
             f"g{gate_id}",
             xy=(centre[0], centre[1]),
@@ -187,14 +129,8 @@ def _draw_gates(ax: Axes, obs: dict[str, NDArray[np.floating]]) -> None:
         )
 
 
-def _draw_poles(ax: Axes, obstacles: NDArray[np.floating]) -> None:
-    """Draw every obstacle with the radius at which the drone would touch it.
-
-    The circle is the pole radius plus the drone radius and nothing else, so it marks actual
-    contact rather than the planner's safety margin: `safety_distance` and the larger radius the A*
-    search blocks are both requirements above this one, and drawing them here made the poles look
-    far bigger than the obstacle.
-    """
+def _draw_poles(ax: Axes, obstacles: np.ndarray) -> None:
+    """Draw every obstacle with the radius at which the drone would touch it."""
     import matplotlib.pyplot as plt
 
     contact = POLE_RADIUS + DRONE_RADIUS
@@ -215,43 +151,35 @@ def _draw_poles(ax: Axes, obstacles: NDArray[np.floating]) -> None:
         )
 
 
-def plot_paths(
-    obs: dict[str, NDArray[np.floating]],
+def plot_arrays(
+    arrays: dict[str, Any],
     out_path: str | Path,
     *,
-    resolution: float = 0.10,
-    grid: bool = True,
-    dpi: int = 140,
-    flown: NDArray[np.floating] | None = None,
-    flown_speed: NDArray[np.floating] | None = None,
-    planned: bool = True,
-    extra: list[tuple[str, NDArray[np.floating]]] | None = None,
     title: str | None = None,
     subtitle: str | None = None,
-    config: ConfigDict | None = None,
     heading: str | None = None,
-) -> PathRecord:
-    """Draw a track from above with the planned path and the flight that followed it.
+    planned: bool = False,
+    grid: bool = True,
+    resolution: float = 0.10,
+    dpi: int = 140,
+    finish: float | None = None,
+) -> Path:
+    """Draw a run from its logged arrays and save the figure.
 
     Args:
-        obs: Observation dictionary, see [observation_from_config][...observation_from_config].
+        arrays: The arrays of a run, as written by ``scripts/debug_run.py``.
         out_path: Where to write the image. Parent directories are created.
-        resolution: Edge length [m] of the A* grid cell used for the occupancy overlay.
-        grid: Whether to draw the occupancy overlay of the A* search.
-        dpi: Resolution of the saved figure.
-        flown: Optional achieved trajectory of an episode, shape ``(n, 3)``. Drawn coloured by
-            speed.
-        flown_speed: Speed at every ``flown`` sample, shape ``(n, )``. Without it the flown
-            trajectory is coloured by arc length instead.
-        planned: Whether to draw the planned path. Off when only how the drone flew matters.
-        extra: Optional further paths to draw as thin lines, each a ``(label, points)`` pair.
-        title: Figure title. Defaults to "Planned path".
-        subtitle: Optional second title line, e.g. the verdict of an episode.
-        config: Race configuration whose planner settings apply, or ``None`` for the defaults.
+        title: Figure title. Defaults to "Run".
+        subtitle: Optional second title line, e.g. the verdict.
         heading: Heading of the plot. Defaults to "Track from above".
+        planned: Whether to draw the last path the controller committed to, from ``plan_points``.
+        grid: Whether to draw the occupancy overlay of the A* search.
+        resolution: Edge length [m] of the A* grid cell used for the occupancy overlay.
+        dpi: Resolution of the saved figure.
+        finish: Finishing time in seconds. Taken from the ``t`` array when omitted.
 
     Returns:
-        The planned route.
+        The path of the written image.
     """
     import matplotlib
 
@@ -261,30 +189,31 @@ def plot_paths(
     from matplotlib.lines import Line2D
     from matplotlib.patches import Patch
 
-    settings = path_config_from(config)
-    record = plan_route(obs, config)
+    obstacles = np.asarray(arrays["true_obstacles_pos"], dtype=float)
+    gates_pos = np.asarray(arrays["true_gates_pos"], dtype=float)
+    gates_quat = np.asarray(arrays["gates_quat"], dtype=float)
+    flown = np.asarray(arrays["pos"], dtype=float)
+    speed = np.asarray(arrays["speed"], dtype=float)
+    elapsed = float(finish) if finish is not None else float(np.asarray(arrays["t"])[-1])
 
     overlay = None
     if grid:
-        frames = GateFrames.from_quaternions(obs["gates_quat"])
+        from scipy.spatial.transform import Rotation as R
+
+        y_axes = R.from_quat(gates_quat).as_matrix()[:, :, 1]
         overlay = ArenaGrid(
-            obs["obstacles_pos"],
-            obs["gates_pos"],
-            frames.y_axes,
+            obstacles,
+            gates_pos,
+            y_axes,
             AstarConfig(
                 resolution=resolution,
-                pole_clearance=settings.safety_distance,
-                frame_margin=settings.astar_frame_margin,
-                # Must match what the planner passes, or the drawn occupancy is more optimistic
-                # than the grid the route was actually searched on.
-                overshoot=settings.push_scale,
-                bounds_low=settings.astar_bounds[0],
-                bounds_high=settings.astar_bounds[1],
+                pole_clearance=_OVERLAY_CLEARANCE,
+                overshoot=_OVERLAY_OVERSHOOT,
+                bounds_low=_OVERLAY_BOUNDS[0],
+                bounds_high=_OVERLAY_BOUNDS[1],
             ),
         )
 
-    # The legend lives outside the axes, so the track needs room to its left and the figure room to
-    # its right.
     figure, top = plt.subplots(figsize=(13.0, 6.4))
     handles: list = []
 
@@ -304,12 +233,13 @@ def plot_paths(
             Patch(facecolor="0.55", alpha=0.45, label=f"A* occupancy ({resolution:.2f} m cells)")
         )
 
-    _draw_poles(top, obs["obstacles_pos"])
-    _draw_gates(top, obs)
+    _draw_poles(top, obstacles)
+    _draw_gates(top, gates_pos, gates_quat)
     handles.extend(
         [
             Line2D([], [], color="0.20", lw=5.0, label="gate frame"),
-            Line2D([], [], color="tab:orange", lw=1.3, ls=":", label="gate opening + direction"),
+            Line2D([], [], color="tab:grey", lw=1.3, ls=":", label="gate opening"),
+            Line2D([], [], color="tab:orange", lw=1.0, label="gate crossing direction"),
             Line2D([], [], marker="o", color="tab:purple", ls="none", ms=5, label="pole"),
             Line2D(
                 [],
@@ -321,51 +251,45 @@ def plot_paths(
         ]
     )
 
-    for label, points_extra in extra or []:
-        top.plot(points_extra[:, 0], points_extra[:, 1], color="tab:cyan", ls="-", lw=1.5, zorder=3)
-        handles.append(Line2D([], [], color="tab:cyan", lw=1.5, label=label))
-
-    end_point = record.points[-1]
-    if planned:
-        top.plot(
-            record.points[:, 0],
-            record.points[:, 1],
-            color="k",
-            lw=2.0,
-            zorder=6,
-            solid_capstyle="round",
+    if planned and "plan_points" in arrays and len(arrays["plan_points"]):
+        # Every plan starts at the original take-off point and is anchored by path progress, so most
+        # of the last plan is already behind the drone. Draw only the part it still had to fly.
+        last = np.asarray(arrays["plan_points"][-1], dtype=float)
+        theta = float(np.asarray(arrays["plan_theta"])[-1])
+        length = float(np.asarray(arrays["plan_length"])[-1])
+        first = int(np.clip(round(theta / max(length, 1e-9) * (len(last) - 1)), 0, len(last) - 1))
+        remaining = last[first:]
+        top.plot(remaining[:, 0], remaining[:, 1], color="k", lw=1.8, zorder=3)
+        handles.insert(
+            0, Line2D([], [], color="k", lw=1.8, label="last plan, from where it was committed")
         )
-        handles.insert(0, Line2D([], [], color="k", lw=2.0, label="planned path"))
 
-    if flown is not None and len(flown) > 1:
+    if len(flown) > 1:
         segments = np.stack([flown[:-1, :2], flown[1:, :2]], axis=1)
         collection = LineCollection(segments, cmap="turbo", zorder=7, linewidths=2.8)
-        if flown_speed is not None and len(flown_speed) >= len(segments):
-            collection.set_array(np.asarray(flown_speed, dtype=float)[: len(segments)])
-            colour_label = "flown speed [m/s]"
-        else:
-            travelled = np.concatenate(
-                ([0.0], np.cumsum(np.linalg.norm(np.diff(flown, axis=0), axis=1)))
-            )
-            collection.set_array(travelled[: len(segments)])
-            colour_label = "flown arc length [m]"
+        collection.set_array(speed[: len(segments)])
         top.add_collection(collection)
         bar = figure.colorbar(collection, ax=top, fraction=0.030, pad=0.015)
-        bar.set_label(colour_label, fontsize=9)
+        bar.set_label("flown speed [m/s]", fontsize=9)
         bar.ax.tick_params(labelsize=8)
         handles.insert(
             int(planned), Line2D([], [], color="tab:orange", lw=2.8, label="flown (colour = speed)")
         )
-        end_point = flown[-1]
 
-    top.plot(
-        obs["pos"][0], obs["pos"][1], "*", ms=18, color="tab:green", mec="k", mew=0.6, zorder=8
+    top.plot(flown[0, 0], flown[0, 1], "*", ms=18, color="tab:green", mec="k", mew=0.6, zorder=8)
+    top.plot(flown[-1, 0], flown[-1, 1], "s", ms=8, color="tab:green", mec="k", mew=0.6, zorder=8)
+    top.annotate(
+        f"finish {elapsed:.2f} s",
+        xy=(flown[-1, 0], flown[-1, 1]),
+        xytext=(flown[-1, 0] + 0.12, flown[-1, 1] - 0.04),
+        color="tab:green",
+        fontsize=9.5,
+        zorder=9,
     )
-    top.plot(end_point[0], end_point[1], "s", ms=8, color="tab:green", mec="k", mew=0.6, zorder=8)
     handles.extend(
         [
             Line2D([], [], marker="*", color="tab:green", ls="none", ms=14, label="start"),
-            Line2D([], [], marker="s", color="tab:green", ls="none", ms=8, label="end"),
+            Line2D([], [], marker="s", color="tab:green", ls="none", ms=8, label="finish"),
         ]
     )
 
@@ -383,11 +307,45 @@ def plot_paths(
         borderaxespad=0.0,
     )
 
-    figure.suptitle(title or "Planned path", fontsize=12, y=1.0)
+    figure.suptitle(f"{title or 'Run'} — finished in {elapsed:.2f} s", fontsize=12.5, y=0.99)
     if subtitle:
-        figure.text(0.42, 0.955, subtitle, ha="center", va="top", fontsize=10, color="0.25")
+        figure.text(0.42, 0.945, subtitle, ha="center", va="top", fontsize=10, color="0.25")
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(out_path, dpi=dpi, bbox_inches="tight", facecolor="white")
     plt.close(figure)
-    return record
+    return out_path
+
+
+def plot_run(
+    log_path: str | Path,
+    out_path: str | Path,
+    *,
+    title: str | None = None,
+    description: str | None = None,
+    **kwargs: Any,
+) -> Path:
+    """Draw a run from the ``.npz`` written by ``scripts/debug_run.py``.
+
+    Args:
+        log_path: Path of the ``.npz``. A ``.json`` of the same name next to it supplies the verdict
+            and the finishing time.
+        out_path: Where to write the image.
+        title: Figure title. Defaults to the log file name.
+        description: Optional second title line. Defaults to the verdict from the summary.
+        **kwargs: Passed on to [plot_arrays][...plot_arrays].
+
+    Returns:
+        The path of the written image.
+    """
+    arrays, summary = load_log(log_path)
+    if description is None and summary:
+        description = f"{summary.get('verdict', '?')}: {summary.get('detail', '')}".strip(": ")
+    return plot_arrays(
+        arrays,
+        out_path,
+        title=title or Path(log_path).stem,
+        subtitle=description,
+        finish=finish_time(arrays, summary),
+        **kwargs,
+    )
