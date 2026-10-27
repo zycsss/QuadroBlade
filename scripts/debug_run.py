@@ -138,6 +138,50 @@ def classify(
     )
 
 
+def failure_record(
+    verdict: str,
+    last_pos: np.ndarray,
+    sim_time: float,
+    gates_pos: np.ndarray,
+    obstacles_pos: np.ndarray,
+) -> dict[str, Any]:
+    """Describe an unsuccessful ending in a form a figure can draw.
+
+    The verdict alone says a run failed; this says where, when and against which object, which is
+    what a zoomed view needs. It is written into the log as ``failure_*`` arrays.
+
+    Args:
+        verdict: The verdict from `classify`.
+        last_pos: Last live drone position.
+        sim_time: Time at which the episode ended.
+        gates_pos: Gate positions, nominal as the environment started.
+        obstacles_pos: Obstacle positions.
+
+    Returns:
+        A record with ``kind``, ``object`` (index, or ``-1``), ``pos``, ``t`` and the ``distance``
+        to that object. ``kind`` is ``"none"`` for a finished run.
+    """
+    if verdict == "FINISHED":
+        return {"kind": "none", "object": -1, "pos": last_pos, "t": sim_time, "distance": 0.0}
+    obstacle_distance = np.linalg.norm(obstacles_pos - last_pos, axis=1)
+    gate_distance = np.linalg.norm(gates_pos - last_pos, axis=1)
+    if verdict == "HIT_OBSTACLE":
+        index = int(obstacle_distance.argmin())
+        distance = float(obstacle_distance[index])
+    elif verdict == "HIT_GATE":
+        index = int(gate_distance.argmin())
+        distance = float(gate_distance[index])
+    elif verdict == "CONTACT":
+        # Nothing recognised the ending, so point at the nearest object it most likely ran into.
+        if obstacle_distance.min() <= gate_distance.min():
+            index, distance = int(obstacle_distance.argmin()), float(obstacle_distance.min())
+        else:
+            index, distance = int(gate_distance.argmin()), float(gate_distance.min())
+    else:
+        index, distance = -1, 0.0
+    return {"kind": verdict, "object": index, "pos": last_pos, "t": sim_time, "distance": distance}
+
+
 def run_episode(
     config: Any, controller_cls: type, seed: int, verbose: bool = False, device: str = "cpu"
 ) -> dict[str, Any]:
@@ -263,7 +307,6 @@ def run_episode(
                 rec["pos"][i], rec["pos"][i + 1], gates_pos[gate_id], gates_quat[gate_id]
             )
             crossings.append({"pass": k, "gate": gate_id, "t": rec["t"][i + 1], **info_})
-
     if verbose:
         for c in crossings:
             print(
@@ -274,6 +317,14 @@ def run_episode(
     return {
         "verdict": verdict,
         "detail": detail,
+        # Where, when and against what the episode ended, so a figure can zoom on it.
+        "failure": failure_record(
+            verdict,
+            rec["pos"][-1],
+            n_steps / config.env.freq,
+            np.asarray(env.unwrapped.data.gates_pos[0], dtype=float),
+            np.asarray(env.unwrapped.data.obstacles_pos[0], dtype=float),
+        ),
         "n_final": n_final,
         "n_required": len(gate_sequence),
         "steps": n_steps,
@@ -332,6 +383,12 @@ def episode_arrays(ep: dict[str, Any]) -> dict[str, Any]:
         arrays[f"plan_{key}"] = np.array([plan[key] for plan in plans], dtype=float)
     arrays["plan_drone_pos"] = np.array([plan["drone_pos"] for plan in plans], dtype=float)
     arrays["plan_points"] = np.array([plan["points"] for plan in plans], dtype=float)
+    failure = ep["failure"]
+    arrays["failure_kind"] = np.array(failure["kind"])
+    arrays["failure_object"] = np.array(failure["object"], dtype=int)
+    arrays["failure_pos"] = np.asarray(failure["pos"], dtype=float)
+    arrays["failure_t"] = np.array(failure["t"], dtype=float)
+    arrays["failure_distance"] = np.array(failure["distance"], dtype=float)
     return arrays
 
 
