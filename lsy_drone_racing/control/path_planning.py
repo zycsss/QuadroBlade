@@ -547,7 +547,10 @@ class PathPlanner:
         for previous, current in zip(groups[:-1], groups[1:], strict=True):
             start, goal = previous[-1], current[0]
             span = float(np.linalg.norm((goal - start)[:2]))
-            if span < cfg.astar_resolution or grid.line_is_clear(start[:2], goal[:2]):
+            # Only a chord that misses the clearance itself needs a route. Testing against the
+            # routed margin here would reroute legs that already comply, which bends the path
+            # around a pole it clears and leaves a kink where the detour rejoins the gate block.
+            if span < cfg.astar_resolution or grid.line_meets_clearance(start[:2], goal[:2]):
                 joined.append(current)
                 continue
             leg = grid.search(start[:2], goal[:2])

@@ -314,8 +314,30 @@ class ArenaGrid:
     def line_is_clear(self, start_xy: NDArray[np.floating], goal_xy: NDArray[np.floating]) -> bool:
         """Return whether the straight segment between two points clears every obstacle.
 
-        This is the exact geometric test, not the rasterized one, so it is safe to use both as the
-        trigger for a search and as the acceptance test of the path shortcut.
+        This is the exact geometric test, not the rasterized one, so it is safe to use as the
+        acceptance test of the path shortcut. It uses the routed margin, i.e. the required clearance
+        times ``overshoot``, because a shortcut that only satisfies the bare requirement would be
+        pulled inside it by the smoothing pass. To ask whether a chord already satisfies the
+        requirement, and therefore does not need a route at all, use
+        [line_meets_clearance][lsy_drone_racing.control.astar.ArenaGrid.line_meets_clearance].
+
+        Args:
+            start_xy: First end of the segment, shape ``(2,)``.
+            goal_xy: Second end of the segment, shape ``(2,)``.
+
+        Returns:
+            ``True`` if the segment keeps the routed margin everywhere.
+        """
+        return self._clears(start_xy, goal_xy, self.pole_inflate)
+
+    def line_meets_clearance(
+        self, start_xy: NDArray[np.floating], goal_xy: NDArray[np.floating]
+    ) -> bool:
+        """Return whether a straight chord already satisfies the required clearance.
+
+        A chord that does satisfies the planner's own `clearance` requirement needs no route, and
+        routing it anyway would only bend the path around an obstacle it already clears. The routed
+        margin is deliberately not used here: it is the smoothing allowance, not the requirement.
 
         Args:
             start_xy: First end of the segment, shape ``(2,)``.
@@ -324,11 +346,17 @@ class ArenaGrid:
         Returns:
             ``True`` if the segment keeps the required clearance everywhere.
         """
+        return self._clears(start_xy, goal_xy, self.config.pole_clearance)
+
+    def _clears(
+        self, start_xy: NDArray[np.floating], goal_xy: NDArray[np.floating], pole_margin: float
+    ) -> bool:
+        """Return whether a segment keeps ``pole_margin`` from every pole and the frame padding."""
         start = np.asarray(start_xy, dtype=float)[:2]
         goal = np.asarray(goal_xy, dtype=float)[:2]
         if len(self._poles):
             minimum = points_to_segment_distance(self._poles, start, goal).min()
-            if float(minimum) < self.pole_inflate:
+            if float(minimum) < pole_margin:
                 return False
         if len(self._posts_start):
             distances = segment_distances(start, goal, self._posts_start, self._posts_end)

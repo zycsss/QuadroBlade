@@ -108,10 +108,13 @@ there is nothing to discover in `z`. It costs about 2 ms per plan at 10 cm cells
 
 The required clearance between the path and a pole centre is `PathConfig.safety_distance`, 0.15 m,
 measured centre to centre — about 4.5 cm of air around a 0.09 m drone and a 0.015 m pole. Both
-planner layers use that one number. The A* grid blocks a circle of `safety_distance * push_scale`
-around each pole rather than the clearance itself, for the same reason the heuristic detour waypoints
-are placed farther out: the smoothing pass cuts inside a corner, so a route that only just satisfies
-the clearance ends up below it. `[controller]` in a race config may override `use_astar`,
+planner layers use that one number. When the search does run it blocks `safety_distance *
+push_scale` = 0.21 m around each pole, for the same reason the heuristic detour waypoints are placed
+farther out: the smoothing pass cuts inside a corner, so a route that only just satisfies the
+clearance ends up below it. A chord that already keeps the plain 0.15 m is left alone, though, and
+that distinction matters: with the overshot margin used as the trigger, a leg whose straight line
+passed 0.163 m from a pole was rerouted for the sake of 13 mm, which put a visible kink where the
+detour rejoined the gate block. `[controller]` in a race config may override `use_astar`,
 `astar_resolution` and `safety_distance` without code changes.
 
 Measured on level 2, seeds 0-3 (`debug_run.py --n_runs 4`):
@@ -119,20 +122,21 @@ Measured on level 2, seeds 0-3 (`debug_run.py --n_runs 4`):
 | route | finished | mean time | path | min clearance |
 | --- | --- | --- | --- | --- |
 | heuristic push-out | 4/4 | 12.62 s | 13.48 m | 0.150 m |
-| A* route | 4/4 | 12.68 s | 13.51 m | 0.217 m |
+| A* route | 4/4 | 12.63 s | 13.52 m | 0.150 m |
 
-The two are a wash on lap time; the A* route keeps 67 mm more clearance to the nearest pole for 60 ms,
-which is why it is enabled by default. Note what the search actually enforces: `safety_distance *
-push_scale` = 0.21 m, i.e. 40 % outside the requirement, which is the same deliberate overshoot the
-heuristic detour waypoints use and what keeps the route above 0.15 m after the smoothing pass.
+That is a dead heat, and worth stating plainly: once the unnecessary detours are gone, the heuristic
+push-out already reaches the required clearance everywhere on this track, so the search has nothing
+left to fix here and the two differ by 4 cm of path and 10 ms. The route search is the more general
+method — it also decides the side of a pole rather than inheriting it from where a waypoint landed —
+and it is never worse in these measurements, but it is not buying lap time on level 2. Both routes
+sit at exactly 0.150 m at their tightest point, i.e. on the requirement with no margin.
 
 **Gate passages and corners.** `gate_straight_length` is the length over which the path is forced
 straight through a gate. It is the parameter that controls how tight the corners next to a gate get:
-halving it from 0.55 m to 0.275 m cuts the peak curvature of the A* route from 14.6 1/m to 5.9 1/m,
-so the sharpest corner goes from a 6.9 cm to a 16.9 cm radius, and the curvature speed limit there
-(`v <= sqrt(a_lat_max / curvature)` with `a_lat_max` 4.0) rises from 0.52 m/s to 0.82 m/s. The minimum
-pole clearance improves with it, from 0.168 m to 0.217 m, and the lap time drops from 12.83 s to
-12.68 s.
+halving it from 0.55 m to 0.275 m cuts the peak curvature from 14.7 1/m to 5.9 1/m (heuristic route
+14.9 to 6.2 1/m), so the sharpest corner goes from a 6.9 cm to a 16.9 cm radius, and the curvature
+speed limit there (`v <= sqrt(a_lat_max / curvature)` with `a_lat_max` 4.0) rises from 0.52 m/s to
+0.82 m/s. The lap time drops from 12.68 s to 12.63 s at unchanged clearance.
 
 `approach_distance`, the +-0.6 m in/out waypoints along the gate normal, is *not* the lever for this:
 halving it to 0.3 m shortens the path by 1.2 m but pushes the 95th-percentile curvature from 3.5 to
