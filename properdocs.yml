@@ -58,6 +58,7 @@ nav:
       - control.attitude_controller: control/attitude_controller.md
       - control.attitude_mpc: control/attitude_mpc.md
       - control.path_planning: control/path_planning.md
+      - control.astar: control/astar.md
       - control.my_controller: control/my_controller.md
     - Environments:
       - envs/index.md

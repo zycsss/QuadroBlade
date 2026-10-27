@@ -20,6 +20,10 @@ Deviations from the reference implementation (all required for this environment)
 
 * The gate order is taken from ``obs["gate_sequence"]`` and ``obs["gate_sequence_direction"]``
   instead of the raw gate array order, so repeated gates and reverse passes are handled.
+* The route between two gate passages is searched with a two dimensional A* over a rasterized top
+  view of the track, see [astar][lsy_drone_racing.control.astar]. The heuristic push-out of the
+  reference implementation is kept as a safety net behind it, and ``PathConfig.use_astar`` selects
+  which of the two decides the route.
 * The blocked interval's entry sample is kept and a degenerate (dead-centre) obstacle crossing
   falls back to the chord perpendicular instead of placing the waypoint inside the obstacle.
 * The path is extended past the last gate and defines a linear continuation outside its parameter
@@ -30,6 +34,7 @@ Deviations from the reference implementation (all required for this environment)
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -37,8 +42,12 @@ import numpy as np
 from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Rotation as R
 
+from lsy_drone_racing.control.astar import ArenaGrid, AstarConfig
+
 if TYPE_CHECKING:
     from numpy.typing import NDArray
+
+logger = logging.getLogger(__name__)
 
 #: Weight of the proximity bump around a gate centre. Mirrors the reference `qc_dyn` allocation and
 #: the Gaussian contouring-weight allocation of the T-RO22 paper (Sec. IV-C).
@@ -67,6 +76,20 @@ class PathConfig:
             after each pass and the loop stops as soon as the required clearance is achieved.
         length_growth_max: Maximum factor by which obstacle avoidance may lengthen the path before
             it is rejected. A rejected pass keeps the previous, shorter path.
+        use_astar: Whether to decide the route around the obstacles with a grid A* search. When
+            enabled, every chord between two gate passages that violates the clearance is replaced
+            by the shortest clearance-keeping route found on a rasterized top view of the track, so
+            the side on which a pole is passed is searched instead of guessed. When disabled, the
+            heuristic detour waypoints of ``_avoid_obstacles`` are used instead. Off by default: the
+            search raises the minimum pole clearance of the nominal level 2 track from 0.25 m to
+            0.32 m and costs about 2 ms per plan, but on the same randomized seeds it finished 3 of
+            5 episodes where the heuristic finished 4 of 4, so it is not yet a measured improvement
+            in the closed loop.
+        astar_resolution: Edge length [m] of one A* grid cell. 0.10 m resolves the poles and is
+            about twice as fast as 0.05 m for a route that is a few percent longer.
+        astar_frame_margin: Additional clearance [m] on top of the drone radius that an A* route
+            keeps from the gate posts.
+        astar_bounds: Lower and upper corner of the arena in XY [m] that the A* grid covers.
         smooth_iterations: Number of Laplacian smoothing sweeps applied to the polyline after
             obstacle avoidance. The push-out inserts waypoints that create near-cusps, which would
             otherwise cap the flyable path speed.
@@ -97,6 +120,10 @@ class PathConfig:
     push_scale: float = 1.4
     obstacle_iter_max: int = 2
     length_growth_max: float = 1.25
+    use_astar: bool = False
+    astar_resolution: float = 0.10
+    astar_frame_margin: float = 0.02
+    astar_bounds: tuple[tuple[float, float], tuple[float, float]] = ((-2.45, -1.45), (2.45, 1.45))
     smooth_iterations: int = 600
     anchor_window: float = 0.25
     gate_straight_length: float = 0.55
@@ -346,9 +373,11 @@ class PathPlanner:
         start = np.asarray(start_pos, dtype=float).reshape(3)
         blocks = self._gate_blocks(start, pass_pos, pass_normals, obstacles)
         blocks = self._insert_detours(blocks, pass_pos, pass_normals, pass_y_axes, pass_z_axes)
-        waypoints = np.concatenate(
-            [np.concatenate(blocks, axis=0), self._runout(blocks, pass_pos, pass_normals)]
-        )
+        runout = self._runout(blocks, pass_pos, pass_normals)
+        if self.config.use_astar and len(obstacles):
+            waypoints = self._connect_blocks(blocks, runout, obstacles, gate_pos, frames.y_axes)
+        else:
+            waypoints = np.concatenate([np.concatenate(blocks, axis=0), runout])
         waypoints = self._avoid_obstacles(waypoints, obstacles)
         waypoints = self._smooth_path(waypoints, obstacles)
         waypoints = self._straighten_gate_passages(waypoints, pass_pos, pass_normals)
@@ -468,6 +497,91 @@ class PathPlanner:
                     detour_dir = -pass_y_axes[i]
             out.append((pass_pos[i] + cfg.detour_distance * detour_dir).reshape(1, 3))
         return out
+
+    def _connect_blocks(
+        self,
+        blocks: list[NDArray[np.floating]],
+        runout: NDArray[np.floating],
+        obstacles: NDArray[np.floating],
+        gates_pos: NDArray[np.floating],
+        gates_y_axes: NDArray[np.floating],
+    ) -> NDArray[np.floating]:
+        """Join the waypoint blocks, routing around the obstacles where a chord is blocked.
+
+        The blocks are kept verbatim, because their points define the gate passages and a path that
+        leaves the gate normal inside the opening clips the frame. Only the straight chords between
+        two consecutive blocks are negotiable: a chord that already keeps the required clearance is
+        kept as it is, and a blocked one is replaced by the route found by
+        [ArenaGrid.search][lsy_drone_racing.control.astar.ArenaGrid.search]. The height is
+        interpolated along the leg because the search is two dimensional.
+
+        Args:
+            blocks: Waypoint blocks of the track, each shape ``(n_block, 3)``.
+            runout: Final waypoint behind the last gate, shape ``(1, 3)``.
+            obstacles: Obstacle positions, shape ``(n_obstacles, 3)``.
+            gates_pos: Gate centres, shape ``(n_gates, 3)``. Every gate contributes a pair of posts
+                that a route has to avoid.
+            gates_y_axes: In-plane lateral axis of every gate, shape ``(n_gates, 3)``.
+
+        Returns:
+            The joined waypoints, shape ``(m_points, 3)``.
+        """
+        cfg = self.config
+        groups = [np.asarray(block, dtype=float).reshape(-1, 3) for block in blocks]
+        groups.append(np.asarray(runout, dtype=float).reshape(-1, 3))
+        grid = ArenaGrid(
+            obstacles,
+            gates_pos,
+            gates_y_axes,
+            AstarConfig(
+                resolution=cfg.astar_resolution,
+                pole_clearance=cfg.safety_distance,
+                frame_margin=cfg.astar_frame_margin,
+                bounds_low=cfg.astar_bounds[0],
+                bounds_high=cfg.astar_bounds[1],
+            ),
+        )
+        joined = [groups[0]]
+        for previous, current in zip(groups[:-1], groups[1:], strict=True):
+            start, goal = previous[-1], current[0]
+            span = float(np.linalg.norm((goal - start)[:2]))
+            if span < cfg.astar_resolution or grid.line_is_clear(start[:2], goal[:2]):
+                joined.append(current)
+                continue
+            leg = grid.search(start[:2], goal[:2])
+            if leg is None or len(leg) < 2:
+                logger.warning(
+                    "No A* route between %s and %s, keeping the straight chord", start, goal
+                )
+                joined.append(current)
+                continue
+            joined.append(self._lift_leg(leg, start, goal)[1:-1])
+            joined.append(current)
+        return np.concatenate(joined, axis=0)
+
+    @staticmethod
+    def _lift_leg(
+        leg: NDArray[np.floating], start: NDArray[np.floating], goal: NDArray[np.floating]
+    ) -> NDArray[np.floating]:
+        """Attach a height to a two dimensional route by interpolating along its length.
+
+        Args:
+            leg: The route in the XY plane, shape ``(n, 2)``.
+            start: The anchor the route starts at, shape ``(3,)``.
+            goal: The anchor the route ends at, shape ``(3,)``.
+
+        Returns:
+            The three dimensional route, shape ``(n, 3)``, starting at ``start`` and ending at
+            ``goal``.
+        """
+        chords = np.linalg.norm(np.diff(leg, axis=0), axis=1)
+        cumulative = np.concatenate(([0.0], np.cumsum(chords)))
+        fraction = cumulative / max(float(cumulative[-1]), 1e-9)
+        heights = start[2] + fraction * (goal[2] - start[2])
+        lifted = np.column_stack([np.asarray(leg, dtype=float), heights])
+        lifted[0] = start
+        lifted[-1] = goal
+        return lifted
 
     def _avoid_obstacles(
         self, waypoints: NDArray[np.floating], obstacles: NDArray[np.floating]

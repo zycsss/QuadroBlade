@@ -97,6 +97,23 @@ path, which is what makes level 2 (randomized, only locally revealed poses) work
 tracks the planner also forces a straight passage through every gate and keeps the path out of the
 solid gate frames it is not passing through.
 
+**Obstacle routing.** The side on which the path passes a pole can be decided by a two dimensional A*
+search over a rasterized top view of the track
+([`lsy_drone_racing/control/astar.py`](lsy_drone_racing/control/astar.py)) instead of by the local
+push-out heuristic alone. Only the chords *between* two consecutive gate passages are rerouted; the
+passages themselves stay on the gate normal, because a path that leaves the normal inside the opening
+clips the frame. The search is two dimensional for a reason: the obstacles are vertical cylinders
+spanning the whole flight altitude band and the gate altitudes are prescribed by the gate order, so
+there is nothing to discover in `z`. On the nominal level 2 track it costs about 2 ms per plan at
+10 cm cells and raises the minimum pole clearance from 0.25 m to 0.32 m, i.e. from just inside the
+0.26 m safety distance to comfortably outside it.
+
+It is **off by default** (`PathConfig.use_astar = False`) because the clearance gain does not
+translate into a better success rate yet: on the same randomized seeds the search finished 3 of 5
+level 2 episodes at 12.9 s mean, the heuristic 4 of 4 at 12.6 s mean. The two failures look like
+tracking problems on the sharper routed geometry (one contact after the third gate, one gate hit)
+rather than collisions with a pole, which is where the next step is.
+
 ```bash
 # headless flight with a per-episode verdict and trajectory plot
 python scripts/debug_run.py --config level1.toml --controller my_controller.py
@@ -106,6 +123,9 @@ python scripts/debug_run.py --config level1.toml --controller my_controller.py -
 
 # rendered flight (the configs enable the GUI by default)
 python scripts/sim.py --config level0.toml
+
+# what the planner decided, without flying: top view, clearance and altitude per route
+python scripts/plot_path.py --config level2.toml
 ```
 
 `python` has to resolve to the repository's pixi environment; from a plain shell use
