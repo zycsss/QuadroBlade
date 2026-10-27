@@ -380,27 +380,24 @@ def write_log(
     return out_path
 
 
-def plot_episode(ep: dict[str, Any], arrays: dict[str, Any], out_path: Path, title: str) -> Path:
-    """Plot how the episode actually flew, from the same arrays the log holds.
+def plot_episode(log_path: Path, out_path: Path, title: str) -> Path:
+    """Plot the run that a written log holds.
+
+    The figure is built by `lsy_drone_racing.utils.path_plot` from the log file, not from anything
+    held in memory, so the picture and the log are the same data by construction.
 
     Args:
-        ep: The episode record returned by `run_episode`.
-        arrays: The arrays of the episode, see [episode_arrays][...episode_arrays].
+        log_path: The ``.npz`` this episode was just logged to.
         out_path: Where to write the image.
         title: Figure title.
 
     Returns:
         The path of the written image.
     """
-    from lsy_drone_racing.utils.path_plot import plot_arrays
+    from lsy_drone_racing.utils.path_plot import plot_run
 
-    return plot_arrays(
-        arrays,
-        out_path,
-        title=title,
-        subtitle=f"{ep['verdict']}: {ep['detail']}",
-        heading="Track from above: colour = how it flew",
-        finish=ep["sim_time"],
+    return plot_run(
+        log_path, out_path, title=title, heading="Track from above: colour = how it flew"
     )
 
 
@@ -456,9 +453,11 @@ def main(
             in the config.
         n_runs: Number of episodes to run.
         seed: Base random seed. Episode ``i`` uses ``seed + i``.
-        plot: Whether to write a PNG per episode.
+        plot: Whether to write a PNG per episode. The figure is drawn from the run log by
+            `lsy_drone_racing.utils.path_plot`, so the log is written even when `log` is False.
         out_dir: Directory for plots (``plots/`` is gitignored).
-        log: Whether to write an ``.npz`` of the run and a ``.json`` summary per episode.
+        log: Whether to report the ``.npz`` of the run and its ``.json`` summary per episode. The
+            files are written whenever this or `plot` is set, because the figure needs them.
         log_dir: Directory for those logs (``logs/`` is gitignored).
         verbose: Print per-gate-pass margins.
         device: ``"cpu"`` or ``"gpu"``. The environment defaults to CPU and the TOML config cannot
@@ -492,34 +491,33 @@ def main(
         )
         if plot or log:
             stem = f"{config_path.stem}_{Path(controller_file).stem}_seed{ep_seed}"
-            arrays = episode_arrays(ep)
-            # The log is written first, so the figure always has a file that reproduces it.
+            log_path = write_log(
+                ep,
+                episode_arrays(ep),
+                Path(log_dir) / f"{stem}.npz",
+                {
+                    "config": config,
+                    "controller": controller_file,
+                    "seed": ep_seed,
+                    "device": device,
+                    "control_mode": cfg.env.control_mode,
+                },
+            )
             if log:
-                written = write_log(
-                    ep,
-                    arrays,
-                    Path(log_dir) / f"{stem}.npz",
-                    {
-                        "config": config,
-                        "controller": controller_file,
-                        "seed": ep_seed,
-                        "device": device,
-                        "control_mode": cfg.env.control_mode,
-                    },
-                )
                 solver_ms = ep["record"].get("solver_ms", np.zeros(0))
                 print(
-                    f"          log  -> {written}  ({len(ep['plan_log'])} plans, "
+                    f"          log  -> {log_path}  ({len(ep['plan_log'])} plans, "
                     f"{len(ep['record']['t'])} steps, solver "
                     + (f"{np.mean(solver_ms):.1f} ms mean" if len(solver_ms) else "n/a")
                     + ")"
                 )
             if plot:
+                # Plotted from the file that was just written, never from memory.
                 out = Path(out_dir) / f"{stem}.png"
                 plot_episode(
-                    ep, arrays, out, f"{config_path.stem} / {controller_file} / seed {ep_seed}"
+                    log_path, out, f"{config_path.stem} / {controller_file} / seed {ep_seed}"
                 )
-                print(f"          plot -> {out}")
+                print(f"          plot -> {out}  (from {log_path.name})")
 
     n_ok = sum(ep["verdict"] == "FINISHED" for ep in results)
     times = [ep["sim_time"] for ep in results if ep["verdict"] == "FINISHED"]

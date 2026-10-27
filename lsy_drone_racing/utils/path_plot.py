@@ -151,7 +151,7 @@ def _draw_poles(ax: Axes, obstacles: np.ndarray) -> None:
         )
 
 
-def plot_arrays(
+def _plot_arrays(
     arrays: dict[str, Any],
     out_path: str | Path,
     *,
@@ -325,7 +325,10 @@ def plot_run(
     description: str | None = None,
     **kwargs: Any,
 ) -> Path:
-    """Draw a run from the ``.npz`` written by ``scripts/debug_run.py``.
+    """Draw a run from the log that ``scripts/debug_run.py`` wrote.
+
+    This is the entry point: everything the figure shows is read back from ``log_path``, so a
+    picture can never disagree with the run it describes and two runs are drawn from identical data.
 
     Args:
         log_path: Path of the ``.npz``. A ``.json`` of the same name next to it supplies the verdict
@@ -333,7 +336,8 @@ def plot_run(
         out_path: Where to write the image.
         title: Figure title. Defaults to the log file name.
         description: Optional second title line. Defaults to the verdict from the summary.
-        **kwargs: Passed on to [plot_arrays][...plot_arrays].
+        **kwargs: Passed on to [_plot_arrays][..._plot_arrays], e.g. ``planned``, ``grid``,
+            ``resolution`` or ``dpi``.
 
     Returns:
         The path of the written image.
@@ -341,7 +345,7 @@ def plot_run(
     arrays, summary = load_log(log_path)
     if description is None and summary:
         description = f"{summary.get('verdict', '?')}: {summary.get('detail', '')}".strip(": ")
-    return plot_arrays(
+    return _plot_arrays(
         arrays,
         out_path,
         title=title or Path(log_path).stem,
