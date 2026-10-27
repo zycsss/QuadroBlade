@@ -5,21 +5,6 @@
 # | `level2.toml`       | *Yes*                          | *Yes*                       | *No*              | Learning, re-planning |
 [controller]
 file = "my_controller.py" # Put your controller file name here. Specifying a controller as argument to scripts will override this setting. Controllers are located in `lsy_drone_racing/control/`
-# Optional path planner overrides (see `PathConfig`): route the path around the poles with a 2D A*
-# search instead of the push-out heuristic, and set the required clearance between path and pole
-# centers.
-use_astar = true
-# safety_distance = 0.15
-# Optional MPCC overrides (see `MPCCConfig`). The reference speed is
-#   v = mu_speed / (2 * (w_speed_gate * gate_weight + r_vtheta)),  gate_weight in [0, 0.4]
-# so `w_speed_gate` is what throttles the drone at the gates and `a_lat_max` what throttles it in the
-# corners. Raising `v_max` alone changes almost nothing.
-w_speed_gate = 4.0
-a_lat_max = 8.0
-v_max = 3.5
-# The reference speed is halved for this long after every re-plan. Level 2 re-plans on every
-# revealed pose, so this is a large share of the lap.
-replan_slowdown_time = 0.3
 
 [deploy]
 ### Settings only relevant for deployment

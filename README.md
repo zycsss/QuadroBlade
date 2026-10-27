@@ -178,7 +178,13 @@ sixth of `w_speed_gate`. Measured on level 2, seeds 0-3, `debug_run.py --n_runs 
 `replan_slowdown_time` is worth 1.1 s on its own because level 2 re-plans on every revealed pose and
 halves the reference speed for that long each time. The gate margins only tighten by 1-2 cm at the
 fast setting (tightest pass 9.7 cm against the 20 cm half opening), so the speed is not being bought
-with accuracy. All four knobs live in the `[controller]` section of the config file.
+with accuracy.
+
+Those four values are the controller's own defaults for a randomized track
+(`RANDOMIZED_TRACK_MPCC` in `my_controller.py`), not entries in the race config. **Do not edit
+`config/level*.toml`**: the competition checks the line count of every provided config file and
+reports an edited one as cheating. A `[controller]` entry that names an `MPCCConfig` field still
+overrides these defaults, so a scratch config is the way to sweep them.
 
 **Run logs.** `debug_run.py` writes one `.npz` plus a `.json` summary per episode into `logs/`
 (gitignored; `--no-log` disables it, `--log_dir` moves it). The `.npz` holds, per control step:

@@ -70,6 +70,22 @@ SIGNATURE_FILE = CODE_EXPORT_DIR / "mpcc_racing.signature"
 
 #: State and input dimensions of the OCP.
 NX, NU, NP = 15, 5, 7
+
+#: MPCC settings for a randomized track, i.e. for the levels that re-plan on sensor updates.
+#:
+#: These live here rather than in the race config because the competition checks the line count of
+#: every provided config file and reports an edited one as cheating. They were tuned on level 2,
+#: seeds 0-19: the MPCC defaults give 12.34 s per lap, this gives 8.17 s with the same success rate
+#: (13/20, the failures are pole contacts caused by late reveals, not by the pace). The reference
+#: speed is ``mu_speed / (2 * (w_speed_gate * gate_weight + r_vtheta))``, so ``w_speed_gate``
+#: sets the pace at the gates and ``a_lat_max`` the pace in the corners; ``v_max`` alone barely
+#: nothing. See the speed budget in the README.
+RANDOMIZED_TRACK_MPCC = {
+    "w_speed_gate": 4.0,
+    "a_lat_max": 8.0,
+    "v_max": 3.5,
+    "replan_slowdown_time": 0.3,
+}
 #: In-process solver cache, so that multi-episode evaluation scripts build the solver only once.
 _SOLVER_CACHE: dict[str, tuple[AcadosOcpSolver, AcadosOcp]] = {}
 
@@ -448,10 +464,15 @@ class MPCCController(Controller):
         randomized_track = any(
             key in randomizations for key in ("gate_pos", "gate_rpy", "obstacle_pos")
         )
-        mpcc_overrides = {} if randomized_track else {"w_speed_gate": 9.0, "q_contour_peak": 2000.0}
-        # Any `[controller]` entry that names an MPCCConfig field overrides it, so the
-        # aggressiveness knobs can be swept from a config file. `w_speed_gate` and `a_lat_max`
-        # are the two that actually set the pace; see the speed budget in the README.
+        mpcc_overrides = (
+            dict(RANDOMIZED_TRACK_MPCC)
+            if randomized_track
+            else {"w_speed_gate": 9.0, "q_contour_peak": 2000.0}
+        )
+        # A `[controller]` entry that names an MPCCConfig field still overrides the defaults, so
+        # the aggressiveness knobs can be swept from a scratch config. The race configs must stay
+        # byte-identical to the official ones: the competition checks their line count, and editing
+        # them is reported as cheating.
         controller_cfg = config.get("controller") or {}
         for key in MPCCConfig.__dataclass_fields__:
             if key in controller_cfg:
