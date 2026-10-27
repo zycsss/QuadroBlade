@@ -244,9 +244,11 @@ def plot_paths(
     grid: bool = True,
     dpi: int = 140,
     flown: NDArray[np.floating] | None = None,
+    extra: list[tuple[str, NDArray[np.floating]]] | None = None,
     title: str | None = None,
     subtitle: str | None = None,
     config: ConfigDict | None = None,
+    heading: str | None = None,
 ) -> list[PathRecord]:
     """Draw the planned path of a track and save it as one figure.
 
@@ -259,9 +261,13 @@ def plot_paths(
         grid: Whether to draw the occupancy overlay of the A* search.
         dpi: Resolution of the saved figure.
         flown: Optional achieved trajectory of an episode, shape ``(n, 3)``, drawn on top.
+        extra: Optional further paths to draw as thin lines, each a ``(label, points)`` pair. Used
+            by ``scripts/debug_run.py`` to show the plan the episode started from next to the plan
+            for the poses it ended up facing.
         title: Figure title. Defaults to "Planned path".
         subtitle: Optional second title line, e.g. the verdict of an episode.
         config: Race configuration whose planner settings apply, or ``None`` for the defaults.
+        heading: Heading of the top view panel. Defaults to "Planned path from above".
 
     Returns:
         The planned routes, in the order they were planned.
@@ -325,6 +331,16 @@ def plot_paths(
         top.plot(record.points[:, 0], record.points[:, 1], color="0.45", ls="--", lw=1.5, zorder=3)
     if flown is not None and len(flown) > 1:
         top.plot(flown[:, 0], flown[:, 1], color="k", lw=1.1, alpha=0.85, zorder=6)
+    for _, points_extra in extra or []:
+        top.plot(
+            points_extra[:, 0],
+            points_extra[:, 1],
+            color="tab:cyan",
+            ls="-",
+            lw=1.6,
+            alpha=0.9,
+            zorder=4,
+        )
     # The featured route is coloured by arc length so a self-crossing track stays readable.
     points = featured.points
     segments = np.stack([points[:-1, :2], points[1:, :2]], axis=1)
@@ -375,7 +391,7 @@ def plot_paths(
     top.set_aspect("equal")
     top.set_xlabel("x [m]")
     top.set_ylabel("y [m]")
-    heading = "Planned path from above"
+    heading = heading or "Planned path from above"
     if overlay is not None:
         heading += f"\ngrey = A* occupancy ({resolution:.2f} m cells)"
     top.set_title(heading, fontsize=10.5)
@@ -397,6 +413,8 @@ def plot_paths(
     ]
     if flown is not None and len(flown) > 1:
         handles.insert(2, Line2D([], [], color="k", lw=1.1, label="flown"))
+    for label, _ in extra or []:
+        handles.insert(0, Line2D([], [], color="tab:cyan", lw=1.6, label=label))
     if not any(record.use_astar for record in records):
         handles = [handle for handle in handles if "A*" not in handle.get_label()]
     top.legend(handles=handles, loc="lower left", fontsize=8, framealpha=0.95)

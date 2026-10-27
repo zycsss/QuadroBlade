@@ -252,6 +252,10 @@ def run_episode(
         "steps": n_steps,
         "sim_time": n_steps / config.env.freq,
         "crossings": crossings,
+        # The poses the drone actually faced, which differ from the nominal ones above on a
+        # randomized track. The controller only learns them within the sensor range.
+        "true_gates_pos": np.asarray(env.unwrapped.data.gates_pos[0], dtype=float),
+        "true_obstacles_pos": np.asarray(env.unwrapped.data.obstacles_pos[0], dtype=float),
         "record": rec,
         "gates_pos": gates_pos,
         "gates_quat": gates_quat,
@@ -263,10 +267,11 @@ def run_episode(
 
 
 def plot_episode(ep: dict[str, Any], out_path: Path, title: str, config: Any) -> None:
-    """Plot the planned paths of the track with the achieved trajectory of the episode on top.
+    """Plot the plan for the revealed poses with the achieved trajectory of the episode on top.
 
-    Uses the same figure as `scripts/plot_path.py`; the episode's flown trajectory is overlaid so a
-    CONTACT or HIT_GATE verdict can be read off the same picture as the plan it was tracking.
+    Uses the same figure as `scripts/plot_path.py`, but for the gate and obstacle poses the drone
+    actually faced rather than the nominal ones from the config, and with the plan it started from
+    drawn underneath. The gap between the two is what the 0.7 m sensor range costs.
 
     Args:
         ep: The episode record returned by `run_episode`.
@@ -274,21 +279,35 @@ def plot_episode(ep: dict[str, Any], out_path: Path, title: str, config: Any) ->
         title: Figure title.
         config: The loaded race configuration, for the planner settings it overrides.
     """
+    from lsy_drone_racing.control.path_planning import PathPlanner, path_config_from
     from lsy_drone_racing.utils.path_plot import observation_from_config, plot_paths
 
     obs = observation_from_config(config)
-    # The episode saw the revealed poses, which on a randomized track differ from the nominal ones.
-    obs["gates_pos"] = ep["gates_pos"]
-    obs["gates_quat"] = ep["gates_quat"]
-    obs["obstacles_pos"] = ep["obstacles_pos"]
+    # The episode faced the revealed poses; on a randomized track they differ from the nominal ones
+    # the controller planned against at t=0.
+    obs["gates_pos"] = ep["true_gates_pos"]
+    obs["obstacles_pos"] = ep["true_obstacles_pos"]
     obs["pos"] = ep["record"]["pos"][0]
+    # What the controller committed to before any pose was revealed.
+    initial_obs = observation_from_config(config)
+    initial_obs["pos"] = ep["record"]["pos"][0]
+    initial_path, _ = PathPlanner(path_config_from(config)).plan(initial_obs, initial_obs["pos"])
     plot_paths(
         obs,
         out_path,
         flown=ep["record"]["pos"],
+        extra=[
+            (
+                "initial plan (nominal poses)",
+                initial_path.pos(np.linspace(0.0, initial_path.length, 4000)),
+            )
+        ],
         title=title,
         subtitle=f"{ep['verdict']}: {ep['detail']}",
         config=config,
+        heading=(
+            "Plan for the revealed poses\ncyan = the plan it started from, at the nominal poses"
+        ),
     )
 
 
