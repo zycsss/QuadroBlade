@@ -296,6 +296,7 @@ def plot_episode(ep: dict[str, Any], out_path: Path, title: str, config: Any) ->
         obs,
         out_path,
         flown=ep["record"]["pos"],
+        flown_speed=np.asarray(ep["record"]["speed"], dtype=float),
         extra=[
             (
                 "initial plan (nominal poses)",
@@ -305,9 +306,7 @@ def plot_episode(ep: dict[str, Any], out_path: Path, title: str, config: Any) ->
         title=title,
         subtitle=f"{ep['verdict']}: {ep['detail']}",
         config=config,
-        heading=(
-            "Plan for the revealed poses\ncyan = the plan it started from, at the nominal poses"
-        ),
+        heading="Track from above: black = planned, colour = how it flew",
     )
 
 

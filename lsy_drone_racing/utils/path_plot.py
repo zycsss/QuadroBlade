@@ -1,23 +1,22 @@
 """Figures for a planned path.
 
 The planner decides the route through the track, but the simulation output did not show that
-decision. This module draws it, for ``scripts/plot_path.py`` and for the per-episode figures of
-``scripts/debug_run.py``, so there is a single implementation of the picture.
+decision, and it did not show how the drone actually flew it either. This module draws both, for
+``scripts/plot_path.py`` and for the per-episode figures of ``scripts/debug_run.py``, so there is a
+single implementation of the picture.
 
-One figure, three panels:
+One view from above, showing
 
-* the planned path from above, over the occupancy grid the A* search sees, with the gates and their
-  crossing direction. The path is coloured by arc length so that a track which visits a gate twice
-  (or crosses itself) can still be followed from start to finish. If the achieved trajectory of an
-  episode is given, it is drawn as a thin black line on top.
-* the lateral clearance to the nearest pole along the path, which is the quantity the route search
-  is supposed to improve;
-* the altitude along the path, which the two dimensional search leaves to the waypoint template.
+* the planned path as a black line, over the occupancy grid the A* search sees, with the gates and
+  their crossing direction;
+* the achieved trajectory of an episode, when there is one, coloured by its speed — the quantity
+  that says how the flight went, rather than how it was supposed to go;
+* every pole with two circles: the solid one is ``safety_distance``, the clearance the path has to
+  keep, and the dotted one is the slightly larger radius the A* search blocks so that its route
+  survives the smoothing pass. Drawing only the larger radius made the path look as if it cut
+  through its own constraint.
 
-Two circles are drawn around every pole, and they are not the same thing: the solid one is
-``safety_distance``, the clearance the path has to keep, and the dotted one is the slightly larger
-radius the A* search blocks so that its route survives the smoothing pass. Drawing only the larger
-radius made the path look as if it cut through its own constraint.
+The legend sits outside the axes so it never covers the track.
 """
 
 from __future__ import annotations
@@ -50,7 +49,7 @@ if TYPE_CHECKING:
 
 @dataclass
 class PathRecord:
-    """One planned route and the numbers the figure and summaries need.
+    """One planned route and the numbers the summaries need.
 
     Attributes:
         use_astar: Whether this route came from the A* search rather than the push-out heuristic.
@@ -116,46 +115,38 @@ def pole_clearance(
     return np.linalg.norm(delta, axis=-1).min(axis=1)
 
 
-def plan_routes(
-    obs: dict[str, NDArray[np.floating]],
-    modes: list[bool],
-    config: ConfigDict | None = None,
-    samples: int = 4000,
-) -> list[PathRecord]:
-    """Plan every requested mode and collect what the figure and the summaries need.
+def plan_route(
+    obs: dict[str, NDArray[np.floating]], config: ConfigDict | None = None, samples: int = 4000
+) -> PathRecord:
+    """Plan one route with the configured planner and collect what the figure and the summary need.
 
     Args:
         obs: Observation dictionary, see [observation_from_config][...observation_from_config].
-        modes: One entry per plan, ``True`` to use the A* route search.
         config: Race configuration whose planner settings apply, or ``None`` for the defaults.
-        samples: Number of arc length samples to evaluate for the plots.
+        samples: Number of arc length samples to evaluate.
 
     Returns:
-        One record per plan, in the order of ``modes``.
+        The planned route.
     """
     import time
 
-    records = []
-    for use_astar in modes:
-        planner = PathPlanner(path_config_from(config, use_astar=use_astar))
-        start = time.perf_counter()
-        path, info = planner.plan(obs, obs["pos"])
-        elapsed = (time.perf_counter() - start) * 1e3
-        arc = np.linspace(0.0, path.length, samples)
-        points = path.pos(arc)
-        records.append(
-            PathRecord(
-                use_astar=use_astar,
-                path=path,
-                gate_centers=info.gate_centers,
-                obstacles=info.obstacles,
-                arc=arc,
-                points=points,
-                clearance=pole_clearance(points, info.obstacles),
-                plan_ms=elapsed,
-            )
-        )
-    return records
+    settings = path_config_from(config)
+    planner = PathPlanner(settings)
+    start = time.perf_counter()
+    path, info = planner.plan(obs, obs["pos"])
+    elapsed = (time.perf_counter() - start) * 1e3
+    arc = np.linspace(0.0, path.length, samples)
+    points = path.pos(arc)
+    return PathRecord(
+        use_astar=settings.use_astar,
+        path=path,
+        gate_centers=info.gate_centers,
+        obstacles=info.obstacles,
+        arc=arc,
+        points=points,
+        clearance=pole_clearance(points, info.obstacles),
+        plan_ms=elapsed,
+    )
 
 
 def _draw_gates(ax: Axes, obs: dict[str, NDArray[np.floating]]) -> None:
@@ -239,38 +230,37 @@ def plot_paths(
     obs: dict[str, NDArray[np.floating]],
     out_path: str | Path,
     *,
-    compare: bool = True,
     resolution: float = 0.10,
     grid: bool = True,
     dpi: int = 140,
     flown: NDArray[np.floating] | None = None,
+    flown_speed: NDArray[np.floating] | None = None,
     extra: list[tuple[str, NDArray[np.floating]]] | None = None,
     title: str | None = None,
     subtitle: str | None = None,
     config: ConfigDict | None = None,
     heading: str | None = None,
-) -> list[PathRecord]:
-    """Draw the planned path of a track and save it as one figure.
+) -> PathRecord:
+    """Draw the planned path of a track, and the flight that followed it, and save the figure.
 
     Args:
         obs: Observation dictionary, see [observation_from_config][...observation_from_config].
         out_path: Where to write the image. Parent directories are created.
-        compare: Whether to plan with and without the A* route search. Disable to draw only the
-            planner default.
         resolution: Edge length [m] of the A* grid cell used for the occupancy overlay.
         grid: Whether to draw the occupancy overlay of the A* search.
         dpi: Resolution of the saved figure.
-        flown: Optional achieved trajectory of an episode, shape ``(n, 3)``, drawn on top.
-        extra: Optional further paths to draw as thin lines, each a ``(label, points)`` pair. Used
-            by ``scripts/debug_run.py`` to show the plan the episode started from next to the plan
-            for the poses it ended up facing.
+        flown: Optional achieved trajectory of an episode, shape ``(n, 3)``. Drawn coloured by
+            speed.
+        flown_speed: Speed at every ``flown`` sample, shape ``(n, )``. Without it the flown
+            trajectory is coloured by arc length instead.
+        extra: Optional further paths to draw as thin lines, each a ``(label, points)`` pair.
         title: Figure title. Defaults to "Planned path".
         subtitle: Optional second title line, e.g. the verdict of an episode.
         config: Race configuration whose planner settings apply, or ``None`` for the defaults.
-        heading: Heading of the top view panel. Defaults to "Planned path from above".
+        heading: Heading of the plot. Defaults to "Track from above".
 
     Returns:
-        The planned routes, in the order they were planned.
+        The planned route.
     """
     import matplotlib
 
@@ -278,12 +268,10 @@ def plot_paths(
     import matplotlib.pyplot as plt
     from matplotlib.collections import LineCollection
     from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
 
     settings = path_config_from(config)
-    modes = [False, True] if compare else [settings.use_astar]
-    records = plan_routes(obs, modes, config)
-    # The coloured route is the interesting one: the A* route when it is enabled, else the default.
-    featured = next((record for record in records if record.use_astar), records[-1])
+    record = plan_route(obs, config)
 
     overlay = None
     if grid:
@@ -304,11 +292,10 @@ def plot_paths(
             ),
         )
 
-    figure = plt.figure(figsize=(16.0, 5.8))
-    layout = figure.add_gridspec(2, 2, width_ratios=[1.45, 1.0], hspace=0.40, wspace=0.22)
-    top = figure.add_subplot(layout[:, 0])
-    clearance_axis = figure.add_subplot(layout[0, 1])
-    height_axis = figure.add_subplot(layout[1, 1])
+    # The legend lives outside the axes, so the track needs room to its left and the figure room to
+    # its right.
+    figure, top = plt.subplots(figsize=(13.0, 6.4))
+    handles: list = []
 
     if overlay is not None:
         low = np.asarray(overlay.config.bounds_low, dtype=float)
@@ -318,56 +305,113 @@ def plot_paths(
             origin="lower",
             extent=(low[0], high[0], low[1], high[1]),
             cmap="Greys",
-            alpha=0.22,
+            alpha=0.30,
             zorder=0,
             interpolation="nearest",
         )
+        handles.append(
+            Patch(facecolor="0.55", alpha=0.45, label=f"A* occupancy ({resolution:.2f} m cells)")
+        )
+
     _draw_poles(top, obs["obstacles_pos"], settings)
     _draw_gates(top, obs)
+    handles.extend(
+        [
+            Line2D([], [], color="0.20", lw=5.0, label="gate frame"),
+            Line2D([], [], color="tab:orange", lw=1.3, ls=":", label="gate opening + direction"),
+            Line2D([], [], marker="o", color="tab:purple", ls="none", ms=5, label="pole"),
+            Line2D(
+                [],
+                [],
+                color="tab:red",
+                lw=1.3,
+                label=f"required clearance {settings.safety_distance:.2f} m",
+            ),
+            Line2D(
+                [],
+                [],
+                color="tab:red",
+                ls=":",
+                lw=1.0,
+                label=f"A* search margin {settings.safety_distance * settings.push_scale:.2f} m",
+            ),
+        ]
+    )
 
-    for record in records:
-        if record is featured:
-            continue
-        top.plot(record.points[:, 0], record.points[:, 1], color="0.45", ls="--", lw=1.5, zorder=3)
+    for label, points_extra in extra or []:
+        top.plot(points_extra[:, 0], points_extra[:, 1], color="tab:cyan", ls="-", lw=1.5, zorder=3)
+        handles.append(Line2D([], [], color="tab:cyan", lw=1.5, label=label))
+
+    # The planned path is the reference: one black line, no colour coding.
+    top.plot(
+        record.points[:, 0],
+        record.points[:, 1],
+        color="k",
+        lw=2.0,
+        zorder=6,
+        solid_capstyle="round",
+    )
+    handles.insert(0, Line2D([], [], color="k", lw=2.0, label="planned path"))
+
     if flown is not None and len(flown) > 1:
-        top.plot(flown[:, 0], flown[:, 1], color="k", lw=1.1, alpha=0.85, zorder=6)
-    for _, points_extra in extra or []:
-        top.plot(
-            points_extra[:, 0],
-            points_extra[:, 1],
-            color="tab:cyan",
-            ls="-",
-            lw=1.6,
-            alpha=0.9,
-            zorder=4,
+        segments = np.stack([flown[:-1, :2], flown[1:, :2]], axis=1)
+        collection = LineCollection(segments, cmap="turbo", zorder=7, linewidths=2.8)
+        if flown_speed is not None and len(flown_speed) >= len(segments):
+            collection.set_array(np.asarray(flown_speed, dtype=float)[: len(segments)])
+            colour_label = "flown speed [m/s]"
+        else:
+            travelled = np.concatenate(
+                ([0.0], np.cumsum(np.linalg.norm(np.diff(flown, axis=0), axis=1)))
+            )
+            collection.set_array(travelled[: len(segments)])
+            colour_label = "flown arc length [m]"
+        top.add_collection(collection)
+        bar = figure.colorbar(collection, ax=top, fraction=0.030, pad=0.015)
+        bar.set_label(colour_label, fontsize=9)
+        bar.ax.tick_params(labelsize=8)
+        handles.insert(
+            1, Line2D([], [], color="tab:orange", lw=2.8, label="flown (colour = speed)")
         )
-    # The featured route is coloured by arc length so a self-crossing track stays readable.
-    points = featured.points
-    segments = np.stack([points[:-1, :2], points[1:, :2]], axis=1)
-    collection = LineCollection(segments, cmap="viridis", zorder=5, linewidths=2.6)
-    collection.set_array(featured.arc[:-1])
-    top.add_collection(collection)
-    figure.colorbar(collection, ax=top, fraction=0.045, pad=0.02, label="arc length [m]")
 
-    tightest = int(np.argmin(featured.clearance))
-    if np.isfinite(featured.clearance[tightest]):
+    top.plot(
+        obs["pos"][0], obs["pos"][1], "*", ms=18, color="tab:green", mec="k", mew=0.6, zorder=8
+    )
+    top.plot(
+        record.points[-1, 0],
+        record.points[-1, 1],
+        "s",
+        ms=8,
+        color="tab:green",
+        mec="k",
+        mew=0.6,
+        zorder=8,
+    )
+    handles.extend(
+        [
+            Line2D([], [], marker="*", color="tab:green", ls="none", ms=14, label="start"),
+            Line2D([], [], marker="s", color="tab:green", ls="none", ms=8, label="end of path"),
+        ]
+    )
+
+    tightest = int(np.argmin(record.clearance))
+    if np.isfinite(record.clearance[tightest]):
         top.plot(
-            points[tightest, 0],
-            points[tightest, 1],
+            record.points[tightest, 0],
+            record.points[tightest, 1],
             "o",
             ms=10,
             mfc="none",
             mec="tab:red",
             mew=1.8,
-            zorder=7,
+            zorder=9,
         )
         top.annotate(
-            f"tightest {featured.clearance[tightest] * 100:.0f} cm",
-            xy=(points[tightest, 0], points[tightest, 1]),
-            xytext=(points[tightest, 0] - 0.62, points[tightest, 1] + 0.18),
+            f"tightest {record.clearance[tightest] * 100:.0f} cm",
+            xy=(record.points[tightest, 0], record.points[tightest, 1]),
+            xytext=(record.points[tightest, 0] - 0.62, record.points[tightest, 1] + 0.18),
             color="tab:red",
             fontsize=8.5,
-            zorder=8,
+            zorder=9,
             arrowprops={
                 "arrowstyle": "-",
                 "lw": 0.8,
@@ -376,96 +420,38 @@ def plot_paths(
                 "shrinkB": 6,
             },
         )
-    top.plot(
-        obs["pos"][0], obs["pos"][1], "*", ms=17, color="tab:green", mec="k", mew=0.6, zorder=7
-    )
-    top.plot(points[-1, 0], points[-1, 1], "s", ms=8, color="tab:green", mec="k", mew=0.6, zorder=7)
-    top.annotate(
-        "end of path",
-        xy=(points[-1, 0], points[-1, 1]),
-        xytext=(points[-1, 0] + 0.12, points[-1, 1] + 0.06),
-        color="tab:green",
-        fontsize=8.5,
-        zorder=8,
-    )
+        handles.append(
+            Line2D(
+                [],
+                [],
+                marker="o",
+                color="none",
+                mec="tab:red",
+                mew=1.8,
+                ms=9,
+                label="tightest planned clearance",
+            )
+        )
+
     top.set_aspect("equal")
     top.set_xlabel("x [m]")
     top.set_ylabel("y [m]")
-    heading = heading or "Planned path from above"
-    if overlay is not None:
-        heading += f"\ngrey = A* occupancy ({resolution:.2f} m cells)"
-    top.set_title(heading, fontsize=10.5)
-    top.grid(alpha=0.22)
-    handles = [
-        Line2D([], [], color=plt.cm.viridis(0.6), lw=2.6, label="A* route (colour = arc length)"),
-        Line2D([], [], color="0.45", ls="--", lw=1.5, label="heuristic push-out"),
-        Line2D([], [], color="tab:green", marker="*", ms=13, ls="none", label="start"),
-        Line2D([], [], color="tab:green", marker="s", ms=8, ls="none", label="end of path"),
-        Line2D([], [], color="tab:red", lw=1.3, label=f"required {settings.safety_distance:.2f} m"),
-        Line2D(
-            [],
-            [],
-            color="tab:red",
-            ls=":",
-            lw=1.0,
-            label=f"A* search margin {settings.safety_distance * settings.push_scale:.2f} m",
-        ),
-    ]
-    if flown is not None and len(flown) > 1:
-        handles.insert(2, Line2D([], [], color="k", lw=1.1, label="flown"))
-    for label, _ in extra or []:
-        handles.insert(0, Line2D([], [], color="tab:cyan", lw=1.6, label=label))
-    if not any(record.use_astar for record in records):
-        handles = [handle for handle in handles if "A*" not in handle.get_label()]
-    top.legend(handles=handles, loc="lower left", fontsize=8, framealpha=0.95)
-
-    for record in records:
-        clearance_axis.plot(
-            record.arc,
-            record.clearance,
-            color="tab:blue" if record.use_astar else "0.45",
-            ls="-" if record.use_astar else "--",
-            lw=2.0 if record.use_astar else 1.5,
-            label="A* route" if record.use_astar else "heuristic push-out",
-        )
-    clearance_axis.axhline(
-        settings.safety_distance,
-        color="tab:red",
-        ls=":",
-        lw=1.2,
-        label=f"safety_distance {settings.safety_distance:.2f} m",
+    top.set_title(heading or "Track from above", fontsize=11)
+    top.grid(alpha=0.20)
+    top.legend(
+        handles=handles,
+        loc="upper left",
+        bbox_to_anchor=(1.20, 1.0),
+        fontsize=8.5,
+        framealpha=1.0,
+        borderaxespad=0.0,
     )
-    clearance_axis.set_xlabel("arc length [m]")
-    clearance_axis.set_ylabel("clearance to nearest pole [m]")
-    clearance_axis.set_ylim(bottom=0.0)
-    clearance_axis.set_title("Lateral clearance along the path", fontsize=10.5)
-    clearance_axis.grid(alpha=0.22)
-    clearance_axis.legend(fontsize=8, loc="lower right", framealpha=0.95)
 
-    for record in records:
-        height_axis.plot(
-            record.arc,
-            record.points[:, 2],
-            color="tab:blue" if record.use_astar else "0.45",
-            ls="-" if record.use_astar else "--",
-            lw=2.0 if record.use_astar else 1.5,
-            label="A* route" if record.use_astar else "heuristic push-out",
-        )
-    for centre in obs["gates_pos"]:
-        height_axis.axhline(centre[2], color="tab:orange", lw=0.7, ls=":", alpha=0.6, zorder=0)
-    height_axis.set_xlabel("arc length [m]")
-    height_axis.set_ylabel("z [m]")
-    height_axis.set_title("Altitude along the path (dotted = gate heights)", fontsize=10.5)
-    height_axis.grid(alpha=0.22)
-    height_axis.legend(fontsize=8, loc="upper left", framealpha=0.95)
-
-    figure.suptitle(title or "Planned path", fontsize=12, y=0.99)
+    figure.suptitle(title or "Planned path", fontsize=12, y=1.0)
     if subtitle:
-        # Anchored at its top edge below the title so the two never collide, which they did when the
-        # subtitle was centred a few hundredths of a figure unit under the suptitle.
-        figure.text(0.5, 0.945, subtitle, ha="center", va="top", fontsize=10, color="0.25")
+        figure.text(0.42, 0.955, subtitle, ha="center", va="top", fontsize=10, color="0.25")
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(out_path, dpi=dpi, bbox_inches="tight", facecolor="white")
     plt.close(figure)
-    return records
+    return record
