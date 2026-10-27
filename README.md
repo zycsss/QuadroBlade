@@ -181,7 +181,7 @@ fast setting (tightest pass 9.7 cm against the 20 cm half opening), so the speed
 with accuracy. All four knobs live in the `[controller]` section of the config file.
 
 ```bash
-# headless flight with a per-episode verdict and the planned path + flown trajectory
+# headless flight with a per-episode verdict and the flown trajectory, coloured by speed
 python scripts/debug_run.py --config level1.toml --controller my_controller.py
 
 # several episodes with a success rate and mean time
@@ -190,7 +190,7 @@ python scripts/debug_run.py --config level1.toml --controller my_controller.py -
 # rendered flight (the configs enable the GUI by default)
 python scripts/sim.py --config level0.toml
 
-# what the planner decided, without flying (the same figure debug_run.py writes per episode)
+# what the planner produces, without flying: the planned path over the same track view
 python scripts/plot_path.py --config level2.toml
 ```
 

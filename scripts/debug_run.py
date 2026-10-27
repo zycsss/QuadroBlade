@@ -267,11 +267,12 @@ def run_episode(
 
 
 def plot_episode(ep: dict[str, Any], out_path: Path, title: str, config: Any) -> None:
-    """Plot the plan for the revealed poses with the achieved trajectory of the episode on top.
+    """Plot how the episode actually flew, over the track it actually faced.
 
-    Uses the same figure as `scripts/plot_path.py`, but for the gate and obstacle poses the drone
-    actually faced rather than the nominal ones from the config, and with the plan it started from
-    drawn underneath. The gap between the two is what the 0.7 m sensor range costs.
+    Uses the same figure as `scripts/plot_path.py`, but with the gate and obstacle poses the drone
+    faced rather than the nominal ones from the config, and with no planned path at all: the stored
+    trajectory is coloured by speed, so the picture answers how the flight went rather than how it
+    was supposed to go.
 
     Args:
         ep: The episode record returned by `run_episode`.
@@ -279,7 +280,6 @@ def plot_episode(ep: dict[str, Any], out_path: Path, title: str, config: Any) ->
         title: Figure title.
         config: The loaded race configuration, for the planner settings it overrides.
     """
-    from lsy_drone_racing.control.path_planning import PathPlanner, path_config_from
     from lsy_drone_racing.utils.path_plot import observation_from_config, plot_paths
 
     obs = observation_from_config(config)
@@ -288,25 +288,16 @@ def plot_episode(ep: dict[str, Any], out_path: Path, title: str, config: Any) ->
     obs["gates_pos"] = ep["true_gates_pos"]
     obs["obstacles_pos"] = ep["true_obstacles_pos"]
     obs["pos"] = ep["record"]["pos"][0]
-    # What the controller committed to before any pose was revealed.
-    initial_obs = observation_from_config(config)
-    initial_obs["pos"] = ep["record"]["pos"][0]
-    initial_path, _ = PathPlanner(path_config_from(config)).plan(initial_obs, initial_obs["pos"])
     plot_paths(
         obs,
         out_path,
         flown=ep["record"]["pos"],
         flown_speed=np.asarray(ep["record"]["speed"], dtype=float),
-        extra=[
-            (
-                "initial plan (nominal poses)",
-                initial_path.pos(np.linspace(0.0, initial_path.length, 4000)),
-            )
-        ],
+        planned=False,
         title=title,
         subtitle=f"{ep['verdict']}: {ep['detail']}",
         config=config,
-        heading="Track from above: black = planned, colour = how it flew",
+        heading="Track from above: colour = how it flew",
     )
 
 

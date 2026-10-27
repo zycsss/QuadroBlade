@@ -28,18 +28,14 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from lsy_drone_racing.control.astar import (
+    DRONE_RADIUS,
     GATE_FRAME_HALF,
     GATE_OPENING_HALF,
     POLE_RADIUS,
     ArenaGrid,
     AstarConfig,
 )
-from lsy_drone_racing.control.path_planning import (
-    GateFrames,
-    PathConfig,
-    PathPlanner,
-    path_config_from,
-)
+from lsy_drone_racing.control.path_planning import GateFrames, PathPlanner, path_config_from
 
 if TYPE_CHECKING:
     from matplotlib.axes import Axes
@@ -191,27 +187,20 @@ def _draw_gates(ax: Axes, obs: dict[str, NDArray[np.floating]]) -> None:
         )
 
 
-def _draw_poles(ax: Axes, obstacles: NDArray[np.floating], settings: PathConfig) -> None:
-    """Draw every obstacle with its required clearance and the radius the search blocks."""
+def _draw_poles(ax: Axes, obstacles: NDArray[np.floating]) -> None:
+    """Draw every obstacle with the radius at which the drone would touch it.
+
+    The circle is the pole radius plus the drone radius and nothing else, so it marks actual
+    contact rather than the planner's safety margin: `safety_distance` and the larger radius the A*
+    search blocks are both requirements above this one, and drawing them here made the poles look
+    far bigger than the obstacle.
+    """
     import matplotlib.pyplot as plt
 
-    required = settings.safety_distance
-    searched = required * settings.push_scale
+    contact = POLE_RADIUS + DRONE_RADIUS
     for pole_id, pole in enumerate(obstacles):
         ax.add_patch(
-            plt.Circle((pole[0], pole[1]), required, fill=False, ec="tab:red", lw=1.3, zorder=2)
-        )
-        ax.add_patch(
-            plt.Circle(
-                (pole[0], pole[1]),
-                searched,
-                fill=False,
-                ec="tab:red",
-                ls=":",
-                lw=1.0,
-                alpha=0.65,
-                zorder=2,
-            )
+            plt.Circle((pole[0], pole[1]), contact, fill=False, ec="tab:red", lw=1.3, zorder=2)
         )
         ax.add_patch(
             plt.Circle((pole[0], pole[1]), POLE_RADIUS, fc="tab:purple", ec="none", zorder=5)
@@ -235,13 +224,14 @@ def plot_paths(
     dpi: int = 140,
     flown: NDArray[np.floating] | None = None,
     flown_speed: NDArray[np.floating] | None = None,
+    planned: bool = True,
     extra: list[tuple[str, NDArray[np.floating]]] | None = None,
     title: str | None = None,
     subtitle: str | None = None,
     config: ConfigDict | None = None,
     heading: str | None = None,
 ) -> PathRecord:
-    """Draw the planned path of a track, and the flight that followed it, and save the figure.
+    """Draw a track from above with the planned path and the flight that followed it.
 
     Args:
         obs: Observation dictionary, see [observation_from_config][...observation_from_config].
@@ -253,6 +243,7 @@ def plot_paths(
             speed.
         flown_speed: Speed at every ``flown`` sample, shape ``(n, )``. Without it the flown
             trajectory is coloured by arc length instead.
+        planned: Whether to draw the planned path. Off when only how the drone flew matters.
         extra: Optional further paths to draw as thin lines, each a ``(label, points)`` pair.
         title: Figure title. Defaults to "Planned path".
         subtitle: Optional second title line, e.g. the verdict of an episode.
@@ -313,7 +304,7 @@ def plot_paths(
             Patch(facecolor="0.55", alpha=0.45, label=f"A* occupancy ({resolution:.2f} m cells)")
         )
 
-    _draw_poles(top, obs["obstacles_pos"], settings)
+    _draw_poles(top, obs["obstacles_pos"])
     _draw_gates(top, obs)
     handles.extend(
         [
@@ -325,15 +316,7 @@ def plot_paths(
                 [],
                 color="tab:red",
                 lw=1.3,
-                label=f"required clearance {settings.safety_distance:.2f} m",
-            ),
-            Line2D(
-                [],
-                [],
-                color="tab:red",
-                ls=":",
-                lw=1.0,
-                label=f"A* search margin {settings.safety_distance * settings.push_scale:.2f} m",
+                label=f"contact radius {POLE_RADIUS + DRONE_RADIUS:.3f} m (pole + drone)",
             ),
         ]
     )
@@ -342,16 +325,17 @@ def plot_paths(
         top.plot(points_extra[:, 0], points_extra[:, 1], color="tab:cyan", ls="-", lw=1.5, zorder=3)
         handles.append(Line2D([], [], color="tab:cyan", lw=1.5, label=label))
 
-    # The planned path is the reference: one black line, no colour coding.
-    top.plot(
-        record.points[:, 0],
-        record.points[:, 1],
-        color="k",
-        lw=2.0,
-        zorder=6,
-        solid_capstyle="round",
-    )
-    handles.insert(0, Line2D([], [], color="k", lw=2.0, label="planned path"))
+    end_point = record.points[-1]
+    if planned:
+        top.plot(
+            record.points[:, 0],
+            record.points[:, 1],
+            color="k",
+            lw=2.0,
+            zorder=6,
+            solid_capstyle="round",
+        )
+        handles.insert(0, Line2D([], [], color="k", lw=2.0, label="planned path"))
 
     if flown is not None and len(flown) > 1:
         segments = np.stack([flown[:-1, :2], flown[1:, :2]], axis=1)
@@ -370,68 +354,20 @@ def plot_paths(
         bar.set_label(colour_label, fontsize=9)
         bar.ax.tick_params(labelsize=8)
         handles.insert(
-            1, Line2D([], [], color="tab:orange", lw=2.8, label="flown (colour = speed)")
+            int(planned), Line2D([], [], color="tab:orange", lw=2.8, label="flown (colour = speed)")
         )
+        end_point = flown[-1]
 
     top.plot(
         obs["pos"][0], obs["pos"][1], "*", ms=18, color="tab:green", mec="k", mew=0.6, zorder=8
     )
-    top.plot(
-        record.points[-1, 0],
-        record.points[-1, 1],
-        "s",
-        ms=8,
-        color="tab:green",
-        mec="k",
-        mew=0.6,
-        zorder=8,
-    )
+    top.plot(end_point[0], end_point[1], "s", ms=8, color="tab:green", mec="k", mew=0.6, zorder=8)
     handles.extend(
         [
             Line2D([], [], marker="*", color="tab:green", ls="none", ms=14, label="start"),
-            Line2D([], [], marker="s", color="tab:green", ls="none", ms=8, label="end of path"),
+            Line2D([], [], marker="s", color="tab:green", ls="none", ms=8, label="end"),
         ]
     )
-
-    tightest = int(np.argmin(record.clearance))
-    if np.isfinite(record.clearance[tightest]):
-        top.plot(
-            record.points[tightest, 0],
-            record.points[tightest, 1],
-            "o",
-            ms=10,
-            mfc="none",
-            mec="tab:red",
-            mew=1.8,
-            zorder=9,
-        )
-        top.annotate(
-            f"tightest {record.clearance[tightest] * 100:.0f} cm",
-            xy=(record.points[tightest, 0], record.points[tightest, 1]),
-            xytext=(record.points[tightest, 0] - 0.62, record.points[tightest, 1] + 0.18),
-            color="tab:red",
-            fontsize=8.5,
-            zorder=9,
-            arrowprops={
-                "arrowstyle": "-",
-                "lw": 0.8,
-                "color": "tab:red",
-                "shrinkA": 0,
-                "shrinkB": 6,
-            },
-        )
-        handles.append(
-            Line2D(
-                [],
-                [],
-                marker="o",
-                color="none",
-                mec="tab:red",
-                mew=1.8,
-                ms=9,
-                label="tightest planned clearance",
-            )
-        )
 
     top.set_aspect("equal")
     top.set_xlabel("x [m]")
