@@ -47,6 +47,14 @@ from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Rotation as R
 
 from lsy_drone_racing.control.astar import ArenaGrid, AstarConfig
+from lsy_drone_racing.control.bspline_path import (
+    DEGREE,
+    BsplinePath,
+    fit_control_points,
+    pin_initial_state,
+    relax_control_points,
+    retime,
+)
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -147,6 +155,22 @@ class PathConfig:
             the anchor's own geometry, the old path where the seed carries it and the straight
             tangent otherwise. This is the stage that makes the promise "the new path starts where
             the drone is and along the old path" true after every later stage has moved the path.
+        path_kind: ``"bspline"`` fits the plan as a cubic B-spline trajectory with the drone's state
+            as its initial condition, ``"spline"`` uses the natural cubic spline and the anchor pin.
+            See [bspline_path][lsy_drone_racing.control.bspline_path].
+        bspline_spacing: Target arc length [m] per control point of the B-spline. Fewer, further
+            apart control points give a smoother and less faithful path; more of them follow the
+            waypoints more closely.
+        bspline_speed: Nominal speed [m/s] the knot spacing is derived from, i.e. how long the
+            initial state's velocity vector is in the control polygon.
+        bspline_speed_limit: Speed limit [m/s] the retiming stage enforces on the derivative control
+            points before the plan is committed.
+        bspline_accel_limit: Acceleration limit [m/s^2] the retiming stage enforces. The knot
+            spacing is stretched until both limits hold, which is the cheapest form of the time
+            adjustment in Fast-Planner (RA-L 2019) Sec. V.
+        bspline_relax_iters: Gradient steps spent straightening the control polygon. Zero leaves the
+            geometry as fitted; a positive value trades fidelity for curvature, which is what turns
+            an unflyable hairpin into a flyable arc.
         climb_height: Height [m] added above the start position before heading to the first gate.
         runout: Extra length [m] the path continues behind the last gate.
         duration: Duration [s] of the auxiliary time-parameterized spline.
@@ -187,6 +211,12 @@ class PathConfig:
     gate_opening_limit: float = 0.101
     seed_length: float = 0.15
     anchor_pin_length: float = 0.25
+    path_kind: str = "bspline"
+    bspline_spacing: float = 0.08
+    bspline_speed: float = 2.0
+    bspline_speed_limit: float = 2.3
+    bspline_accel_limit: float = 8.0
+    bspline_relax_iters: int = 0
     climb_height: float = 0.25
     runout: float = 0.4
     duration: float = 30.0
@@ -263,6 +293,12 @@ class PathSeed:
             for its first ``anchor_pin_length`` metres instead of following the straight tangent,
             which keeps the new path's curvature continuous at the anchor as well as its direction.
         progress: Arc length of the anchor on ``path``. Ignored without ``path``.
+        velocity: The drone's measured velocity at the anchor, shape ``(3,)``, in m/s. A B-spline
+            plan uses it as a boundary condition, so the new path leaves the anchor with the speed
+            and direction the drone actually has rather than with whatever the old path was doing.
+        acceleration: The drone's measured acceleration at the anchor, shape ``(3,)``, in m/s^2,
+            used the same way. It is a finite difference of the observed velocity, so it is coarse;
+            the plan only needs it to be continuous, not accurate.
     """
 
     position: NDArray[np.floating]
@@ -270,6 +306,8 @@ class PathSeed:
     length: float
     path: ArcPath | None = None
     progress: float = 0.0
+    velocity: NDArray[np.floating] | None = None
+    acceleration: NDArray[np.floating] | None = None
 
     def __post_init__(self):
         """Normalize the tangent and reject a degenerate seed."""
@@ -282,6 +320,11 @@ class PathSeed:
         object.__setattr__(self, "tangent", tangent / norm)
         object.__setattr__(self, "length", float(self.length))
         object.__setattr__(self, "progress", float(self.progress))
+        for name in ("velocity", "acceleration"):
+            value = getattr(self, name)
+            object.__setattr__(
+                self, name, None if value is None else np.asarray(value, dtype=float).reshape(3)
+            )
 
     def follow(self, arcs: NDArray[np.floating]) -> NDArray[np.floating]:
         """Return the points a re-plan should follow at the given arc lengths from the anchor.
@@ -588,8 +631,11 @@ class PathPlanner:
             # smoothing rounds corners and the gate handling pushes sideways. This is the pass that
             # makes the promise true.
             waypoints = self._enforce_clearance(waypoints, obstacles)
-        pin_length = self.config.anchor_pin_length if seed is not None else 0.0
-        path = self._to_arc_path(waypoints, seed, pin_length)
+        if self.config.path_kind == "bspline":
+            path = self._to_bspline_path(waypoints, obstacles, pass_pos, seed)
+        else:
+            pin_length = self.config.anchor_pin_length if seed is not None else 0.0
+            path = self._to_arc_path(waypoints, seed, pin_length)
         info = PathInfo(
             waypoints=waypoints,
             gate_centers=pass_pos,
@@ -1452,11 +1498,77 @@ class PathPlanner:
         pts[:count] = (1.0 - weight)[:, None] * window + weight[:, None] * target
         return pts
 
-    def _to_arc_path(
+    def _to_bspline_path(
         self,
         waypoints: NDArray[np.floating],
+        obstacles: NDArray[np.floating],
+        pass_pos: NDArray[np.floating],
         seed: PathSeed | None = None,
-        pin_length: float = 0.0,
+    ) -> BsplinePath:
+        """Fit the plan as a cubic B-spline trajectory, pinned to the drone's current state.
+
+        The B-spline replaces the natural cubic spline and its arc-length reparameterization for
+        three reasons, all of them measured on this track:
+
+        * the first three control points *are* the initial state, so a re-plan leaves the anchor
+          with the drone's measured velocity and acceleration instead of an approximation of the old
+          path's tangent (`pin_initial_state`);
+        * moving one control point only changes ``DEGREE + 1`` spans, which is what makes a local
+          repair well defined rather than approximate;
+        * velocity and acceleration are finite differences of the control points, so the dynamic
+          limits are visible at plan time (`retime`) rather than surviving only as a speed table in
+          the controller.
+
+        Args:
+            waypoints: The finished waypoint polyline, shape ``(n_points, 3)``.
+            obstacles: Pole positions, shape ``(n_obstacles, 3)``, for the clearance term of the
+                relaxation.
+            pass_pos: Gate centres in passing order, shape ``(n_passes, 3)``. The control points
+                that define those passages are locked, so the relaxation cannot pull a gate pass
+                off its opening.
+            seed: The re-plan's seed, which carries the state to start from.
+
+        Returns:
+            The trajectory, exposed as an arc length parameterized path.
+        """
+        cfg = self.config
+        points = np.asarray(waypoints, dtype=float).reshape(-1, 3)
+        length = float(np.sum(np.linalg.norm(np.diff(points, axis=0), axis=1)))
+        n_control = max(DEGREE + 4, int(round(length / max(cfg.bspline_spacing, 1e-3))) + 4)
+        time_step = max(cfg.bspline_spacing / max(cfg.bspline_speed, 1e-3), 1e-3)
+        control = fit_control_points(points, n_control, time_step)
+        if seed is None:
+            control[0] = np.asarray(points[0], dtype=float)
+        else:
+            speed = 0.0 if seed.velocity is None else float(np.linalg.norm(seed.velocity))
+            if speed > 0.2:
+                direction = np.asarray(seed.velocity, dtype=float) / speed
+            else:
+                # No usable velocity reading (opening plan, or a test): keep the direction the
+                # old path asked for and the nominal speed, which is what the seed's tangent means.
+                direction, speed = np.asarray(seed.tangent, dtype=float), cfg.bspline_speed
+            control = pin_initial_state(
+                control,
+                np.asarray(seed.position, dtype=float),
+                direction * speed,
+                np.zeros(3) if seed.acceleration is None else seed.acceleration,
+                time_step,
+            )
+        if cfg.bspline_relax_iters > 0 and len(obstacles):
+            locked = np.zeros(len(control), dtype=bool)
+            for centre in pass_pos:
+                locked |= np.linalg.norm(control - centre, axis=1) < 0.3
+            control = relax_control_points(
+                control, obstacles, cfg.safety_distance, locked, iterations=cfg.bspline_relax_iters
+            )
+        time_step = retime(control, time_step, cfg.bspline_speed_limit, cfg.bspline_accel_limit)
+        logger.debug(
+            "B-spline plan: %d control points, dt %.3f s, %.2f m", len(control), time_step, length
+        )
+        return BsplinePath(control, time_step)
+
+    def _to_arc_path(
+        self, waypoints: NDArray[np.floating], seed: PathSeed | None = None, pin_length: float = 0.0
     ) -> ArcPath:
         """Fit and reparameterize the path, then hand it to an [ArcPath][...ArcPath].
 

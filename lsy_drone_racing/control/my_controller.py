@@ -575,6 +575,7 @@ class MPCCController(Controller):
         self._mass_ratio = 1.0
         self._applied_thrust = self._hover_thrust
         self._prev_vel: NDArray[np.floating] | None = None
+        self._accel = np.zeros(3)
         self._reset_mass_history()
         self._path: ArcPath | None = None
         self._gate_centers = np.zeros((0, 3))
@@ -636,6 +637,7 @@ class MPCCController(Controller):
         self._mass_ratio = 1.0
         self._applied_thrust = self._hover_thrust
         self._prev_vel = None
+        self._accel = np.zeros(3)
         self._reset_mass_history()
         self._theta = 0.0
         self._tick = 0
@@ -894,6 +896,8 @@ class MPCCController(Controller):
             length=self._planner.config.seed_length,
             path=self._path,
             progress=progress,
+            velocity=velocity,
+            acceleration=self._accel,
         )
         started = time.perf_counter()
         path, info = self._planner.plan(trimmed, seed.position, climb=False, seed=seed)
@@ -1183,6 +1187,14 @@ class MPCCController(Controller):
         self._tick += 1
 
         pos = np.asarray(obs["pos"], dtype=float)
+        # The acceleration a B-spline plan starts with. It has to be taken before the mass estimate
+        # overwrites the previous velocity with the current one.
+        velocity = np.asarray(obs["vel"], dtype=float)
+        self._accel = (
+            np.clip((velocity - self._prev_vel) * self._freq, -25.0, 25.0)
+            if self._prev_vel is not None
+            else np.zeros(3)
+        )
         self._update_mass_estimate(obs)
         changes = self._track_info_changed(obs)
         if changes:
