@@ -400,14 +400,21 @@ class PathPlanner:
         self.config = config or PathConfig()
 
     def plan(
-        self, obs: dict[str, NDArray[np.floating]], start_pos: NDArray[np.floating]
+        self,
+        obs: dict[str, NDArray[np.floating]],
+        start_pos: NDArray[np.floating],
+        climb: bool = True,
     ) -> tuple[ArcPath, PathInfo]:
         """Plan the path from the start position through all gates in the configured order.
 
         Args:
             obs: Environment observation. Requires ``gates_pos``, ``gates_quat``,
                 ``gate_sequence``, ``gate_sequence_direction`` and ``obstacles_pos``.
-            start_pos: Position the path starts at, shape ``(3,)``.
+            start_pos: Position the path starts at, shape ``(3,)``. A re-plan passes the drone's
+                current position and the sequence of the passes still to come, so the planned path
+                begins where the drone actually is rather than at the take-off point it left behind.
+            climb: Whether the path rises ``climb_height`` above ``start_pos`` before the gates.
+                first gate. True for the first plan of an episode, which starts on the ground.
 
         Returns:
             The arc-length parameterized path and its metadata.
@@ -425,7 +432,7 @@ class PathPlanner:
         pass_z_axes = frames.z_axes[sequence]
 
         start = np.asarray(start_pos, dtype=float).reshape(3)
-        blocks = self._gate_blocks(start, pass_pos, pass_normals, obstacles)
+        blocks = self._gate_blocks(start, pass_pos, pass_normals, obstacles, climb=climb)
         blocks = self._insert_detours(blocks, pass_pos, pass_normals, pass_y_axes, pass_z_axes)
         runout = self._runout(blocks, pass_pos, pass_normals)
         if self.config.use_astar and len(obstacles):
@@ -456,11 +463,36 @@ class PathPlanner:
         pass_pos: NDArray[np.floating],
         pass_normals: NDArray[np.floating],
         obstacles: NDArray[np.floating],
+        climb: bool = True,
     ) -> list[NDArray[np.floating]]:
-        """Build one waypoint block per gate pass, preceded by start and climb blocks."""
+        """Build one waypoint block per gate pass, preceded by start and climb blocks.
+
+        Args:
+            start: Where the path begins.
+            pass_pos: Gate centres in passing order, shape ``(n_passes, 3)``.
+            pass_normals: Gate normals in passing order, shape ``(n_passes, 3)``.
+            obstacles: Obstacle positions, shape ``(n_obstacles, 3)``.
+            climb: Whether the second block rises ``climb_height`` above the start. Only the first
+                of an episode starts on the ground; a re-plan starts wherever the drone is, and a
+                climb there would pull the path above it. The block itself is kept either way: it is
+                the first segment of the polyline, and without it the routing degenerates and the
+                path comes out about 45 percent longer. A re-plan replaces the climb with a short
+                level step toward the next gate.
+
+        Returns:
+            One block per gate pass, preceded by the start block.
+        """
         cfg = self.config
-        climb = start + np.array([0.0, 0.0, cfg.climb_height])
-        blocks = [start.reshape(1, 3), climb.reshape(1, 3)]
+        blocks = [start.reshape(1, 3)]
+        if climb:
+            ahead = np.array([0.0, 0.0, cfg.climb_height])
+        elif len(pass_pos):
+            towards = np.asarray(pass_pos[0], dtype=float) - start
+            length = float(np.linalg.norm(towards))
+            ahead = towards / max(length, 1e-9) * max(0.05, min(0.3, 0.4 * length))
+        else:
+            ahead = np.zeros(3)
+        blocks.append((start + ahead).reshape(1, 3))
         for pos, normal in zip(pass_pos, pass_normals, strict=True):
             d_in = self._side_offset(pos, normal, -1.0, obstacles)
             d_out = self._side_offset(pos, normal, +1.0, obstacles)

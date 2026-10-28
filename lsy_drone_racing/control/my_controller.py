@@ -748,26 +748,67 @@ class MPCCController(Controller):
         return changes
 
     def _replan(self, obs: dict[str, NDArray[np.floating]], reason: str = "sensor update"):
-        """Re-plan the path with the newly revealed gate and obstacle poses.
+        """Re-plan the path from where the drone is, through the passes that are still to come.
 
         Only the path reference changes: the optimal control problem and its solver are untouched,
         because the path enters the cost as per-stage parameters. The speed limit table and the
-        progress bound are rebuilt for the new path, and the projection window is widened for one
-        step so that the drone re-anchors onto the new arc length immediately.
+        progress bound are rebuilt for the new path.
+
+        The new path starts at the drone's current position rather than at the take-off point, and
+        it only contains the gate passes that have not happened yet. Planning from the take-off
+        point laid out the part of the track that was already behind the drone and then asked the
+        drone to converge onto it, which is where most of the drift against the plan came from:
+        the reference at the drone's progress was a point on a path shaped around obstacles the
+        drone had already passed. Anchoring at the current pose makes the first metres of the
+        plan reachable by construction.
+
+        Progress restarts at zero because the new path begins at the drone.
 
         Args:
             obs: The current observation.
             reason: Why the path is re-planned, recorded in the plan log.
         """
-        path, info = self._planner.plan(obs, self._plan_origin)
+        start = np.asarray(obs["pos"], dtype=float).copy()
+        trimmed = self._remaining_obs(obs)
+        if trimmed is None:
+            return
+        path, info = self._planner.plan(trimmed, start, climb=False)
         self._install_path(path, info)
+        self._theta = 0.0
+        self._projection_window = (-0.15, 1.0)
         self._reproject_wide = True
         self._slowdown_until = self._tick + int(round(self._mpcc.replan_slowdown_time * self._freq))
         self.replans += 1
         self._record_plan(f"re-plan: {reason}", obs)
         logger.info(
-            "Re-planned path after sensor update: %.2f m (replan %d)", path.length, self.replans
+            "Re-planned from the current pose: %.2f m, %d passes left (replan %d)",
+            path.length,
+            len(np.asarray(trimmed["gate_sequence"]).ravel()),
+            self.replans,
         )
+
+    @staticmethod
+    def _remaining_obs(
+        obs: dict[str, NDArray[np.floating]],
+    ) -> dict[str, NDArray[np.floating]] | None:
+        """Return the observation with the gate sequence cut down to the passes still to come.
+
+        Args:
+            obs: The current observation.
+
+        Returns:
+            A shallow copy whose ``gate_sequence`` and ``gate_sequence_direction`` start at the next
+            pass, or ``None`` when every pass is already done and there is nothing left to plan.
+        """
+        passed = int(np.asarray(obs["n_gates_passed"]))
+        sequence = np.asarray(obs["gate_sequence"], dtype=int).ravel()
+        direction = np.asarray(obs["gate_sequence_direction"], dtype=float).ravel()
+        if passed >= len(sequence):
+            return None
+        trimmed = dict(obs)
+        trimmed["gate_sequence"] = sequence[passed:]
+        trimmed["gate_sequence_direction"] = direction[passed:]
+        return trimmed
 
     def _apply_progress_bound(self):
         """Push the path length into the per-stage upper bound of the theta state.
