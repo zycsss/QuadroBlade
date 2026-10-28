@@ -227,6 +227,11 @@ class MPCCConfig:
     replan_max_defer_ticks: int = 0
     replan_defer_in_passage: bool = False
     replan_slowdown_factor: float = 0.5
+    # Measured on level 2: braking to 0.15 of the reference speed for 0.15 s after every re-plan
+    # costs 0.31 s of lap time, 8.99 s to 9.30 s, and does not raise the finish count on the 20-seed
+    # screen. The hold is therefore off: a factor of 1.0 with a zero window makes it a no-op.
+    replan_hold_time: float = 0.0
+    replan_hold_factor: float = 1.0
     name: str = "mpcc_racing"
 
     @property
@@ -595,6 +600,7 @@ class MPCCController(Controller):
         self._reproject_wide = False
         self._projection_window = (-0.15, 0.6)
         self._slowdown_until = 0
+        self._hold_until = 0
         self.replans = 0
         self.plan_log: list[dict[str, object]] = []
         # Reveals waiting to be planned for, and when the first and latest of them arrived.
@@ -857,6 +863,7 @@ class MPCCController(Controller):
         self._projection_window = (-0.15, 1.0)
         self._reproject_wide = True
         self._slowdown_until = self._tick + int(round(self._mpcc.replan_slowdown_time * self._freq))
+        self._hold_until = self._tick + int(round(self._mpcc.replan_hold_time * self._freq))
         self.replans += 1
         self._record_plan(f"re-plan: {reason}", obs)
         logger.info(
@@ -1014,7 +1021,15 @@ class MPCCController(Controller):
         speed = cfg.mu_speed / (2.0 * (cfg.w_speed_gate * float(weight[0]) + cfg.r_vtheta))
         speed = min(speed, speed_actual + cfg.v_lead)
         speed = min(speed, float(np.interp(theta, self._speed_grid, self._speed_limit)))
-        if self._tick < self._slowdown_until:
+        if self._tick < self._hold_until:
+            # Brake hard right after a re-plan: this is the only place where the controller spends
+            # time to buy geometry. The revealed pose can be 0.21 m from the nominal one, and the
+            # drone needs about 0.46 s of lateral travel to make that up, against the 0.41 s the
+            # 0.7 m sensor range gives it at race speed. Slowing to a crawl for a moment shortens
+            # the distance still to fly, so the correction lands before the obstacle instead of
+            # after it.
+            speed *= cfg.replan_hold_factor
+        elif self._tick < self._slowdown_until:
             speed *= cfg.replan_slowdown_factor
         return float(np.clip(speed, cfg.v_min, cfg.v_max))
 
