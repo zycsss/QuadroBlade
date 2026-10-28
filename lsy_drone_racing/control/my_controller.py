@@ -546,6 +546,8 @@ class MPCCController(Controller):
         self._stall_reported = False
         self.status = 0
         self.solve_time = 0.0
+        # Set before the first plan so the opening plan is timed like every re-plan.
+        self._last_plan_ms = 0.0
         self._init_episode(obs)
 
     # region lifecycle
@@ -558,7 +560,9 @@ class MPCCController(Controller):
             reason: What to record as the reason for the path in the plan log.
         """
         self._plan_origin = np.asarray(obs["pos"], dtype=float).copy()
+        started = time.perf_counter()
         path, info = self._planner.plan(obs, self._plan_origin)
+        self._last_plan_ms = (time.perf_counter() - started) * 1e3
         self._install_path(path, info)
         self._reset_state(obs, reason)
 
@@ -666,6 +670,9 @@ class MPCCController(Controller):
                 "theta": float(self._theta),
                 "length": float(self._path.length),
                 "n_waypoints": int(len(self._path_info.waypoints)),
+                # Wall clock the planner took for this path. It is the cost the control loop pays
+                # inside one tick, so it is worth recording next to the path it produced.
+                "ms": float(self._last_plan_ms),
                 "points": np.asarray(self._draw_points, dtype=float).copy(),
             }
         )
@@ -764,15 +771,25 @@ class MPCCController(Controller):
 
         Progress restarts at zero because the new path begins at the drone.
 
+        The anchor is the drone's pose at the *end* of this control interval, not its pose now: the
+        command computed this tick still applies for one interval, so by the time the new path takes
+        effect the drone has moved ``velocity * dt`` further on. Anchoring at the current position
+        put the start of the path behind the drone, which turns the first segment into a catch-up
+        and makes the spline curve sharply right where the curvature limit then throttles the drone.
+
         Args:
             obs: The current observation.
             reason: Why the path is re-planned, recorded in the plan log.
         """
-        start = np.asarray(obs["pos"], dtype=float).copy()
+        here = np.asarray(obs["pos"], dtype=float)
+        velocity = np.asarray(obs["vel"], dtype=float)
+        start = here + velocity / self._freq
         trimmed = self._remaining_obs(obs)
         if trimmed is None:
             return
+        started = time.perf_counter()
         path, info = self._planner.plan(trimmed, start, climb=False)
+        self._last_plan_ms = (time.perf_counter() - started) * 1e3
         self._install_path(path, info)
         self._theta = 0.0
         self._projection_window = (-0.15, 1.0)
@@ -781,9 +798,10 @@ class MPCCController(Controller):
         self.replans += 1
         self._record_plan(f"re-plan: {reason}", obs)
         logger.info(
-            "Re-planned from the current pose: %.2f m, %d passes left (replan %d)",
+            "Re-planned from the current pose: %.2f m, %d passes left, %.1f ms (replan %d)",
             path.length,
             len(np.asarray(trimmed["gate_sequence"]).ravel()),
+            self._last_plan_ms,
             self.replans,
         )
 
