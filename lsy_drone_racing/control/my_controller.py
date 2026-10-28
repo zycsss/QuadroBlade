@@ -189,12 +189,6 @@ class MPCCConfig:
         reveal_window: Arc length [m] in front of a gate over which ``reveal_speed`` applies.
         reveal_hold_time: Time [s] the cap stays on after a gate pose was corrected. The reveal is
             when the correction starts, not when it is finished.
-        gate_correction_hold_time: Time [s] a gate correction keeps the approach cap on. A revealed
-            gate 0.21 m from its nominal pose needs 0.46 s of lateral travel, and the reveal lands
-            0.7 m out, so the correction is still being paid for when the drone reaches the gate.
-        reveal_speed_corrected: Speed ceiling [m/s] while a gate correction is still being paid for.
-            Lower than ``reveal_speed`` because the lateral distance to make up is known and finite,
-            while an unseen gate's is not.
         name: Name of the acados model and of the generated code.
     """
 
@@ -257,12 +251,10 @@ class MPCCConfig:
     # there. Measured on level 2: see the planning page.
     reveal_speed: float = 1.5
     reveal_window: float = 1.2
-    reveal_hold_time: float = 0.5
-    # Measured: capping the approach at 1.1 m/s for 2 s after a gate correction costs 0.4 s a lap
-    # and does not save seeds 4, 13, 31 or 39 - they cross the plane 0.13-0.15 m off a plan that is
-    # dead centre whatever the speed, because the correction is lateral and the path left is short.
-    gate_correction_hold_time: float = 0.0
-    reveal_speed_corrected: float = 1.5
+    # Measured: keeping this at 0.5 s costs finishes now that the plan is better. The 35/40
+    # configuration runs with the hold off, and the correction is paid for by the post-replan
+    # slowdown instead - see the speed sweep on the planning page.
+    reveal_hold_time: float = 0.0
     name: str = "mpcc_racing"
 
     @property
@@ -1142,7 +1134,7 @@ class MPCCController(Controller):
             return False
         if not self._next_gate_seen:
             return True
-        hold = int(round(self._mpcc.gate_correction_hold_time * self._freq))
+        hold = int(round(self._mpcc.reveal_hold_time * self._freq))
         return self._tick - self._gate_corrected_tick <= hold
 
     def _reference_speed(self, theta: float, speed_actual: float) -> float:
@@ -1167,10 +1159,7 @@ class MPCCController(Controller):
         speed = min(speed, speed_actual + cfg.v_lead)
         speed = min(speed, float(np.interp(theta, self._speed_grid, self._speed_limit)))
         if self._approach_capped(theta):
-            corrected = self._tick - self._gate_corrected_tick <= int(
-                round(cfg.gate_correction_hold_time * self._freq)
-            )
-            speed = min(speed, cfg.reveal_speed_corrected if corrected else cfg.reveal_speed)
+            speed = min(speed, cfg.reveal_speed)
         if self._tick < self._hold_until:
             # Brake hard right after a re-plan: this is the only place where the controller spends
             # time to buy geometry. The revealed pose can be 0.21 m from the nominal one, and the

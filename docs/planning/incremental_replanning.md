@@ -247,6 +247,31 @@ passes (6, 11, 28, 33, 34, 36, 39) and two early take-off contacts (30, and 8 at
 relaxation pulls the curve off the passages and distorts the first metres after the anchor. It needs
 a wider passage lock and a stronger fidelity term before it can be adopted; the knobs are in place.
 
+## Measured: what it costs to go faster
+
+Six variants on level 2, seeds 0-39. The baseline is the current default (35/40, 8.37 s):
+
+| variant | success | mean lap | verdict |
+| --- | --- | --- | --- |
+| `mu_speed` 10 -> 16 | 35/40 | 8.36 s | no effect |
+| `a_lat_max` 4 -> 6 | 34/40 | 8.84 s | **slower** |
+| both | 34/40 | 8.84 s | slower |
+| `replan_slowdown_time` 0.8 -> 0.35 s, factor 0.5 -> 0.7 | 30/40 | 7.90 s | 0.47 s for 5 finishes |
+| post-replan slowdown off | 22/40 | 6.89 s | 1.5 s for 13 finishes |
+
+The reference-speed knobs do nothing, or hurt. `mu_speed` only sets the closed-form speed inside
+the high-weight zones, and the curvature and lead clamps dominate there; `a_lat_max` 6 raises the
+corner speed limit, the drone tracks worse, and the extra corrections cost more than the speed they
+buy. The only lever with a real effect is the post-replan slowdown, and it is exactly the margin the
+rest of this page is about: 1.5 s of lap time buys 13 finishes. So the lap time is set by how long the
+drone needs to correct after each reveal, not by how fast the reference asks it to fly - to go faster
+the corrections have to get cheaper (uncertainty-aware planning) or rarer (coalescing, measured worse),
+not the reference speed higher.
+
+Two knobs were removed while measuring this. `gate_correction_hold_time` and `reveal_speed_corrected`
+existed only to hold the approach cap after a gate correction; the 35/40 configuration runs with the
+cap off, so they are gone and `reveal_hold_time` carries its measured default of 0.0 s.
+
 ## The numbers to build on
 
 All measured, see `docs/control/characterisation.md` and the failure analysis.
