@@ -84,8 +84,9 @@ class PathConfig:
             on the nominal level 2 track the route keeps 0.168 m to the nearest pole against 0.150 m
             for the heuristic, and on the four randomized seeds tested both finish 4 of 4 episodes
             (12.83 s against 12.74 s), so the extra margin is worth the 0.09 s.
-        astar_resolution: Edge length [m] of one A* grid cell. 0.10 m resolves the poles and is
-            about twice as fast as 0.05 m for a route that is a few percent longer.
+        astar_resolution: Edge length [m] of one A* grid cell. 0.05 m rasterizes the arena into
+            5684 cells and costs about 0.2 ms more than 0.10 m, which fits the control period, so
+            the finer grid is used.
         astar_frame_margin: Additional clearance [m] on top of the drone radius that an A* route
             keeps from the gate posts.
         astar_bounds: Lower and upper corner of the arena in XY [m] that the A* grid covers.
@@ -132,7 +133,7 @@ class PathConfig:
     obstacle_iter_max: int = 2
     length_growth_max: float = 1.25
     use_astar: bool = True
-    astar_resolution: float = 0.10
+    astar_resolution: float = 0.05
     astar_frame_margin: float = 0.02
     astar_bounds: tuple[tuple[float, float], tuple[float, float]] = ((-2.45, -1.45), (2.45, 1.45))
     smooth_iterations: int = 600
