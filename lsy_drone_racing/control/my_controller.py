@@ -37,7 +37,7 @@ import logging
 import os
 import time
 from collections import deque
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -274,6 +274,13 @@ class MPCCConfig:
 def _signature(config: MPCCConfig, params: dict) -> str:
     """Compute a signature of everything that defines the generated solver.
 
+    Only the fields [build_ocp][lsy_drone_racing.control.my_controller.build_ocp] reads are hashed.
+    Hashing the whole dataclass meant every controller-only tweak - a replan slowdown factor, a
+    reveal window, a gate-correction hold - threw away the compiled solver and paid a one minute
+    rebuild, which is how a run ended in a killed cmake build. The opposite mistake is worse: a
+    field that does reach the OCP but is missing here would silently reuse a stale solver, so the
+    list below is checked against `build_ocp` and the dimensions are hashed alongside it.
+
     Args:
         config: MPCC configuration.
         params: Drone parameters used by the model.
@@ -282,7 +289,9 @@ def _signature(config: MPCCConfig, params: dict) -> str:
         A short hexadecimal signature.
     """
     payload = {
-        "config": asdict(config),
+        "config": {name: getattr(config, name) for name in _OCP_FIELDS},
+        # The trap the planning page records: a changed NP reuses the stale generated code silently.
+        "dimensions": [NX, NU, NP],
         "mass": float(params["mass"]),
         "thrust": [float(params["thrust_min"]), float(params["thrust_max"])],
         "lag": [np.asarray(params[k], dtype=float).tolist() for k in _LAG_KEYS],
@@ -291,6 +300,33 @@ def _signature(config: MPCCConfig, params: dict) -> str:
     digest = json.dumps(payload, sort_keys=True, default=str).encode()
     return hashlib.sha256(digest).hexdigest()[:16]
 
+
+#: The MPCCConfig fields that `build_ocp` reads. Everything else only affects the running
+#: controller, so changing it must not invalidate the compiled solver.
+_OCP_FIELDS = (
+    "N",
+    "dt",
+    "q_lag",
+    "q_contour",
+    "w_obstacle",
+    "obstacle_radius",
+    "q_lag_peak",
+    "q_contour_peak",
+    "contour_z_weight",
+    "q_attitude",
+    "r_rates",
+    "mu_speed",
+    "r_vtheta",
+    "v_max",
+    "thrust_lag",
+    "qp_solver",
+    "condensing_N",
+    "attitude_limit",
+    "rate_limit",
+    "pos_low",
+    "pos_high",
+    "name",
+)
 
 _LAG_KEYS = ("rpy_coef", "rpy_rates_coef", "cmd_rpy_coef")
 
