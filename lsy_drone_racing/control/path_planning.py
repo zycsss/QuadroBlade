@@ -26,6 +26,10 @@ Deviations from the reference implementation (all required for this environment)
   which of the two decides the route.
 * The blocked interval's entry sample is kept and a degenerate (dead-centre) obstacle crossing
   falls back to the chord perpendicular instead of placing the waypoint inside the obstacle.
+* A re-plan is *seeded*: it starts on the old path at the drone's projection and leaves along the
+  old path's tangent, and the part of the first gate passage that lies behind the drone is dropped,
+  so a new path never asks the drone to turn around at its first waypoint. See
+  [PathSeed][lsy_drone_racing.control.path_planning.PathSeed].
 * The path is extended past the last gate and defines a linear continuation outside its parameter
   range, so the controller may evaluate it slightly ahead or behind without extrapolating a cubic.
 
@@ -114,6 +118,17 @@ class PathConfig:
             it crosses the gate plane but does not pass through the gate. The solid frame ends at
             0.36 m and the drone is a 0.09 m sphere, so anything closer would hit the frame.
         gate_frame_window: Arc length [m] over which an unintended frame crossing is pushed away.
+        trim_seeded_passage: Whether a seeded re-plan drops the part of the first gate passage that
+            lies behind its anchor. That part is the anchor fold, so it is on by default; the flag
+            exists to measure it against the straight approach it removes, which is what centres the
+            drone through the 0.40 m opening.
+        seed_length: Length [m] of the straight seed step that a re-plan puts after its anchor. It
+            sets the direction the new path leaves the old one with, so it has to be long enough for
+            the waypoint spline to feel it and short enough not to delay the correction.
+        anchor_pin_length: Arc length [m] at the start of a re-planned path that is moved back onto
+            the anchor's own geometry, the old path where the seed carries it and the straight
+            tangent otherwise. This is the stage that makes the promise "the new path starts where
+            the drone is and along the old path" true after every later stage has moved the path.
         climb_height: Height [m] added above the start position before heading to the first gate.
         runout: Extra length [m] the path continues behind the last gate.
         duration: Duration [s] of the auxiliary time-parameterized spline.
@@ -144,10 +159,13 @@ class PathConfig:
     # but costs three successes out of 20, because the straight approach is what centres the drone
     # through the opening. Left off; the fold is cheaper to avoid by not re-planning in a passage.
     trim_first_passage: bool = False
+    trim_seeded_passage: bool = True
     gate_straight_length: float = 0.275
     gate_straight_blend: float = 0.25
     gate_frame_clearance: float = 0.55
     gate_frame_window: float = 0.3
+    seed_length: float = 0.15
+    anchor_pin_length: float = 0.25
     climb_height: float = 0.25
     runout: float = 0.4
     duration: float = 30.0
@@ -201,6 +219,59 @@ class PathInfo:
     waypoints: NDArray[np.floating]
     gate_centers: NDArray[np.floating]
     obstacles: NDArray[np.floating]
+
+
+@dataclass(frozen=True)
+class PathSeed:
+    """Where and in which direction a re-planned path has to start.
+
+    A re-plan is not a fresh plan: the drone is already flying, so the new path has to begin on the
+    one it is following and leave it along the direction the drone is already moving. This is the
+    whole content of the seed.
+
+    Attributes:
+        position: The anchor, a point *on the old path* rather than the drone's measured pose, so
+            the new path starts from the old one, not from wherever tracking error left the drone.
+        tangent: Unit direction of the old path at the anchor.
+        length: Length [m] of the straight seed step, see ``PathConfig.seed_length``.
+        path: The old path itself, when it is known. Given it, the anchor pin follows the old path
+            for its first ``anchor_pin_length`` metres instead of following the straight tangent,
+            which keeps the new path's curvature continuous at the anchor as well as its direction.
+        progress: Arc length of the anchor on ``path``. Ignored without ``path``.
+    """
+
+    position: NDArray[np.floating]
+    tangent: NDArray[np.floating]
+    length: float
+    path: ArcPath | None = None
+    progress: float = 0.0
+
+    def __post_init__(self):
+        """Normalize the tangent and reject a degenerate seed."""
+        position = np.asarray(self.position, dtype=float).reshape(3)
+        tangent = np.asarray(self.tangent, dtype=float).reshape(3)
+        norm = float(np.linalg.norm(tangent))
+        if norm < 1e-9:
+            raise ValueError("A path seed requires a non-zero tangent.")
+        object.__setattr__(self, "position", position)
+        object.__setattr__(self, "tangent", tangent / norm)
+        object.__setattr__(self, "length", float(self.length))
+        object.__setattr__(self, "progress", float(self.progress))
+
+    def follow(self, arcs: NDArray[np.floating]) -> NDArray[np.floating]:
+        """Return the points a re-plan should follow at the given arc lengths from the anchor.
+
+        Args:
+            arcs: Arc length from the anchor, shape ``(n, )``.
+
+        Returns:
+            The old path at those arc lengths when it is known, and the straight tangent line
+            through the anchor otherwise.
+        """
+        arcs = np.asarray(arcs, dtype=float).reshape(-1)
+        if self.path is not None:
+            return self.path.pos(self.progress + arcs)
+        return self.position[None, :] + arcs[:, None] * self.tangent[None, :]
 
 
 def path_config_from(config: object = None, **overrides: object) -> PathConfig:
@@ -408,6 +479,7 @@ class PathPlanner:
         obs: dict[str, NDArray[np.floating]],
         start_pos: NDArray[np.floating],
         climb: bool = True,
+        seed: PathSeed | None = None,
     ) -> tuple[ArcPath, PathInfo]:
         """Plan the path from the start position through all gates in the configured order.
 
@@ -417,8 +489,12 @@ class PathPlanner:
             start_pos: Position the path starts at, shape ``(3,)``. A re-plan passes the drone's
                 current position and the sequence of the passes still to come, so the planned path
                 begins where the drone actually is rather than at the take-off point it left behind.
+                A seed, when given, replaces this with the seed's position.
             climb: Whether the path rises ``climb_height`` above ``start_pos`` before the gates.
                 first gate. True for the first plan of an episode, which starts on the ground.
+            seed: Where and in which direction a re-plan has to start, see
+                [PathSeed][lsy_drone_racing.control.path_planning.PathSeed]. ``None`` for the
+                plan, which starts from rest and has no path to continue.
 
         Returns:
             The arc-length parameterized path and its metadata.
@@ -436,10 +512,28 @@ class PathPlanner:
         pass_z_axes = frames.z_axes[sequence]
 
         start = np.asarray(start_pos, dtype=float).reshape(3)
-        blocks = self._gate_blocks(start, pass_pos, pass_normals, obstacles, climb=climb)
+        if seed is not None:
+            start = np.asarray(seed.position, dtype=float).reshape(3)
+        blocks = self._gate_blocks(start, pass_pos, pass_normals, obstacles, climb=climb, seed=seed)
+        # A re-plan starts inside the first passage often enough that the part of it behind the
+        # has to go before anything else looks at the waypoints: it is a fold within centimetres of
+        # the anchor, and the smoothing can only turn it into a corner.
+        trim = (seed is not None and self.config.trim_seeded_passage) or (
+            not climb and self.config.trim_first_passage
+        )
+        if trim:
+            blocks = self._trim_first_passage(
+                blocks,
+                pass_pos,
+                pass_normals,
+                direction=None if seed is None else seed.tangent,
+                # Measured: trimming from the end of the seed step rather than from the anchor is
+                # what removes the last fold. The seed step is 0.15 m long, so a drone that is
+                # closer than that to the passage start ends up with the passage *behind* the step
+                # and folds it back anyway.
+                origin=None if seed is None else blocks[1][0],
+            )
         blocks = self._insert_detours(blocks, pass_pos, pass_normals, pass_y_axes, pass_z_axes)
-        if not climb and self.config.trim_first_passage:
-            blocks = self._trim_first_passage(blocks, pass_normals)
         runout = self._runout(blocks, pass_pos, pass_normals)
         if self.config.use_astar and len(obstacles):
             waypoints = self._connect_blocks(blocks, runout, obstacles, gate_pos, frames.y_axes)
@@ -452,10 +546,11 @@ class PathPlanner:
             waypoints, pass_pos, pass_normals, pass_y_axes, pass_z_axes
         )
         if self.config.enforce_clearance:
-            # Last, because every stage above can move the path inward: the smoothing rounds corners
-            # and the gate handling pushes sideways. This is the pass that makes the promise true.
+            # Last of the waypoint stages, because every stage above can move the path inward: the
+            # smoothing rounds corners and the gate handling pushes sideways. This is the pass that
+            # makes the promise true.
             waypoints = self._enforce_clearance(waypoints, obstacles)
-        path = self._to_arc_path(waypoints)
+        path = self._to_arc_path(waypoints, seed)
         info = PathInfo(
             waypoints=waypoints,
             gate_centers=pass_pos,
@@ -470,6 +565,7 @@ class PathPlanner:
         pass_normals: NDArray[np.floating],
         obstacles: NDArray[np.floating],
         climb: bool = True,
+        seed: PathSeed | None = None,
     ) -> list[NDArray[np.floating]]:
         """Build one waypoint block per gate pass, preceded by start and climb blocks.
 
@@ -484,13 +580,29 @@ class PathPlanner:
                 the first segment of the polyline, and without it the routing degenerates and the
                 path comes out about 45 percent longer. A re-plan replaces the climb with a short
                 level step toward the next gate.
+            seed: The direction a re-plan leaves the old path with. When given, the second block
+                steps along the *old* path's tangent instead of toward the next gate, which is what
+                re-plan from turning the drone around at the anchor.
 
         Returns:
             One block per gate pass, preceded by the start block.
         """
         cfg = self.config
+        passages = []
+        for pos, normal in zip(pass_pos, pass_normals, strict=True):
+            d_in = self._side_offset(pos, normal, -1.0, obstacles)
+            d_out = self._side_offset(pos, normal, +1.0, obstacles)
+            offsets = np.linspace(-d_in, d_out, cfg.num_intermediate_points)
+            passages.append(pos.reshape(1, 3) + offsets[:, None] * normal.reshape(1, 3))
         blocks = [start.reshape(1, 3)]
-        if climb:
+        if seed is not None:
+            # The seed step decides the direction the spline leaves the anchor with, and it must not
+            # reach past the start of the first passage: a step that overshoots it makes the passage
+            # begin behind a point that is already on the path, which is a fold the trim would then
+            # have to eat along with the approach the gate needs for centring.
+            gap = float((passages[0][0] - start) @ seed.tangent) if passages else 0.0
+            ahead = np.asarray(seed.tangent, dtype=float) * max(0.02, min(seed.length, gap))
+        elif climb:
             ahead = np.array([0.0, 0.0, cfg.climb_height])
         elif len(pass_pos):
             towards = np.asarray(pass_pos[0], dtype=float) - start
@@ -499,11 +611,7 @@ class PathPlanner:
         else:
             ahead = np.zeros(3)
         blocks.append((start + ahead).reshape(1, 3))
-        for pos, normal in zip(pass_pos, pass_normals, strict=True):
-            d_in = self._side_offset(pos, normal, -1.0, obstacles)
-            d_out = self._side_offset(pos, normal, +1.0, obstacles)
-            offsets = np.linspace(-d_in, d_out, cfg.num_intermediate_points)
-            blocks.append(pos.reshape(1, 3) + offsets[:, None] * normal.reshape(1, 3))
+        blocks.extend(passages)
         return blocks
 
     def _side_offset(
@@ -1080,47 +1188,127 @@ class PathPlanner:
         return pts
 
     def _trim_first_passage(
-        self, blocks: list[NDArray[np.floating]], pass_normals: NDArray[np.floating]
+        self,
+        blocks: list[NDArray[np.floating]],
+        pass_pos: NDArray[np.floating],
+        pass_normals: NDArray[np.floating],
+        direction: NDArray[np.floating] | None = None,
+        origin: NDArray[np.floating] | None = None,
     ) -> list[NDArray[np.floating]]:
         """Drop the part of the first gate passage that lies behind the drone.
 
         A passage block runs from ``approach_distance`` before the gate to beyond it. On a re-plan
         the drone is often already *inside* that approach, so the block starts behind it and the
         polyline turns 180 degrees within a few centimetres of the anchor: a cusp that the smoothing
-        polyline turns 180 degrees within a few centimetres of the anchor: a cusp the smoothing then
-        are still ahead removes the fold without changing where the path crosses the gate.
+        then has to eat, and the fold this whole change exists to remove. Keeping only the samples
+        that are still ahead removes the fold without changing where the path crosses the gate.
 
         Args:
             blocks: The waypoint blocks, ``blocks[0]`` the start and ``blocks[1]`` its anchor step.
+            pass_pos: Gate centres in passing order, shape ``(n_passes, 3)``.
             pass_normals: Gate normals in passing order, shape ``(n_passes, 3)``.
+            direction: Direction that counts as "ahead" along which the samples are tested. Defaults
+                to the next gate's normal, which is right for a drone flying at the gate. A re-plan
+                passes the old path's tangent instead, because a drone that is turning into the gate
+                can have passage samples behind it that are still ahead of the gate plane.
+            origin: Point the "ahead" test is made from. Defaults to the first waypoint; a seeded
+                re-plan passes the end of its seed step, so that the passage does not start behind a
+                point that is already on the path.
 
         Returns:
             The blocks with the first passage trimmed to the part ahead of the start.
         """
         if len(blocks) < 3 or len(pass_normals) == 0:
             return blocks
-        start = blocks[0][0]
+        start = np.asarray(blocks[0][0] if origin is None else origin, dtype=float)
         normal = np.asarray(pass_normals[0], dtype=float)
+        ahead_direction = normal if direction is None else np.asarray(direction, dtype=float)
         passage = blocks[2]
-        ahead = (passage - start[None, :]) @ normal
+        ahead = (passage - start[None, :]) @ ahead_direction
         keep = ahead >= -0.02
+        # The pass itself is not negotiable: if the drone is already past the gate plane, the kept
+        # samples would never cross it and the gate would never count. Keep the last approach sample
+        # in that case, even though it is behind the anchor and therefore a (small) fold.
+        side = (passage - np.asarray(pass_pos[0], dtype=float)[None, :]) @ normal
+        if not np.any(side[keep] <= 0.0):
+            approach = np.flatnonzero(side <= 0.0)
+            if len(approach):
+                keep[approach[-1]] = True
         if keep.sum() >= 2:
             trimmed = list(blocks)
             trimmed[2] = passage[keep]
             return trimmed
         return blocks
 
-    def _to_arc_path(self, waypoints: NDArray[np.floating]) -> ArcPath:
-        """Fit and reparameterize the path, then hand it to an [ArcPath][...ArcPath]."""
+    def _pin_anchor(self, points: NDArray[np.floating], seed: PathSeed) -> NDArray[np.floating]:
+        """Move the first ``anchor_pin_length`` metres of a re-planned path onto the anchor.
+
+        Every stage between the waypoints and here moves the start of the path: the smoothing rounds
+        it, the gate straightening pulls it onto the gate normal, the clearance pass pushes it away
+        from a pole. What survives is a path that starts somewhere near the drone, pointing near the
+        next gate. This pass restores the two properties the controller relies on: ``pos(0)`` is the
+        anchor, which lies on the old path, and ``tangent(0)`` is the old path's tangent, i.e. the
+        direction the drone is already flying. The drone therefore never has to turn around at the
+        start of a new path.
+
+        The target of the blend is the old path itself when the seed carries it, so the new path
+        also inherits the old one's curvature at the anchor and the correction only starts to bite
+        in. With a tangent only, the target is the straight line through the anchor.
+
+        The displacement is blended with a smootherstep weight, so the weight and its first *and*
+        second derivatives vanish at both ends: the path joins the rest of the plan with continuous
+        position, tangent and curvature, and nothing downstream sees a corner.
+
+        Args:
+            points: The finished path samples, shape ``(n_points, 3)``.
+            seed: The anchor, the tangent and optionally the old path to pin the start to.
+
+        Returns:
+            The samples with their first ``anchor_pin_length`` metres on the seed's own geometry.
+        """
+        length = float(self.config.anchor_pin_length)
+        pts = np.asarray(points, dtype=float).reshape(-1, 3).copy()
+        if length <= 0.0 or len(pts) < 3:
+            return pts
+        # Window in samples: at least three points, at most the whole path.
+        steps = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+        arc = np.concatenate(([0.0], np.cumsum(steps)))
+        count = int(np.searchsorted(arc, length)) + 1
+        count = max(3, min(count, len(pts)))
+        window = pts[:count]
+        # Targets are laid out from the anchor at the window's own arc length, so the first point is
+        # the anchor itself and not the anchor plus however far the smoothing or the gate
+        # straightening dragged the start forward.
+        target = np.asarray(seed.follow(arc[:count]), dtype=float).reshape(-1, 3)
+        # 1 at the anchor, 0 at the end of the window.
+        fraction = np.clip(1.0 - arc[:count] / max(length, 1e-9), 0.0, 1.0)
+        weight = fraction * fraction * fraction * (fraction * (6.0 * fraction - 15.0) + 10.0)
+        pts[:count] = (1.0 - weight)[:, None] * window + weight[:, None] * target
+        return pts
+
+    def _to_arc_path(
+        self, waypoints: NDArray[np.floating], seed: PathSeed | None = None
+    ) -> ArcPath:
+        """Fit and reparameterize the path, then hand it to an [ArcPath][...ArcPath].
+
+        The anchor pin of a seeded re-plan is applied *here*, to the dense samples, and not to the
+        waypoints: the arc-length reparameterization refits a natural cubic spline and resamples it
+        to twenty times, and its first tangent drifts away from the first chord a little on every
+        sweep. Measured on a real re-plan, the drift turned a start that was straight along the old
+        path into one pointing 100 degrees off it. Pinning the samples the fitted path is actually
+        built from is immune to that, because the pinned prefix already has the geometry it is
+        to.
+        """
         cfg = self.config
         spline = self._reparametrize(self._create_spline(waypoints, cfg.duration))
         span = float(spline.x[-1] - spline.x[0])
         n_points = max(2, int(span / 0.02))
-        return ArcPath(
-            np.asarray(
-                spline(np.linspace(float(spline.x[0]), float(spline.x[-1]), n_points)), dtype=float
-            ).reshape(-1, 3)
-        )
+        points = np.asarray(
+            spline(np.linspace(float(spline.x[0]), float(spline.x[-1]), n_points)), dtype=float
+        ).reshape(-1, 3)
+        if seed is not None:
+            points = self._pin_anchor(points, seed)
+        return ArcPath(points)
 
 
 def track_reference(

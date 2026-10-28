@@ -53,6 +53,7 @@ from lsy_drone_racing.control.path_planning import (
     ArcPath,
     PathInfo,
     PathPlanner,
+    PathSeed,
     path_config_from,
     track_reference,
 )
@@ -829,13 +830,14 @@ class MPCCController(Controller):
         because the path enters the cost as per-stage parameters. The speed limit table and the
         progress bound are rebuilt for the new path.
 
-        The new path starts at the drone's current position rather than at the take-off point, and
-        it only contains the gate passes that have not happened yet. Planning from the take-off
-        point laid out the part of the track that was already behind the drone and then asked the
-        drone to converge onto it, which is where most of the drift against the plan came from:
-        the reference at the drone's progress was a point on a path shaped around obstacles the
-        drone had already passed. Anchoring at the current pose makes the first metres of the
-        plan reachable by construction.
+        The new path starts on the *old* path, at the projection of the pose the drone will have
+        when the new path takes effect, and it leaves that point along the old path's tangent. Two
+        things follow from anchoring on the path rather than on the measured pose: the new path
+        begins on the trajectory the drone is already flying, so the reference at progress zero is a
+        point the drone is heading for and not a point it has to reach sideways; and the tangent is
+        the direction it is already moving, so the first metres of the plan cannot ask it to turn
+        around. Planning from the take-off point, or from the measured pose toward the next gate,
+        did both of those wrong, and the folds that the smoothing then had to eat came out of it.
 
         Progress restarts at zero because the new path begins at the drone.
 
@@ -851,12 +853,21 @@ class MPCCController(Controller):
         """
         here = np.asarray(obs["pos"], dtype=float)
         velocity = np.asarray(obs["vel"], dtype=float)
-        start = here + velocity / self._freq
         trimmed = self._remaining_obs(obs)
         if trimmed is None:
             return
+        assert self._path is not None
+        predicted = here + velocity / self._freq
+        progress = self._path.closest(predicted, self._theta)
+        seed = PathSeed(
+            position=self._path.pos(progress),
+            tangent=self._path.tangent(progress),
+            length=self._planner.config.seed_length,
+            path=self._path,
+            progress=progress,
+        )
         started = time.perf_counter()
-        path, info = self._planner.plan(trimmed, start, climb=False)
+        path, info = self._planner.plan(trimmed, seed.position, climb=False, seed=seed)
         self._last_plan_ms = (time.perf_counter() - started) * 1e3
         self._install_path(path, info)
         self._theta = 0.0
@@ -867,7 +878,8 @@ class MPCCController(Controller):
         self.replans += 1
         self._record_plan(f"re-plan: {reason}", obs)
         logger.info(
-            "Re-planned from the current pose: %.2f m, %d passes left, %.1f ms (replan %d)",
+            "Re-planned from progress %.2f m: %.2f m, %d passes left, %.1f ms (replan %d)",
+            progress,
             path.length,
             len(np.asarray(trimmed["gate_sequence"]).ravel()),
             self._last_plan_ms,
