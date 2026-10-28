@@ -57,7 +57,13 @@ logger = logging.getLogger(__name__)
 #: the Gaussian contouring-weight allocation of the T-RO22 paper (Sec. IV-C).
 GATE_PROXIMITY_WEIGHT = 0.4
 #: Weight of the (slightly weaker) proximity bump around an obstacle.
-OBSTACLE_PROXIMITY_WEIGHT = 0.2
+#:
+#: It used to be half the gate weight, on the argument that the drone may cut corners between gates.
+#: Measured on level 2, that is exactly what it does at a pole: the planned clearance is 0.15 m, the
+#: body touches at 0.114 m, so only 3.6 cm are available for lateral error, and the drone spent 6 to
+#: 9 cm of it on the four pole failures of the 40-seed screen. A pole is a hard obstacle, not a
+#: corner, so it now asks for as much contouring as a gate does.
+OBSTACLE_PROXIMITY_WEIGHT = 0.4
 #: Width of the proximity bumps, `exp(-_PROXIMITY_DECAY * d^2)`.
 _PROXIMITY_DECAY = 8.0
 
@@ -118,6 +124,18 @@ class PathConfig:
             it crosses the gate plane but does not pass through the gate. The solid frame ends at
             0.36 m and the drone is a 0.09 m sphere, so anything closer would hit the frame.
         gate_frame_window: Arc length [m] over which an unintended frame crossing is pushed away.
+        gate_frame_slab: Half thickness [m] of the slab around a gate plane that counts as close
+            enough to touch the frame. A body of 0.10 m radius beside a 0.03 m bar touches it from
+            0.13 m away, and this is the distance at which the path is pushed out. It replaces an
+            exact crossing test: a path that comes close to the plane and turns away without
+            crossing it can hit the ring just as well.
+        gate_frame_step: Largest in-plane displacement [m] a single frame-avoidance pass applies.
+            Clearing a 0.5 m violation in one pass leaves a kink where its taper ends; the same
+            correction spread over several passes keeps the path flyable.
+        gate_opening_limit: Largest off-centre distance [m] at which a body still fits through the
+            0.40 m wide opening, i.e. the half opening minus the body radius. A passage further out
+            than this is not a passage: it is logged, because moving it would make the drone miss a
+            gate it has to fly through.
         trim_seeded_passage: Whether a seeded re-plan drops the part of the first gate passage that
             lies behind its anchor. That part is the anchor fold, so it is on by default; the flag
             exists to measure it against the straight approach it removes, which is what centres the
@@ -164,6 +182,9 @@ class PathConfig:
     gate_straight_blend: float = 0.25
     gate_frame_clearance: float = 0.55
     gate_frame_window: float = 0.3
+    gate_frame_slab: float = 0.13
+    gate_frame_step: float = 0.15
+    gate_opening_limit: float = 0.101
     seed_length: float = 0.15
     anchor_pin_length: float = 0.25
     climb_height: float = 0.25
@@ -213,11 +234,15 @@ class PathInfo:
     Attributes:
         waypoints: The fitted waypoints, shape ``(n_waypoints, 3)``.
         gate_centers: Gate centre of every gate pass in passing order, shape ``(n_passes, 3)``.
+        gate_ids: Index of the gate of every pass in passing order, shape ``(n_passes, )``. The
+            controller needs it to look up whether that gate has been seen yet, which is what its
+            approach speed cap is keyed on.
         obstacles: Obstacle positions used for collision avoidance, shape ``(n_obstacles, 3)``.
     """
 
     waypoints: NDArray[np.floating]
     gate_centers: NDArray[np.floating]
+    gate_ids: NDArray[np.integer]
     obstacles: NDArray[np.floating]
 
 
@@ -512,8 +537,12 @@ class PathPlanner:
         pass_z_axes = frames.z_axes[sequence]
 
         start = np.asarray(start_pos, dtype=float).reshape(3)
+        completed = False
         if seed is not None:
             start = np.asarray(seed.position, dtype=float).reshape(3)
+            completed = self._completed_pass(
+                start, seed.tangent, pass_pos, pass_normals, pass_y_axes, pass_z_axes
+            )
         blocks = self._gate_blocks(start, pass_pos, pass_normals, obstacles, climb=climb, seed=seed)
         # A re-plan starts inside the first passage often enough that the part of it behind the
         # has to go before anything else looks at the waypoints: it is a fold within centimetres of
@@ -532,6 +561,9 @@ class PathPlanner:
                 # closer than that to the passage start ends up with the passage *behind* the step
                 # and folds it back anyway.
                 origin=None if seed is None else blocks[1][0],
+                # A pass the drone has already flown through needs no crossing: forcing one is what
+                # asked the drone to come back through the gate it had just left.
+                crossing_required=not completed,
             )
         blocks = self._insert_detours(blocks, pass_pos, pass_normals, pass_y_axes, pass_z_axes)
         runout = self._runout(blocks, pass_pos, pass_normals)
@@ -542,21 +574,74 @@ class PathPlanner:
         waypoints = self._avoid_obstacles(waypoints, obstacles)
         waypoints = self._smooth_path(waypoints, obstacles)
         waypoints = self._straighten_gate_passages(waypoints, pass_pos, pass_normals)
+        # Every gate of the track, not only the remaining passes: a gate the drone has already flown
+        # through is still a solid ring, and on a track that doubles back the route to the next gate
+        # crosses its plane.
+        crossing_count = np.zeros(len(gate_pos), dtype=int)
+        for gate_id in sequence:
+            crossing_count[gate_id] += 1
         waypoints = self._avoid_gate_frames(
-            waypoints, pass_pos, pass_normals, pass_y_axes, pass_z_axes
+            waypoints, gate_pos, frames.normals, frames.y_axes, frames.z_axes, crossing_count
         )
         if self.config.enforce_clearance:
             # Last of the waypoint stages, because every stage above can move the path inward: the
             # smoothing rounds corners and the gate handling pushes sideways. This is the pass that
             # makes the promise true.
             waypoints = self._enforce_clearance(waypoints, obstacles)
-        path = self._to_arc_path(waypoints, seed)
+        pin_length = self.config.anchor_pin_length if seed is not None else 0.0
+        path = self._to_arc_path(waypoints, seed, pin_length)
         info = PathInfo(
             waypoints=waypoints,
             gate_centers=pass_pos,
+            gate_ids=np.asarray(sequence, dtype=int),
             obstacles=obstacles if len(obstacles) else np.zeros((0, 3)),
         )
         return path, info
+
+    @staticmethod
+    def _completed_pass(
+        start: NDArray[np.floating],
+        tangent: NDArray[np.floating],
+        pass_pos: NDArray[np.floating],
+        pass_normals: NDArray[np.floating],
+        pass_y_axes: NDArray[np.floating],
+        pass_z_axes: NDArray[np.floating],
+    ) -> bool:
+        """Return whether the drone is through the first pass of the sequence, or about to be.
+
+        A re-plan can be made on the same tick as a gate pass: the controller plans before the
+        environment steps, so the sequence still lists the gate the drone is about to fly through,
+        and by the time the new path is active it has flown through it. Planning a passage the drone
+        is already past is what produced a second, off-centre crossing of that gate's opening in the
+        measurements on level 2 - the drone was 5 cm past the plane, the trimmed passage pulled it
+        back through it, and the route then left that gate 0.16 m off centre and into the frame.
+
+        The test mirrors the environment's own pass test - at or just before the plane, inside the
+        opening, and heading through it - because only then is the pass either registered or certain
+        to register on the next step. The plane tolerance is loose on the near side for exactly that
+        reason: the anchor is the pose at the *end* of the interval, so a drone 1 cm before the
+        at 1.3 m/s has already crossed it by the time the new path is used.
+
+        Args:
+            start: The anchor of the re-plan, shape ``(3,)``.
+            tangent: Direction the drone is flying, shape ``(3,)``.
+            pass_pos: Gate centres in passing order, shape ``(n_passes, 3)``.
+            pass_normals: Signed traversal normal of every pass, shape ``(n_passes, 3)``.
+            pass_y_axes: In-plane lateral axis of every pass, shape ``(n_passes, 3)``.
+            pass_z_axes: In-plane vertical axis of every pass, shape ``(n_passes, 3)``.
+
+        Returns:
+            ``True`` if the first pass of the sequence is being completed.
+        """
+        if len(pass_pos) == 0:
+            return False
+        normal = np.asarray(pass_normals[0], dtype=float)
+        offset = np.asarray(start, dtype=float) - np.asarray(pass_pos[0], dtype=float)
+        along = float(offset @ normal)
+        lateral = float(offset @ np.asarray(pass_y_axes[0], dtype=float))
+        vertical = float(offset @ np.asarray(pass_z_axes[0], dtype=float))
+        heading = float(np.asarray(tangent, dtype=float) @ normal)
+        return along > -0.05 and max(abs(lateral), abs(vertical)) < 0.20 and heading > 0.3
 
     def _gate_blocks(
         self,
@@ -921,35 +1006,51 @@ class PathPlanner:
         gate_normals: NDArray[np.floating],
         gate_y_axes: NDArray[np.floating],
         gate_z_axes: NDArray[np.floating],
+        passes: NDArray[np.integer],
     ) -> NDArray[np.floating]:
         """Keep the path out of the solid ring of every gate it is not passing through.
 
         A gate is a solid frame: its collision geometry is a ring covering 0.2 m to 0.36 m from the
-        gate centre in the gate plane, while the drone is a sphere of about 0.09 m radius. A path
-        that crosses a gate plane between 0.2 m and 0.45 m from the centre therefore flies straight
-        through the frame. Since the legs between gates can pass close to a gate that is not the
-        current target, every unintended plane crossing inside that band is pushed outwards, with a
+        gate centre in the gate plane, while the drone is a body of about 0.10 m radius. A path that
+        comes within ``gate_frame_slab`` of a gate plane between roughly 0.10 m and 0.45 m from the
+        centre therefore flies through the frame. Every such neighbourhood is pushed outwards, with
         cosine-tapered displacement so that the correction stays local.
+
+        Two things this used to get wrong, both of them measured on level 2:
+
+        * It only ever saw the passes that were still to come. A re-plan gives the planner the
+          remaining gate sequence, so a gate the drone had already flown through was not in this
+          at all, and the route to the next gate - which on this track doubles back - crossed that
+          gate's plane through its own opening, 0.00-0.12 m off centre. The drone followed it into
+          the frame. It now receives every gate of the track, with the number of legitimate
+          per gate, so a passed gate still counts as a frame to avoid.
+        * It only reacted to plane *crossings*. A path that looped close to a gate plane and turned
+          away without crossing it came within 0.02 m of the plane at 0.43 m from the centre, and
+          approximation "no sign change, no conflict" let it through. The test is now a slab around
+          the plane, which catches both crossings and near misses.
 
         Args:
             points: Path points, shape ``(n_points, 3)``.
-            gate_pos: Gate centres in passing order, shape ``(n_passes, 3)``.
-            gate_normals: Signed traversal normal of every pass, shape ``(n_passes, 3)``.
-            gate_y_axes: In-plane lateral axis of every pass, shape ``(n_passes, 3)``.
-            gate_z_axes: In-plane vertical axis of every pass, shape ``(n_passes, 3)``.
+            gate_pos: Gate centres of the whole track, shape ``(n_gates, 3)``.
+            gate_normals: Gate normals of the whole track, shape ``(n_gates, 3)``. The sign is
+                irrelevant here: the plane is what matters.
+            gate_y_axes: In-plane lateral axis of every gate, shape ``(n_gates, 3)``.
+            gate_z_axes: In-plane vertical axis of every gate, shape ``(n_gates, 3)``.
+            passes: Number of legitimate crossings per gate, shape ``(n_gates, )``. Zero for a gate
+                that is not in the remaining sequence.
 
         Returns:
             The corrected path points, shape ``(n_points, 3)``.
         """
-        clearance = self.config.gate_frame_clearance
+        cfg = self.config
         pts = np.asarray(points, dtype=float).reshape(-1, 3).copy()
         spacing = float(np.mean(np.linalg.norm(np.diff(pts, axis=0), axis=1)))
-        window = max(2, int(round(self.config.gate_frame_window / max(spacing, 1e-3))))
-        # Group the passes by gate plane: a gate can appear several times in the gate order, and all
-        # of its crossings through the opening are legitimate while every other crossing is not.
+        window = max(2, int(round(cfg.gate_frame_window / max(spacing, 1e-3))))
+        # Group by gate plane: a gate can appear several times in the gate order, and all of its
+        # crossings through the opening are legitimate while every other approach is not.
         planes: dict[tuple, dict] = {}
-        for centre, normal, y_axis, z_axis in zip(
-            gate_pos, gate_normals, gate_y_axes, gate_z_axes, strict=True
+        for centre, normal, y_axis, z_axis, count in zip(
+            gate_pos, gate_normals, gate_y_axes, gate_z_axes, passes, strict=True
         ):
             centre = np.asarray(centre, dtype=float)
             normal = np.asarray(normal, dtype=float)
@@ -964,44 +1065,100 @@ class PathPlanner:
                     "passes": 0,
                 },
             )
-            plane["passes"] += 1
+            plane["passes"] += int(count)
         for plane in planes.values():
-            centre, normal = plane["centre"], plane["normal"]
-            offset = pts - centre
-            along = offset @ normal
-            crossing = np.where(np.diff(np.sign(along)) != 0)[0]
-            if len(crossing) == 0:
-                continue
-            # The legitimate passages are the crossings through the opening, i.e. the ones closest
-            # to the gate centre; the number of passes of this plane tells how many there are.
-            crossings = []
-            for index in crossing:
-                index = int(index)
-                fraction = -along[index] / (along[index + 1] - along[index])
-                local = offset[index] + fraction * (offset[index + 1] - offset[index])
-                lateral = float(local @ plane["y"])
-                vertical = float(local @ plane["z"])
-                # The frame is a square ring, so the relevant measure is the Chebyshev distance in
-                # the gate plane, not the radial one: a point at (0.31, 0.40) is 0.51 m from the
-                # centre diagonally, but only 0.04 m below the bottom bar.
-                crossings.append((index, max(abs(lateral), abs(vertical)), lateral, vertical))
-            crossings.sort(key=lambda item: item[1])
-            intended = {item[0] for item in crossings[: plane["passes"]]}
-            for index, extent, lateral, vertical in crossings:
-                if index in intended or extent >= clearance:
-                    continue
-                # Push along the dominant in-plane axis, which grows the square clearance fastest.
-                if abs(lateral) >= abs(vertical) and abs(lateral) > 1e-6:
-                    direction = plane["y"] if lateral > 0 else -plane["y"]
-                elif abs(vertical) > 1e-6:
-                    direction = plane["z"] if vertical > 0 else -plane["z"]
-                else:
-                    direction = plane["y"]
-                shift = (clearance - extent) * direction
+            protected = self._passage_mask(pts, plane, window)
+            # A single push moves the samples around it too and can clear a whole run of violations,
+            # so iterate a few times instead of solving for the exact displacement. The push is also
+            # capped per pass: moving a sample 0.5 m in one go leaves a kink where the taper ends,
+            # while spreading the same correction over several passes keeps the path flyable.
+            for _ in range(5):
+                violation = self._frame_violation(pts, plane, protected)
+                if violation is None:
+                    break
+                index, direction, distance = violation
                 indices = np.arange(max(0, index - window), min(len(pts), index + window + 1))
                 weight = 0.5 * (1.0 + np.cos(np.pi * (indices - index) / window))
-                pts[indices] += weight[:, None] * shift
+                weight[protected[indices]] = 0.0
+                step = min(distance, self.config.gate_frame_step)
+                pts[indices] += weight[:, None] * step * direction[None, :]
         return pts
+
+    def _passage_mask(
+        self, pts: NDArray[np.floating], plane: dict, window: int
+    ) -> NDArray[np.bool_]:
+        """Mask the samples that belong to a gate's own passage, which must not be pushed.
+
+        The legitimate crossings are the ones closest to the gate centre, and the number of passes
+        of the plane says how many there are. A passage that is not centred is logged instead of
+        pushed: moving it outwards would make the drone miss the gate it has to fly through.
+
+        Args:
+            pts: Path points, shape ``(n_points, 3)``.
+            plane: The plane dictionary built in [_avoid_gate_frames][...].
+            window: Half width, in samples, of the neighbourhood a push affects.
+
+        Returns:
+            A boolean mask over the samples.
+        """
+        protected = np.zeros(len(pts), dtype=bool)
+        # The first samples are the drone itself: a re-plan made as it flies through a gate starts
+        # inside that gate, so pushing them out of the opening would be pushing the drone. The pin
+        # re-anchors those samples anyway, and the rest of the frame is still avoided.
+        protected[: window + 2] = True
+        offset = pts - plane["centre"]
+        along = offset @ plane["normal"]
+        crossing = np.flatnonzero(np.diff(np.sign(along)) != 0)
+        if len(crossing) == 0:
+            return protected
+        extents = []
+        for index in crossing:
+            fraction = -along[index] / (along[index + 1] - along[index])
+            local = offset[index] + fraction * (offset[index + 1] - offset[index])
+            # The frame is a square ring, so the relevant measure is the Chebyshev distance in the
+            # gate plane: a point at (0.31, 0.40) is 0.51 m from the centre diagonally, but only
+            # 0.04 m below the bottom bar.
+            extents.append(max(abs(float(local @ plane["y"])), abs(float(local @ plane["z"]))))
+        for position in np.argsort(extents)[: plane["passes"]]:
+            index = int(crossing[position])
+            if extents[position] > self.config.gate_opening_limit:
+                logger.debug(
+                    "Gate passage %.3f m off the centre: the body does not fit through the opening",
+                    extents[position],
+                )
+            protected[max(0, index - window) : index + window + 2] = True
+        return protected
+
+    def _frame_violation(
+        self, pts: NDArray[np.floating], plane: dict, protected: NDArray[np.bool_]
+    ) -> tuple[int, NDArray[np.floating], float] | None:
+        """Return the worst sample inside a gate's frame slab and the shift that clears it.
+
+        Args:
+            pts: Path points, shape ``(n_points, 3)``.
+            plane: The plane dictionary built in [_avoid_gate_frames][...].
+            protected: Samples of the gate's own passage, which are left alone.
+
+        Returns:
+            ``(index, unit direction, distance)`` of the sample to move furthest inwards, or
+            ``None`` when the path keeps the frame clearance.
+        """
+        clearance = self.config.gate_frame_clearance
+        offset = pts - plane["centre"]
+        along = offset @ plane["normal"]
+        lateral = offset @ plane["y"]
+        vertical = offset @ plane["z"]
+        extent = np.maximum(np.abs(lateral), np.abs(vertical))
+        inside = (np.abs(along) < self.config.gate_frame_slab) & (extent < clearance) & ~protected
+        if not inside.any():
+            return None
+        index = int(np.argmax(np.where(inside, clearance - extent, -np.inf)))
+        # Push along the dominant in-plane axis, which grows the square clearance fastest.
+        if abs(lateral[index]) >= abs(vertical[index]):
+            direction = plane["y"] if lateral[index] >= 0 else -plane["y"]
+        else:
+            direction = plane["z"] if vertical[index] >= 0 else -plane["z"]
+        return index, np.asarray(direction, dtype=float), float(clearance - extent[index])
 
     def _straighten_gate_passages(
         self,
@@ -1194,6 +1351,7 @@ class PathPlanner:
         pass_normals: NDArray[np.floating],
         direction: NDArray[np.floating] | None = None,
         origin: NDArray[np.floating] | None = None,
+        crossing_required: bool = True,
     ) -> list[NDArray[np.floating]]:
         """Drop the part of the first gate passage that lies behind the drone.
 
@@ -1214,6 +1372,10 @@ class PathPlanner:
             origin: Point the "ahead" test is made from. Defaults to the first waypoint; a seeded
                 re-plan passes the end of its seed step, so that the passage does not start behind a
                 point that is already on the path.
+            crossing_required: Whether the trimmed block still has to cross the gate plane. It does
+                for a pass that is still to come, because the environment only counts a pass at a
+                plane crossing. A pass the drone has just flown through needs none, and forcing one
+                asks the drone to come back through the gate it has just left.
 
         Returns:
             The blocks with the first passage trimmed to the part ahead of the start.
@@ -1230,7 +1392,7 @@ class PathPlanner:
         # samples would never cross it and the gate would never count. Keep the last approach sample
         # in that case, even though it is behind the anchor and therefore a (small) fold.
         side = (passage - np.asarray(pass_pos[0], dtype=float)[None, :]) @ normal
-        if not np.any(side[keep] <= 0.0):
+        if crossing_required and not np.any(side[keep] <= 0.0):
             approach = np.flatnonzero(side <= 0.0)
             if len(approach):
                 keep[approach[-1]] = True
@@ -1240,8 +1402,10 @@ class PathPlanner:
             return trimmed
         return blocks
 
-    def _pin_anchor(self, points: NDArray[np.floating], seed: PathSeed) -> NDArray[np.floating]:
-        """Move the first ``anchor_pin_length`` metres of a re-planned path onto the anchor.
+    def _pin_anchor(
+        self, points: NDArray[np.floating], seed: PathSeed, length: float
+    ) -> NDArray[np.floating]:
+        """Move the first ``length`` metres of a re-planned path onto the anchor.
 
         Every stage between the waypoints and here moves the start of the path: the smoothing rounds
         it, the gate straightening pulls it onto the gate normal, the clearance pass pushes it away
@@ -1262,11 +1426,13 @@ class PathPlanner:
         Args:
             points: The finished path samples, shape ``(n_points, 3)``.
             seed: The anchor, the tangent and optionally the old path to pin the start to.
+            length: Arc length [m] of the prefix to pin, from
+                [_anchor_pin_length][lsy_drone_racing.control.path_planning.PathPlanner._anchor_pin_length].
 
         Returns:
-            The samples with their first ``anchor_pin_length`` metres on the seed's own geometry.
+            The samples with their first ``length`` metres on the seed's own geometry.
         """
-        length = float(self.config.anchor_pin_length)
+        length = float(length)
         pts = np.asarray(points, dtype=float).reshape(-1, 3).copy()
         if length <= 0.0 or len(pts) < 3:
             return pts
@@ -1287,7 +1453,10 @@ class PathPlanner:
         return pts
 
     def _to_arc_path(
-        self, waypoints: NDArray[np.floating], seed: PathSeed | None = None
+        self,
+        waypoints: NDArray[np.floating],
+        seed: PathSeed | None = None,
+        pin_length: float = 0.0,
     ) -> ArcPath:
         """Fit and reparameterize the path, then hand it to an [ArcPath][...ArcPath].
 
@@ -1306,8 +1475,8 @@ class PathPlanner:
         points = np.asarray(
             spline(np.linspace(float(spline.x[0]), float(spline.x[-1]), n_points)), dtype=float
         ).reshape(-1, 3)
-        if seed is not None:
-            points = self._pin_anchor(points, seed)
+        if seed is not None and pin_length > 0.0:
+            points = self._pin_anchor(points, seed, pin_length)
         return ArcPath(points)
 
 

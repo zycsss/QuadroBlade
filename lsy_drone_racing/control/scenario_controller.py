@@ -80,6 +80,7 @@ class ScenarioController(MPCCController):
         info = PathInfo(
             waypoints=path.pos(np.linspace(0.0, path.length, 60)),
             gate_centers=np.zeros((0, 3)),
+            gate_ids=np.zeros(0, dtype=int),
             obstacles=np.zeros((0, 3)),
         )
         self._install_path(path, info)

@@ -183,6 +183,12 @@ class MPCCConfig:
         replan_defer_in_passage: Whether to hold a re-plan while the drone flies a gate passage.
             Re-planning there puts the first block behind the drone, which folds the path back on
             itself within centimetres of the anchor.
+        reveal_speed: Reference speed ceiling [m/s] in front of a gate that has not been seen yet.
+            The ceiling is ``sensor_range / 0.46 s``, the time the drone needs to correct the worst
+            pose error, so it is an information limit rather than a tuning knob.
+        reveal_window: Arc length [m] in front of a gate over which ``reveal_speed`` applies.
+        reveal_hold_time: Time [s] the cap stays on after a gate pose was corrected. The reveal is
+            when the correction starts, not when it is finished.
         name: Name of the acados model and of the generated code.
     """
 
@@ -233,6 +239,14 @@ class MPCCConfig:
     # screen. The hold is therefore off: a factor of 1.0 with a zero window makes it a no-op.
     replan_hold_time: float = 0.0
     replan_hold_factor: float = 1.0
+    # A gate that has not been seen yet may be up to 0.21 m from the pose the plan aims at, and the
+    # drone needs about 0.46 s of lateral travel to make that up. 0.7 m of sensor range therefore
+    # only leaves a safe speed of 0.7 / 0.46 = 1.5 m/s, and the cap is applied over an arc-length
+    # window in front of the gate so the drone has already paid for the correction when it gets
+    # there. Measured on level 2: see the planning page.
+    reveal_speed: float = 1.5
+    reveal_window: float = 1.2
+    reveal_hold_time: float = 0.5
     name: str = "mpcc_racing"
 
     @property
@@ -549,6 +563,13 @@ class MPCCController(Controller):
         # already passes the gates cleanly. `path_config_from` applies that rule and the config
         # overrides of the race config in one place.
         self._planner = PathPlanner(path_config_from(config))
+        # The reveal-aware approach cap is information, not tuning: it buys the time to correct a
+        # pose that is still unknown. A track that does not randomize its poses has nothing to
+        # correct, so the cap would be pure lap time there.
+        randomizations = config.env.get("randomizations") or {}
+        self._randomized_track = any(
+            key in randomizations for key in ("gate_pos", "gate_rpy", "obstacle_pos")
+        )
         self._solver, _ = get_solver(self._mpcc, self._params)
         self._nominal_mass = float(self._params["mass"])
         self._mass_ratio = 1.0
@@ -621,6 +642,8 @@ class MPCCController(Controller):
         self._failures = 0
         self._stall_time = 0.0
         self._stall_reported = False
+        self._next_gate_seen = True
+        self._gate_corrected_tick = -(10**6)
         self._needs_plan = False
         self._solver.reset()
         # Last, so the entry sees the reset progress and tick, not the previous episode's.
@@ -641,6 +664,12 @@ class MPCCController(Controller):
         self._gate_centers = info.gate_centers
         self._obstacles = info.obstacles
         self._draw_points = path.pos(np.linspace(0.0, path.length, 200))
+        # Arc length of every remaining gate pass on this path, for the approach speed cap: a gate
+        # that has not been seen yet may be up to 0.21 m away from the pose the plan aims at, and
+        # correction has to be paid for before the drone reaches it.
+        self._gate_arc = np.array(
+            [path.closest(centre, 0.0, window=(-0.15, path.length)) for centre in info.gate_centers]
+        )
         self._build_speed_limit()
         self._apply_progress_bound()
 
@@ -1012,6 +1041,54 @@ class MPCCController(Controller):
             ]
         )
 
+    def _gate_seen(self, obs: dict[str, NDArray[np.floating]]) -> bool:
+        """Return whether the gate of the next pass has been observed at its true pose.
+
+        The environment reports the nominal pose of an object until the drone comes within the
+        sensor range of it, and the true one afterwards, and it says which by the ``visited`` flags.
+        A track without pose randomisation never changes a pose and its flags stay false, so there
+        "seen" is the right answer: the nominal pose is the true one.
+
+        Args:
+            obs: The current observation.
+
+        Returns:
+            ``True`` when the next gate's pose is trustworthy, or when there is no next gate.
+        """
+        gate_ids = np.asarray(self._path_info.gate_ids).ravel()
+        if len(gate_ids) == 0:
+            return True
+        flags = np.asarray(obs.get("gates_visited", np.zeros(0)), dtype=bool).ravel()
+        gate = int(gate_ids[0])
+        if len(flags) <= gate:
+            return True
+        return bool(flags[gate])
+
+    def _approach_capped(self, theta: float) -> bool:
+        """Return whether the approach to the next gate has to be flown at ``reveal_speed``.
+
+        Two cases ask for it. A gate that has not been seen yet is only nominal, and the correction
+        the reveal will demand has to be flown before the drone gets there. A gate that *was* just
+        corrected keeps the cap for ``reveal_hold_time``, because the reveal is when the correction
+        starts, not when it is finished: measured on level 2, the reveal lands at 0.7 m and the
+        0.46 s of lateral travel needed is the whole distance that is left.
+
+        Args:
+            theta: Path progress in meters.
+
+        Returns:
+            ``True`` if the reference speed should be capped.
+        """
+        if not self._randomized_track or len(self._gate_arc) == 0:
+            return False
+        gap = float(self._gate_arc[0]) - theta
+        if not -0.2 <= gap < self._mpcc.reveal_window:
+            return False
+        if not self._next_gate_seen:
+            return True
+        hold = int(round(self._mpcc.reveal_hold_time * self._freq))
+        return self._tick - self._gate_corrected_tick <= hold
+
     def _reference_speed(self, theta: float, speed_actual: float) -> float:
         """Return the reference path speed at a given path progress.
 
@@ -1033,6 +1110,8 @@ class MPCCController(Controller):
         speed = cfg.mu_speed / (2.0 * (cfg.w_speed_gate * float(weight[0]) + cfg.r_vtheta))
         speed = min(speed, speed_actual + cfg.v_lead)
         speed = min(speed, float(np.interp(theta, self._speed_grid, self._speed_limit)))
+        if self._approach_capped(theta):
+            speed = min(speed, cfg.reveal_speed)
         if self._tick < self._hold_until:
             # Brake hard right after a re-plan: this is the only place where the controller spends
             # time to buy geometry. The revealed pose can be 0.21 m from the nominal one, and the
@@ -1114,11 +1193,14 @@ class MPCCController(Controller):
                 self._pending_since = self._tick
             self._pending.extend(changes)
             self._pending_tick = self._tick
+            if any("gate" in change for change in changes):
+                self._gate_corrected_tick = self._tick
         if self._replan_due(obs):
             reason = ", ".join(dict.fromkeys(self._pending))
             self._pending = []
             self._replan(obs, reason)
         theta = self._progress(pos)
+        self._next_gate_seen = self._gate_seen(obs)
         speed = self._reference_speed(theta, float(np.linalg.norm(np.asarray(obs["vel"], float))))
         self._last_v_ref = float(speed)
         thetas = np.clip(
