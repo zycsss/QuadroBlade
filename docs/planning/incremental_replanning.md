@@ -192,7 +192,43 @@ Level 2, seeds 0-39, same machine and session:
 A wash on success, one degree better at the anchor, and it is the representation the next step needs
 (local support for repair, dynamic limits at plan time).
 
-**The geometry relaxation is implemented and measured but left off** (`bspline_relax_iters = 0`).
+### The relaxation, after the clearance projection was fixed
+
+The first version of the relaxation projected *control points* onto `safety_distance` and lost three
+finishes. Measuring the trade-off on the seeds it changed (`logs/relax_tradeoff.py`) showed why, and it
+was not the gate passages (crossing offsets 0.000-0.011 m either way):
+
+| | relaxation off | relaxation on, first version |
+| --- | --- | --- |
+| plan clearance to poles | 0.173-0.187 m | **0.145-0.149 m** |
+| gate crossing offset | 0.000-0.011 m | 0.000-0.011 m |
+
+The curve between control points lies inside their convex hull, and the hull of points outside a disc
+still cuts the disc, so the control points satisfied the requirement while the plan did not. Projecting
+onto `safety_distance + half the control spacing` fixes the 4 cm, and the relaxation becomes the best
+configuration measured so far:
+
+| level 2, seeds 0-39 | no relaxation | relaxation, no margin | **relaxation + margin** |
+| --- | --- | --- | --- |
+| success | 32/40 | 29/40 | **35/40** |
+| mean lap time | 8.86 s | 8.45 s | **8.37 s** |
+| worst turn, mean | 52.7 deg | 37.8 deg | 41.4 deg |
+| worst turn in the first 0.35 m | 38.0 deg | 25.7 deg | **30.3 deg** |
+
+35/40 clears the 17/20 screen this page asks for before a decision run. `bspline_relax_iters = 150`
+is now the default, and the remaining failures are seeds 8, 9, 30 (take-off and first leg, 1.3-2.5 s)
+and 11, 39.
+
+### The three that did not pay
+
+Each measured at seeds 0-39 and left off, with the number next to the flag:
+**the OCP pole penalty** at `w_obstacle = 300`, `obstacle_radius = 0.16` gives 29/40 at 9.20 s against
+32/40 at 8.86 and does not save the pole seeds (8, 9, 33); **asking the frame avoidance for 0.65 m**
+to cover the ~0.1 m the fit loses costs 0.3 s a lap and seed 7 still clips the top bar; **capping the
+approach at 1.1 m/s after a gate correction** costs 0.4 s a lap and seeds 4, 13, 31, 39 still cross
+0.13-0.15 m off centre, because the correction is lateral and the path left is short.
+
+**The earlier relaxation measurement, for the record.**
 `relax_control_points` minimises the curvature energy of the control polygon with a fidelity term
 onto the fitted polyline, projects control points out of every pole's clearance sphere, and locks the
 points within 0.3 m of a gate centre. With 150 iterations the geometry improves a lot and the lap
