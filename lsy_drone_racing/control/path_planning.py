@@ -90,8 +90,14 @@ class PathConfig:
             keeps from the gate posts.
         astar_bounds: Lower and upper corner of the arena in XY [m] that the A* grid covers.
         smooth_iterations: Number of Laplacian smoothing sweeps applied to the polyline after
-            obstacle avoidance. The push-out inserts waypoints that create near-cusps, which would
-            otherwise cap the flyable path speed.
+            obstacle avoidance, at the full point spacing. The push-out inserts waypoints that
+            create near-cusps, which would otherwise cap the flyable path speed.
+        smooth_stride: Decimation factor applied before smoothing. One sweep only spreads the
+            rounding by one point, so the rounded length scales as the product of the spacing
+            and ``sqrt(sweeps)``; the two knobs are interchangeable through that product.
+            for ``smooth_iterations / stride ** 2`` sweeps rounds the same distance for roughly
+            ``stride ** 3`` times less work. The result is resampled back onto the original spacing,
+            so the rest of the pipeline sees an unchanged array.
         anchor_window: Arc length [m] around every gate centre that is kept fixed during smoothing,
             so that the path cannot drift sideways inside a gate plane.
         gate_straight_length: Half length [m] of the straight passage forced through each gate.
@@ -124,6 +130,7 @@ class PathConfig:
     astar_frame_margin: float = 0.02
     astar_bounds: tuple[tuple[float, float], tuple[float, float]] = ((-2.45, -1.45), (2.45, 1.45))
     smooth_iterations: int = 600
+    smooth_stride: int = 4
     anchor_window: float = 0.25
     gate_straight_length: float = 0.275
     gate_straight_blend: float = 0.25
@@ -689,23 +696,55 @@ class PathPlanner:
         pts = np.asarray(points, dtype=float).reshape(-1, 3).copy()
         if len(pts) < 3:
             return pts
+        # Smooth a decimated copy and resample the result back onto the input spacing. A sweep only
+        # spreads the rounding by one point, so rounding a distance sigma needs
+        # spacing * sqrt(sweeps) == sigma: taking every stride-th point allows stride ** 2
+        # fewer sweeps for the same rounding, which is stride ** 3 less work. The array comes
+        # back at the input resolution, so nothing downstream can tell the difference.
+        stride = max(1, int(self.config.smooth_stride))
+        index = (
+            np.arange(len(pts))
+            if stride == 1
+            else np.unique(np.append(np.arange(0, len(pts), stride), len(pts) - 1))
+        )
+        coarse = pts[index].copy()
+        sweeps = max(1, int(round(self.config.smooth_iterations / stride**2)))
+
         radius = self.config.safety_distance * 0.92
-        for _ in range(self.config.smooth_iterations):
-            pts[1:-1] = 0.25 * pts[:-2] + 0.5 * pts[1:-1] + 0.25 * pts[2:]
-            if obstacles is None or len(obstacles) == 0:
+        radius_squared = radius * radius
+        anchors = (
+            None
+            if obstacles is None or len(obstacles) == 0
+            else np.asarray(obstacles, dtype=float)[:, :2]
+        )
+        rows = np.arange(len(coarse))
+        for _ in range(sweeps):
+            coarse[1:-1] = 0.25 * coarse[:-2] + 0.5 * coarse[1:-1] + 0.25 * coarse[2:]
+            if anchors is None:
                 continue
-            delta = pts[:, None, :2] - np.asarray(obstacles, dtype=float)[None, :, :2]
-            dist = np.linalg.norm(delta, axis=-1)
-            nearest = np.argmin(dist, axis=1)
-            closest = dist[np.arange(len(pts)), nearest]
-            proximity = closest < radius
+            delta = coarse[:, None, :2] - anchors[None, :, :2]
+            # Squared distances: the proximity test only needs a comparison, and the square
+            # root is a measurable share of the loop on its own.
+            squared = np.einsum("ijk,ijk->ij", delta, delta)
+            nearest = np.argmin(squared, axis=1)
+            proximity = squared[rows, nearest] < radius_squared
             if not proximity.any():
                 continue
-            direction = delta[np.arange(len(pts)), nearest]
+            direction = delta[rows, nearest][proximity]
             span = np.maximum(np.linalg.norm(direction, axis=1, keepdims=True), 1e-9)
-            offset = np.asarray(obstacles, dtype=float)[nearest, :2]
-            pts[proximity, :2] = offset[proximity] + radius * direction[proximity] / span[proximity]
-        return pts
+            coarse[proximity, :2] = anchors[nearest[proximity]] + radius * direction / span
+        if stride == 1:
+            return coarse
+
+        # Back to the original sampling: interpolate by arc length through the smoothed polyline.
+        knots = np.concatenate(([0.0], np.cumsum(np.linalg.norm(np.diff(coarse, axis=0), axis=1))))
+        targets = np.concatenate(([0.0], np.cumsum(np.linalg.norm(np.diff(pts, axis=0), axis=1))))
+        keep = np.concatenate(([True], np.diff(knots) > 1e-12))
+        knots, coarse = knots[keep], coarse[keep]
+        if len(knots) < 2:
+            return pts
+        spline = CubicSpline(knots, coarse, bc_type="natural", extrapolate=False)
+        return np.asarray(spline(np.clip(targets, knots[0], knots[-1])), dtype=float).reshape(-1, 3)
 
     def _avoid_gate_frames(
         self,

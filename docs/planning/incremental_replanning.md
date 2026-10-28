@@ -36,17 +36,47 @@ All measured, see `docs/control/characterisation.md` and the failure analysis.
 | steady lateral acceleration | ~6 m/s^2; overload peaks 9.9-11.4 | `a_lat_max = 8` is conservative |
 | collision box (`cf21B_500.xml`) | 0.07 x 0.07 x 0.02 half extents | contact at 0.085-0.114 m |
 | `DRONE_RADIUS` in the planner | 0.09 m (0.105 m contact) | up to 9 mm optimistic |
-| full re-plan | ~58 ms (`A*` ~5 ms of it) | wall clock in sim, an overrun on hardware |
+| full re-plan | **7.5 ms** after the smoothing speedup (see below) | fits a 20 ms control period |
 | MPCC solve | 1.3 ms p95 | not the bottleneck |
 
 Two consequences that shape everything below.
 
 - **In simulation, replan cost is wall-clock only.** The environment advances 20 ms of simulated time
-  per step regardless of how long the planner took, so a 5 ms repair and a 58 ms re-plan fly the same
+  per step regardless of how long the planner took, so a 7 ms repair and a 40 ms re-plan fly the same
   trajectory. Cheap replanning improves the success rate only if it lets the controller re-plan
   *more often* (as an observation is refined), not because it saves time.
-- **On hardware it is a real cost.** At 50 Hz a 58 ms re-plan holds the previous command for about
-  12 cm of flight at 2 m/s. Local repair is therefore a deployment requirement.
+- **On hardware it is a real cost, and it was the blocking one.** At 50 Hz the planner used to take
+  ~40 ms per re-plan, holding the previous command for ~8 cm of flight at 2 m/s and overrunning the
+  control period twice over. At 7.5 ms it fits. Local repair is still worth having, but it is no
+  longer required to fit the loop.
+
+## Planning cost, before and after (branch `faster-planning`)
+
+`_smooth_path` was 90 % of the plan: 600 Laplacian sweeps over 1500 points, 0.083 ms each. One sweep
+only spreads the rounding by one point, so the rounded length is `spacing * sqrt(sweeps)` — the point
+count and the sweep count are interchangeable through that product. Smoothing every 4th point for
+`600 / 16 = 38` sweeps therefore rounds the same distance for 64 times less work, and the result is
+resampled back onto the input spacing so nothing downstream changes.
+
+| stage | before | after | share now |
+| --- | --- | --- | --- |
+| `_smooth_path` | 50.0 ms | **1.0 ms** | 13 % |
+| `_avoid_obstacles` | 3.8 ms | **3.6 ms** | **48 %** |
+| `_connect_blocks` (A*) | 1.6 ms | **1.5 ms** | **20 %** |
+| `_to_arc_path` | 0.8 ms | **0.7 ms** | 9 % |
+| everything else | 0.7 ms | 0.7 ms | 9 % |
+| **total** | **55.8 ms** | **7.5 ms** | |
+
+The path is unchanged where it matters: length 13.522 -> 13.521 m, clearance 0.150 m, gate centring
+within 4 mm, curvature p95 3.43 -> 3.45, kappa max 5.81 -> 6.46. The 20-seed screen still gives
+**13/20 at 8.17 s** with the same failing seeds, and levels 0/1 are unchanged.
+
+Two things follow for the branches below:
+
+- A* is no longer 3 % of the plan, it is 20 %. The caching and bounding-box work listed under
+  `dslite-replan` is now worth 1.5 ms per re-plan rather than noise.
+- `_avoid_obstacles` is the new hotspot at half the plan, and it is the same shape of problem: a
+  per-point push-out over the full 1500-point array, once per pole per iteration.
 
 ## Idea 1: remember observed poses: already done, do not rebuild
 
