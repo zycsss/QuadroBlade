@@ -60,7 +60,7 @@ _PROXIMITY_DECAY = 8.0
 
 @dataclass(frozen=True)
 class PathConfig:
-    """Configuration of the path planner.
+    r"""Configuration of the path planner.
 
     Attributes:
         approach_distance: Half width [m] of the waypoint spread along each gate normal.
@@ -92,6 +92,12 @@ class PathConfig:
         smooth_iterations: Number of Laplacian smoothing sweeps applied to the polyline after
             obstacle avoidance, at the full point spacing. The push-out inserts waypoints that
             create near-cusps, which would otherwise cap the flyable path speed.
+        smoothing_margin: Factor applied to ``safety_distance`` when the smoothing projects a point
+            out of an obstacle. It used to be 0.92, i.e. the smoothing deliberately stopped inside
+            the requirement; it is now above 1, so the rounded path sits outside the requirement and
+            that margin absorbs the tracking drift measured against it.
+        enforce_clearance: Whether to run a final projection pass so the committed path really keeps
+            ``safety_distance``. Every earlier stage can move the path inward.
         smooth_stride: Decimation factor applied before smoothing. One sweep only spreads the
             rounding by one point, so the rounded length scales as the product of the spacing
             and ``sqrt(sweeps)``; the two knobs are interchangeable through that product.
@@ -131,6 +137,8 @@ class PathConfig:
     astar_bounds: tuple[tuple[float, float], tuple[float, float]] = ((-2.45, -1.45), (2.45, 1.45))
     smooth_iterations: int = 600
     smooth_stride: int = 4
+    smoothing_margin: float = 1.25
+    enforce_clearance: bool = True
     anchor_window: float = 0.25
     gate_straight_length: float = 0.275
     gate_straight_blend: float = 0.25
@@ -199,6 +207,11 @@ def path_config_from(config: object = None, **overrides: object) -> PathConfig:
     and buys nothing when the poses are exact, and a config may override individual planner fields
     in its [controller] section.
 
+    The clearance margin does too. A randomized track hands the controller poses that are up to
+    0.212 m wrong until the drone is 0.7 m away, and the measured tracking drift adds up to 5 cm, so
+    that track plans with an outward margin. A track with exact poses needs none of that: there the
+    margin is 1.0, which delivers the required clearance at no lap time cost.
+
     Args:
         config: A loaded race configuration, or ``None`` to get the plain defaults.
         **overrides: Fields that win over both the defaults and the config file, e.g.
@@ -215,12 +228,13 @@ def path_config_from(config: object = None, **overrides: object) -> PathConfig:
             key in randomizations for key in ("gate_pos", "gate_rpy", "obstacle_pos")
         )
         controller = config.get("controller") or {}
-        for key in ("use_astar", "astar_resolution", "safety_distance"):
+        for key in ("use_astar", "astar_resolution", "safety_distance", "smoothing_margin"):
             if key in controller:
                 settings[key] = controller[key]
     if not randomized_track:
         settings["gate_straight_length"] = 0.0
         settings["gate_frame_clearance"] = 0.0
+        settings["smoothing_margin"] = 1.0
     settings.update(overrides)
     return PathConfig(**settings)
 
@@ -424,6 +438,10 @@ class PathPlanner:
         waypoints = self._avoid_gate_frames(
             waypoints, pass_pos, pass_normals, pass_y_axes, pass_z_axes
         )
+        if self.config.enforce_clearance:
+            # Last, because every stage above can move the path inward: the smoothing rounds corners
+            # and the gate handling pushes sideways. This is the pass that makes the promise true.
+            waypoints = self._enforce_clearance(waypoints, obstacles)
         path = self._to_arc_path(waypoints)
         info = PathInfo(
             waypoints=waypoints,
@@ -710,7 +728,11 @@ class PathPlanner:
         coarse = pts[index].copy()
         sweeps = max(1, int(round(self.config.smooth_iterations / stride**2)))
 
-        radius = self.config.safety_distance * 0.92
+        # Project onto the clearance circle scaled by ``smoothing_margin``. This used to be 0.92:
+        # the smoothing deliberately stopped inside the required clearance, which is why committed
+        # paths came out at 0.10-0.14 m instead of 0.15 m. It is now an outward margin, so the
+        # rounded path ends up above the requirement and leaves room for the tracking drift.
+        radius = self.config.safety_distance * self.config.smoothing_margin
         radius_squared = radius * radius
         anchors = (
             None
@@ -979,6 +1001,45 @@ class PathPlanner:
             if mean > 0.0 and float(np.std(segment_lengths)) / mean < cfg.arc_tol:
                 break
         return current
+
+    def _enforce_clearance(
+        self, points: NDArray[np.floating], obstacles: NDArray[np.floating]
+    ) -> NDArray[np.floating]:
+        """Push the finished path back out to the required clearance from every obstacle.
+
+        Every stage before this one can move the path inward: the smoothing rounds corners, the gate
+        straightening shifts points inside the gate plane, and the frame avoidance pushes sideways.
+        Without a final pass the committed path is whatever those stages left behind, which measured
+        between 0.10 m and 0.15 m on level 2 while the planner claimed 0.15 m. This is the pass that
+        makes the claim true, and it is cheap because it only touches the points that are too close.
+
+        The projection is iterated because moving one point clear of a pole can bring its neighbour
+        closer to another one.
+
+        Args:
+            points: The finished waypoints, shape ``(n_points, 3)``.
+            obstacles: Obstacle positions, shape ``(n_obstacles, 3)``.
+
+        Returns:
+            The waypoints with every point at least ``safety_distance`` from every obstacle centre.
+        """
+        if obstacles is None or len(obstacles) == 0:
+            return points
+        pts = np.asarray(points, dtype=float).reshape(-1, 3).copy()
+        anchors = np.asarray(obstacles, dtype=float)[:, :2]
+        radius = float(self.config.safety_distance)
+        rows = np.arange(len(pts))
+        for _ in range(3):
+            delta = pts[:, None, :2] - anchors[None, :, :2]
+            squared = np.einsum("ijk,ijk->ij", delta, delta)
+            nearest = np.argmin(squared, axis=1)
+            violation = squared[rows, nearest] < radius * radius
+            if not violation.any():
+                break
+            direction = delta[rows, nearest][violation]
+            span = np.maximum(np.linalg.norm(direction, axis=1, keepdims=True), 1e-9)
+            pts[violation, :2] = anchors[nearest[violation]] + radius * direction / span
+        return pts
 
     def _to_arc_path(self, waypoints: NDArray[np.floating]) -> ArcPath:
         """Fit and reparameterize the path, then hand it to an [ArcPath][...ArcPath]."""

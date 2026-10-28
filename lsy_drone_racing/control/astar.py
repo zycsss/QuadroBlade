@@ -45,8 +45,14 @@ import numpy as np
 if TYPE_CHECKING:
     from numpy.typing import NDArray
 
-#: Radius of the sphere that encloses the drone [m].
-DRONE_RADIUS = 0.09
+#: Horizontal reach of the drone's collision geometry [m].
+#:
+#: The simulator does not collide a sphere: `crazyflow/drones/cf21B_500.xml` gives the drone a box
+#: with half extents 0.07 x 0.07 x 0.02. Its horizontal reach is therefore 0.070 m when a face is
+#: presented and ``hypot(0.07, 0.07) = 0.099 m`` when a corner is, plus up to ``0.02 * sin(tilt)``
+#: from the half height leaning into the plane, about 0.008 m at the 24 degrees the drone holds in a
+#: turn. This constant is the worst case of that, so anything derived from it is conservative.
+DRONE_RADIUS = 0.107
 #: Half width of the gate opening [m]. The frame is square with a 0.4 m wide opening.
 GATE_OPENING_HALF = 0.20
 #: Half width of the outer edge of the gate frame [m]. The frame is 0.72 m wide overall.

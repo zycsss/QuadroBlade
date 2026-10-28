@@ -69,7 +69,18 @@ SOLVER_JSON = CODE_EXPORT_DIR / "mpcc_racing.json"
 SIGNATURE_FILE = CODE_EXPORT_DIR / "mpcc_racing.signature"
 
 #: State and input dimensions of the OCP.
-NX, NU, NP = 15, 5, 7
+NX, NU = 15, 5
+
+#: Obstacle centres carried in the OCP parameter vector, for the distance penalty. Fixed at compile
+#: time so the generated solver does not depend on the track; unused slots are sent far away, where
+#: the penalty is inactive.
+MAX_BARRIER_POLE = 6
+
+#: Value written into an unused obstacle slot [m]. Far enough that the penalty is exactly zero.
+BARRIER_OFF = 1.0e3
+
+#: Number of OCP parameters: reference position, tangent, proximity weight, then the pole centres.
+NP = 7 + 2 * MAX_BARRIER_POLE
 
 #: MPCC settings for a randomized track, i.e. for the levels that re-plan on sensor updates.
 #:
@@ -85,8 +96,12 @@ RANDOMIZED_TRACK_MPCC = {
     "a_lat_max": 8.0,
     "v_max": 3.5,
     "replan_slowdown_time": 0.3,
+    # The distance penalty is left off: measured on level 2 it changed nothing (13/20 either way,
+    # pose the plan does, so it pushes away from the wrong place; and where the pose is known the
+    # path already keeps 0.187 m, outside the 0.14 m radius. The planning page has the numbers.
+    # path already keeps 0.187 m, outside the 0.14 m radius. See the planning page for the numbers.
+    "w_obstacle": 0.0,
 }
-#: In-process solver cache, so that multi-episode evaluation scripts build the solver only once.
 _SOLVER_CACHE: dict[str, tuple[AcadosOcpSolver, AcadosOcp]] = {}
 
 
@@ -105,6 +120,14 @@ class MPCCConfig:
         q_contour: Contour error weight.
         q_lag_peak: Additional lag weight at the gates and obstacles.
         q_contour_peak: Additional contour weight at the gates and obstacles.
+        w_obstacle: Weight of the one-sided distance penalty that pushes the drone away from an
+            obstacle centre inside ``obstacle_radius``. Zero disables it and leaves the avoidance
+            entirely to the planned path. It is a soft net, not a guarantee: it acts on the flown
+            trajectory, so it can only react to a clearance the path did not provide.
+        obstacle_radius: Distance [m] from an obstacle centre below which the penalty is active. Set
+            it just above the drone's collision reach (0.085 m face-on, 0.114 m corner-on for the
+            0.14 x 0.14 x 0.04 m box) so the term only fights a contact that is about to happen
+            rather than reshaping the whole corner.
         contour_z_weight: Extra emphasis on the vertical contour error. The gates are only 0.4 m
             tall, so altitude accuracy, not lateral accuracy, limits the pass margin.
         q_attitude: Penalty on the absolute roll/pitch/yaw.
@@ -157,6 +180,8 @@ class MPCCConfig:
     dt: float = 0.02
     q_lag: float = 100.0
     q_contour: float = 100.0
+    w_obstacle: float = 0.0
+    obstacle_radius: float = 0.14
     q_lag_peak: float = 2000.0
     q_contour_peak: float = 6000.0
     contour_z_weight: float = 2.0
@@ -304,6 +329,19 @@ def build_ocp(config: MPCCConfig, params: dict) -> AcadosOcp:
     rates = u[0:4]
     cost += cs.dot(rates, cs.mtimes(cs.DM(np.diag(config.r_rates)), rates))
     cost += config.r_vtheta * v_theta * v_theta - config.mu_speed * v_theta
+    # One-sided distance penalty: zero while the drone keeps ``obstacle_radius`` from a pole centre,
+    # quadratic inside it. ``max(0, r - d)**2`` is continuously differentiable at the boundary,
+    # so it adds no kink to the cost, and unused slots sit at BARRIER_OFF where it is zero. It is
+    # a soft net over a planned path, not a substitute for one: it can only react to a clearance
+    # path did not provide, and it trades against the progress reward.
+    if config.w_obstacle > 0.0:
+        for slot in range(MAX_BARRIER_POLE):
+            offset = 1 + 2 * slot
+            gap_x = x[0] - p[offset]
+            gap_y = x[1] - p[offset + 1]
+            distance = cs.sqrt(gap_x * gap_x + gap_y * gap_y + 1e-9)
+            violation = cs.fmax(0.0, config.obstacle_radius - distance)
+            cost += config.w_obstacle * violation * violation
     model.cost_expr_ext_cost = cost
     model.cost_expr_ext_cost_e = cs.SX(0)
 
@@ -313,7 +351,8 @@ def build_ocp(config: MPCCConfig, params: dict) -> AcadosOcp:
 
     ocp.cost.cost_type = "EXTERNAL"
     ocp.cost.cost_type_e = "EXTERNAL"
-    ocp.parameter_values = np.zeros(NP)
+    ocp.parameter_values = np.full(NP, BARRIER_OFF)
+    ocp.parameter_values[:7] = 0.0
 
     # Box constraints on position, thrust setpoints, attitude setpoints and path progress.
     ocp.constraints.idxbx = np.array([0, 1, 2, 9, 10, 11, 12, 13, 14])
@@ -574,6 +613,23 @@ class MPCCController(Controller):
         self._draw_points = path.pos(np.linspace(0.0, path.length, 200))
         self._build_speed_limit()
         self._apply_progress_bound()
+
+    def _barrier_params(self) -> NDArray[np.floating]:
+        """Return the obstacle centres for the distance penalty, padded with the off value.
+
+        The centres are whatever the controller currently believes: the nominal pose for an obstacle
+        it has not seen yet, the true pose once revealed. That is the information the plan uses,
+        so the penalty inherits the plan's uncertainty rather than adding a new failure mode.
+
+        Returns:
+            The flattened XY centres, shape ``(2 * MAX_BARRIER_POLE,)``.
+        """
+        values = np.full(2 * MAX_BARRIER_POLE, BARRIER_OFF, dtype=float)
+        obstacles = np.asarray(self._obstacles, dtype=float).reshape(-1, 3)
+        count = min(len(obstacles), MAX_BARRIER_POLE)
+        if count:
+            values[: 2 * count] = obstacles[:count, :2].ravel()
+        return values
 
     def _reference(
         self, thetas: NDArray[np.floating]
@@ -912,8 +968,9 @@ class MPCCController(Controller):
         )
         positions, tangents, weights = self._reference(thetas)
         self._horizon_points = positions
+        barrier = self._barrier_params()
         for k in range(self._mpcc.N + 1):
-            params = np.concatenate((positions[k], tangents[k], [weights[k]]))
+            params = np.concatenate((positions[k], tangents[k], [weights[k]], barrier))
             self._solver.set(k, "p", np.ascontiguousarray(params, dtype=np.float64))
 
         x0 = self._state_vector(obs, theta)

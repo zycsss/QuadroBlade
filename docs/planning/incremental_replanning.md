@@ -50,6 +50,44 @@ Two consequences that shape everything below.
   control period twice over. At 7.5 ms it fits. Local repair is still worth having, but it is no
   longer required to fit the loop.
 
+## Measured: the clearance fix and the distance penalty (branch `clearance-fix`)
+
+Two changes, both implemented and both measured on the 20-seed screen.
+
+**The planner now delivers the clearance it promises.** `_smooth_path` used to project onto
+`0.92 * safety_distance` = 0.138 m, i.e. it deliberately stopped inside the requirement, and nothing
+re-checked clearance after the gate handling. Now the projection uses `smoothing_margin = 1.25` on a
+randomized track (`1.0` where the poses are exact, so levels 0 and 1 are unchanged) and a final
+`_enforce_clearance` pass runs after every stage that can move the path inward. Verified on a
+simulated reveal: waypoints 0.187 m, fitted path 0.187 m, so the spline does not undo it.
+
+| | before | after |
+| --- | --- | --- |
+| successes whose plan was below 0.15 m | **2 of 13** | **0 of 13** |
+| level 2 | 13/20, 8.17 s | 13/20, 8.24 s |
+| level 0 / level 1 | 8.65 / 8.64 s | 8.64 / 8.63 s |
+
+**The success count did not move**, and the failures changed identity: seed 6 moved from a first-leg
+pole strike to a mid-lap one, while 9, 12 and 14 still die at t ~ 1.3 s. Those three are not a
+clearance problem. Their committed plan measures 0.102-0.150 m from the **true** pole while keeping
+0.187 m from the **nominal** one, which is the signature of a plan built before the reveal: the
+planner cannot keep a distance from a pose it does not know, and no amount of enforcing changes that.
+
+**The distance penalty in the OCP is measured inert.** `w_obstacle` and `obstacle_radius` now exist,
+`NP` carries six pole slots, and the term is `w * max(0, r - d)**2` over the horizon — continuously
+differentiable at the boundary, unused slots parked at 1e3 m. At `w_obstacle = 500` and
+`r = 0.14 m` the 20-seed screen was **identical**: same 13/20, same seeds, 8.22 s. The reason is the
+same stale pose — the penalty pushes away from the nominal pole, which is where the plan already
+keeps 0.187 m — and where the pose is known the path is outside the radius entirely, so the term
+never fires. It defaults to `0.0`; the code path is kept because it is the right place to put a
+barrier once the poses are trustworthy.
+
+Both results point at the same conclusion: **the remaining failures are information-timing, not
+geometry.** The planner and the OCP both act on the nominal pose until the drone is 0.7 m away, and
+0.7 m at 1.7 m/s is 0.41 s against a 0.46 s correction. The next lever is therefore P1.2/P1.3 —
+reserve the pose uncertainty in the plan while the object is unrevealed, and cap the approach speed
+at 1.5 m/s where it is.
+
 ## Planning cost, before and after (branch `faster-planning`)
 
 `_smooth_path` was 90 % of the plan: 600 Laplacian sweeps over 1500 points, 0.083 ms each. One sweep
