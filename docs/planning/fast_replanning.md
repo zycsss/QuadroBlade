@@ -153,9 +153,11 @@ events entirely.
 
 Two practical traps when changing `NP`:
 
-* `_signature()` in `my_controller.py` hashes only the config, the mass, the thrust limits, the lag
-  coefficients and gravity. It does **not** hash `NP`, so a changed `NP` would silently reuse the
-  stale `c_generated_code` solver. Add `NP`, `NX`, `NU` to the payload, or clear the directory.
+* `_signature()` in `my_controller.py` used to hash the whole `MPCCConfig`, which meant every
+  controller-only tweak rebuilt the solver for a minute (one run died in that rebuild), and it did
+  **not** hash `NP`, so a changed `NP` would silently reuse the stale `c_generated_code` solver. It now
+  hashes only the fields `build_ocp` reads, plus `NX`, `NU` and `NP` explicitly. If an OCP field is
+  added, add it to `_OCP_FIELDS` or the solver will be reused across a real change.
 * The avoidance term must be a *soft* penalty (or a linearised half-plane constraint along the
   current obstacle-to-drone direction) because the exact clearance constraint is non-convex and would
   fight `SQP_RTI` at 50 Hz.

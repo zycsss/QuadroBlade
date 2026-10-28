@@ -19,6 +19,233 @@ Merged into `main` from `A-star-mpcc`:
   `utils/characterization.py`, `scripts/characterize.py`, `docs/control/characterisation.md`).
 
 Measured baseline on `config/level2.toml`, seeds 0-19: **13/20 finished, mean 8.17 s**.
+Re-measured at `caa8855`, the branch point of `seeded-replan`, on this machine: **14/20 at 8.99 s** on
+seeds 0-19, **27/40 at 9.03 s** on seeds 0-39. The 13/20 is the pre-`clearance-fix` number.
+
+## Measured: the seeded re-plan (branch `seeded-replan`)
+
+The complaint this answers is that committed paths are not smooth and sometimes go backwards then come
+back. It is the same complaint `fdc43c0` diagnosed and left unfixed, and the numbers below are that
+diagnosis made quantitative: on the 200 samples of every plan the controller logs, **27 % of re-plans
+turned by more than 120 deg in one 6 cm step, 42 % by more than 90 deg, and 133 deg of the mean worst
+turn sat inside the first 0.35 m** — at the anchor.
+
+The cause is that a re-plan was anchored where the drone happened to be and then stepped *toward the
+next gate*. Two consequences: the first block of the first gate passage is laid `approach_distance` =
+0.6 m before the gate, so a drone that is already 0.3 m into that approach gets a block *behind* it
+and the polyline reverses within centimetres of the start; and the leaving direction is the direction
+to the gate, not the direction the drone is flying, so a drone that is turning can be asked to turn
+back.
+
+The re-plan is now seeded (`PathSeed`, `PathPlanner.plan(seed=...)`):
+
+1. the anchor is the projection of the *predicted* pose (`pos + vel / freq`) onto the **old path**, so
+   the new path starts on the old one rather than beside it;
+2. it leaves along the old path's **tangent**, not toward the next gate;
+3. the part of the first passage behind the seed step is dropped, and the seed step is clamped so it
+   never overshoots that passage (`PathConfig.trim_seeded_passage`);
+4. `_pin_anchor` puts the first 0.25 m of the *finished* path back onto the old path, with a smootherstep
+   blend, because the smoothing, the gate straightening and the clearance pass each drag the start a
+   few centimetres away — that is how the fold survived every earlier attempt.
+
+The pin has to run on the dense samples, not on the waypoints (`_to_arc_path`, not `plan`). The
+arc-length reparameterization refits a natural cubic and resamples it up to twenty times, and its first
+tangent drifts a little on every sweep: measured on a real re-plan, a start that was straight along the
+old path came out **100 deg off it**, which is a fold recreated by the stage that was supposed to remove
+it. On the samples the fitted path is actually built from, the drift cannot undo the pin.
+
+Level 2, seeds 0-39:
+
+| | before | after |
+| --- | --- | --- |
+| turns > 120 deg | 75 in 275 re-plans (27 %) | **4 in 285 (1.4 %)** |
+| turns > 90 deg | 115 in 275 (42 %) | **6 in 285 (2.1 %)** |
+| worst turn, mean | 149.5 deg | **57.6 deg** |
+| worst turn in the first 0.35 m, mean | 133.1 deg | **40.5 deg** |
+| success | 27/40 | 26/40 |
+| mean lap time | 9.03 s | **8.71 s** |
+
+So the geometry was not bought with pace: one seed in forty is inside the noise of a 40-seed binomial
+(sd ~ 3.5 seeds) and the lap is 3.5 % faster. The failures change identity — the t ~ 1.3 s pole strikes
+(seeds 9, 12, 14, 27) are gone, while seeds 7, 8, 28, 29, 31, 32, 38, 39 now end later, most of them on
+a gate frame.
+
+Two variants were measured, and the difference between them is the pin's target. Following the **old
+path** (what the code does now) gives 26/40 at 8.71 s and the numbers above; following the **straight
+tangent** gives 27/40 at 8.75 s with 4 folds in 289, worst turn 60.6 deg and anchor turn 42.9 deg. One
+seed and one degree apart, so the old path is kept: it is the literal reading of "the new path starts
+from the old path", and it inherits the old path's curvature at the anchor instead of a straight line's.
+
+The trim is what buys the geometry. With `trim_seeded_passage = False` (pin only) the 20-seed screen is
+**11/20 with 46 folds**, worse than the baseline on both axes: the untrimmed passage still folds, and
+the pin only covers the first 0.25 m of it.
+
+**What is left, in order:**
+
+- **The remaining 4 folds** are all the case where the drone is already past the gate plane when the
+  reveal arrives. The trim has to keep one approach sample or the gate would never be crossed, and that
+  sample is behind the anchor. This needs the gate pass re-planned, not the anchor.
+- **The 30-70 deg turns that remain at 0.25 m are not folds**: they are the correction biting where the
+  pin lets go. Softening them means a longer `anchor_pin_length` (later correction) or a real
+  trajectory optimisation, not a better anchor.
+- **Mid-path reversals are untouched.** 3 of the 40 seeds still contain a 160-173 deg corner *between*
+  two passages. That is the inter-gate turnaround the track asks for (order 1,2,3,4,2, gates facing
+  different ways), and the fix is the fillet of radius `v^2 / a_lat` at the block join that `fdc43c0`
+  already identified as belonging with the B-spline path, not an anchor fix.
+- **The trim costs gate centring**, which is why the failures that remain are mostly `HIT_GATE`. A
+  reveal at 0.7 m asks for a 0.21 m lateral correction that the drone needs 0.46 s to make, and a path
+  that starts at the drone spends the first 0.3 m of that budget doing nothing. Shortening the deferral
+  (`replan_defer_in_passage`) or capping the approach speed in front of an unrevealed gate (P1.3 below)
+  attacks the same term from the information side.
+
+## Measured: the failure classes, one by one (branch `seeded-replan`)
+
+The 14 failures of the 40-seed screen were classified from their logs, at the **true** poses, because
+the verdict itself is computed against the nominal ones (`classify` in `scripts/debug_run.py` names the
+wrong object in 4 of the 14). The split:
+
+| class | seeds | cause |
+| --- | --- | --- |
+| gate frame of a gate already passed | 7, 11, 17, 28, 29, 38, 39 | `_avoid_gate_frames` only ever saw the remaining passes |
+| gate frame, tangential graze | 32 | the same stage only reacted to plane *crossings* |
+| gate frame, pass completed on the same tick | 17 | the re-plan still contained the pass being flown |
+| pole strike, drone 6-9 cm inside the plan | 6, 8, 9, 33 | contouring weight at a pole was half the gate weight |
+| gate pass 0.14 m off centre, plan 0.08 s old | 13, 31 | the reveal lands at 0.7 m, the correction needs 0.46 s |
+
+Four fixes, in that order:
+
+1. **Every gate of the track is given to the frame-avoidance stage**, with the number of legitimate
+   crossings per gate (`PathPlanner.plan` builds `crossing_count` from the remaining sequence). A gate
+   the drone has already flown through is still a solid ring, and on a track that doubles back the
+   route to the next gate crosses its plane - through the opening, because A* only models the posts.
+2. **The test is a slab around the gate plane**, not a sign change (`gate_frame_slab` = 0.13 m), so a
+   path that comes close and turns away is caught too. The push is capped at `gate_frame_step` = 0.15 m
+   per pass over five passes, because clearing 0.5 m in one go left a kink where its taper ended, and
+   the samples of the gate's own passage plus the first 0.3 m (the drone's own position) are protected.
+3. **A pass the drone is completing is not re-flown** (`_completed_pass`): if the anchor is at or just
+   past the first pass's plane, inside the opening and heading through it, the trim does not force a
+   crossing (`crossing_required=False`). Forcing one is what made seed 17 reverse through the gate it
+   had just left.
+4. **The approach to a gate that is not yet seen is capped at 1.5 m/s** (`reveal_speed`,
+   `reveal_window` = 1.2 m, held for `reveal_hold_time` = 0.5 s after a correction), and **the pole
+   contouring weight is raised from 0.2 to 0.4**, matching the gate weight: a pole is a hard obstacle,
+   not a corner to cut. The cap is disabled on a track without pose randomisation, where there is
+   nothing to correct.
+
+Level 2, seeds 0-39, same machine and session:
+
+| | before | after |
+| --- | --- | --- |
+| success | 26/40 (65 %) | **31/40 (78 %)** |
+| mean lap time | 8.71 s | 8.88 s |
+| turns > 120 deg | 4 in 285 re-plans | **1 in 302** |
+| turns > 90 deg | 6 in 285 | **3 in 302** |
+| worst turn, mean | 57.6 deg | **52.9 deg** |
+| worst turn in the first 0.35 m, mean | 40.5 deg | **40.2 deg** |
+
+Five more finishes for 2 % of lap time, and the geometry does not regress. Level 0 and level 1 are
+unchanged: 2/2 at 8.52 s and 2/2 at 8.50 s.
+
+**What is left, all with the same signature - a gate pass 0.15-0.28 m off centre:**
+
+- seeds 13, 29, 31, 39 fail at gate 2 with the plan crossing dead centre and the drone 0.11-0.16 m off
+  it. The reveal arrives at 0.7 m and the 0.46 s correction is the whole distance left; even capped at
+  1.5 m/s the drone reaches the plane before it has converged. This wants the correction to start
+  earlier (`P1.2` uncertainty inflation), not another path tweak.
+- seeds 4, 7, 8 clip a frame 0.28-0.38 m outside the opening, i.e. clipping the *outer* part of the
+  ring while flying past a gate, and seed 9 still strikes pole 0 on the take-off leg. Seed 33 is the
+  pole case that the weight change did not save.
+
+## Measured: the B-spline trajectory, and the geometry relaxation (branch `seeded-replan`)
+
+The path was a natural cubic spline in arc length, so the drone's state entered it only as a position
+(the anchor) and a direction (a pin onto the old tangent). Two things followed, both visible in the
+figures: the plan could contain curvature no speed can fly - the 0.19 m hairpin around pole 3 in seed
+8, which needs 12 m/s² at 1.5 m/s - and the controller could only answer by cutting the corner.
+
+`control/bspline_path.py` replaces that with a **clamped cubic B-spline in time**, following
+Fast-Planner (Zhou et al., RA-L 2019):
+
+- velocity and acceleration are B-splines of the same control points, `v_i = (Q_{i+1} - Q_i)/dt` and
+  `a_i = (Q_{i+2} - 2Q_{i+1} + Q_i)/dt²`, so the convex hull property turns the dynamic limits into
+  bounds on control points;
+- the first three control points **are** the drone's state, `Q_0 = p`, `Q_1 = p + v dt/3`,
+  `Q_2 = p + 2v dt/3 + a dt²/6`, so the plan starts with the measured velocity and acceleration
+  instead of an approximation of the old path's tangent - this is what `PathSeed.velocity` and
+  `.acceleration` now carry, taken from the observation and a finite difference of it;
+- `retime` stretches the knot spacing until the speed and acceleration bounds hold, which is the
+  cheapest form of Fast-Planner's time adjustment (Sec. V).
+
+The controller is unchanged: `BsplinePath` implements the `ArcPath` duck type (`length`, `pos`,
+`tangent`, `curvature`, `closest`), with an arc-length table so `theta` stays a length in metres.
+
+Level 2, seeds 0-39, same machine and session:
+
+| | arc path | **B-spline** |
+| --- | --- | --- |
+| success | 31/40 | **32/40** |
+| mean lap time | 8.88 s | 8.86 s |
+| worst turn, mean | 52.9 deg | **52.7 deg** |
+| worst turn in the first 0.35 m, mean | 40.2 deg | **38.0 deg** |
+| turns > 120 deg | 1 in 302 | 1 in 301 |
+
+A wash on success, one degree better at the anchor, and it is the representation the next step needs
+(local support for repair, dynamic limits at plan time).
+
+### The relaxation, after the clearance projection was fixed
+
+The first version of the relaxation projected *control points* onto `safety_distance` and lost three
+finishes. Measuring the trade-off on the seeds it changed (`logs/relax_tradeoff.py`) showed why, and it
+was not the gate passages (crossing offsets 0.000-0.011 m either way):
+
+| | relaxation off | relaxation on, first version |
+| --- | --- | --- |
+| plan clearance to poles | 0.173-0.187 m | **0.145-0.149 m** |
+| gate crossing offset | 0.000-0.011 m | 0.000-0.011 m |
+
+The curve between control points lies inside their convex hull, and the hull of points outside a disc
+still cuts the disc, so the control points satisfied the requirement while the plan did not. Projecting
+onto `safety_distance + half the control spacing` fixes the 4 cm, and the relaxation becomes the best
+configuration measured so far:
+
+| level 2, seeds 0-39 | no relaxation | relaxation, no margin | **relaxation + margin** |
+| --- | --- | --- | --- |
+| success | 32/40 | 29/40 | **35/40** |
+| mean lap time | 8.86 s | 8.45 s | **8.37 s** |
+| worst turn, mean | 52.7 deg | 37.8 deg | 41.4 deg |
+| worst turn in the first 0.35 m | 38.0 deg | 25.7 deg | **30.3 deg** |
+
+35/40 clears the 17/20 screen this page asks for before a decision run. `bspline_relax_iters = 150`
+is now the default, and the remaining failures are seeds 8, 9, 30 (take-off and first leg, 1.3-2.5 s)
+and 11, 39.
+
+### The three that did not pay
+
+Each measured at seeds 0-39 and left off, with the number next to the flag:
+**the OCP pole penalty** at `w_obstacle = 300`, `obstacle_radius = 0.16` gives 29/40 at 9.20 s against
+32/40 at 8.86 and does not save the pole seeds (8, 9, 33); **asking the frame avoidance for 0.65 m**
+to cover the ~0.1 m the fit loses costs 0.3 s a lap and seed 7 still clips the top bar; **capping the
+approach at 1.1 m/s after a gate correction** costs 0.4 s a lap and seeds 4, 13, 31, 39 still cross
+0.13-0.15 m off centre, because the correction is lateral and the path left is short.
+
+**The earlier relaxation measurement, for the record.**
+`relax_control_points` minimises the curvature energy of the control polygon with a fidelity term
+onto the fitted polyline, projects control points out of every pole's clearance sphere, and locks the
+points within 0.3 m of a gate centre. With 150 iterations the geometry improves a lot and the lap
+gets *faster*:
+
+| 150 relaxation steps | off | on |
+| --- | --- | --- |
+| success | **32/40** | 29/40 |
+| mean lap time | 8.86 s | **8.45 s** |
+| worst turn, mean | 52.7 deg | **37.8 deg** |
+| worst turn in the first 0.35 m, mean | 38.0 deg | **25.7 deg** |
+| turns > 90 deg | 4 in 301 | **2 in 293** |
+
+It is 0.4 s a lap quicker and much smoother, and it loses three finishes: the new failures are gate
+passes (6, 11, 28, 33, 34, 36, 39) and two early take-off contacts (30, and 8 at 2.5 s), i.e. the
+relaxation pulls the curve off the passages and distorts the first metres after the anchor. It needs
+a wider passage lock and a stronger fidelity term before it can be adopted; the knobs are in place.
 
 ## The numbers to build on
 
@@ -36,17 +263,85 @@ All measured, see `docs/control/characterisation.md` and the failure analysis.
 | steady lateral acceleration | ~6 m/s^2; overload peaks 9.9-11.4 | `a_lat_max = 8` is conservative |
 | collision box (`cf21B_500.xml`) | 0.07 x 0.07 x 0.02 half extents | contact at 0.085-0.114 m |
 | `DRONE_RADIUS` in the planner | 0.09 m (0.105 m contact) | up to 9 mm optimistic |
-| full re-plan | ~58 ms (`A*` ~5 ms of it) | wall clock in sim, an overrun on hardware |
+| full re-plan | **7.5 ms** after the smoothing speedup (see below) | fits a 20 ms control period |
 | MPCC solve | 1.3 ms p95 | not the bottleneck |
 
 Two consequences that shape everything below.
 
 - **In simulation, replan cost is wall-clock only.** The environment advances 20 ms of simulated time
-  per step regardless of how long the planner took, so a 5 ms repair and a 58 ms re-plan fly the same
+  per step regardless of how long the planner took, so a 7 ms repair and a 40 ms re-plan fly the same
   trajectory. Cheap replanning improves the success rate only if it lets the controller re-plan
   *more often* (as an observation is refined), not because it saves time.
-- **On hardware it is a real cost.** At 50 Hz a 58 ms re-plan holds the previous command for about
-  12 cm of flight at 2 m/s. Local repair is therefore a deployment requirement.
+- **On hardware it is a real cost, and it was the blocking one.** At 50 Hz the planner used to take
+  ~40 ms per re-plan, holding the previous command for ~8 cm of flight at 2 m/s and overrunning the
+  control period twice over. At 7.5 ms it fits. Local repair is still worth having, but it is no
+  longer required to fit the loop.
+
+## Measured: the clearance fix and the distance penalty (branch `clearance-fix`)
+
+Two changes, both implemented and both measured on the 20-seed screen.
+
+**The planner now delivers the clearance it promises.** `_smooth_path` used to project onto
+`0.92 * safety_distance` = 0.138 m, i.e. it deliberately stopped inside the requirement, and nothing
+re-checked clearance after the gate handling. Now the projection uses `smoothing_margin = 1.25` on a
+randomized track (`1.0` where the poses are exact, so levels 0 and 1 are unchanged) and a final
+`_enforce_clearance` pass runs after every stage that can move the path inward. Verified on a
+simulated reveal: waypoints 0.187 m, fitted path 0.187 m, so the spline does not undo it.
+
+| | before | after |
+| --- | --- | --- |
+| successes whose plan was below 0.15 m | **2 of 13** | **0 of 13** |
+| level 2 | 13/20, 8.17 s | 13/20, 8.24 s |
+| level 0 / level 1 | 8.65 / 8.64 s | 8.64 / 8.63 s |
+
+**The success count did not move**, and the failures changed identity: seed 6 moved from a first-leg
+pole strike to a mid-lap one, while 9, 12 and 14 still die at t ~ 1.3 s. Those three are not a
+clearance problem. Their committed plan measures 0.102-0.150 m from the **true** pole while keeping
+0.187 m from the **nominal** one, which is the signature of a plan built before the reveal: the
+planner cannot keep a distance from a pose it does not know, and no amount of enforcing changes that.
+
+**The distance penalty in the OCP is measured inert.** `w_obstacle` and `obstacle_radius` now exist,
+`NP` carries six pole slots, and the term is `w * max(0, r - d)**2` over the horizon — continuously
+differentiable at the boundary, unused slots parked at 1e3 m. At `w_obstacle = 500` and
+`r = 0.14 m` the 20-seed screen was **identical**: same 13/20, same seeds, 8.22 s. The reason is the
+same stale pose — the penalty pushes away from the nominal pole, which is where the plan already
+keeps 0.187 m — and where the pose is known the path is outside the radius entirely, so the term
+never fires. It defaults to `0.0`; the code path is kept because it is the right place to put a
+barrier once the poses are trustworthy.
+
+Both results point at the same conclusion: **the remaining failures are information-timing, not
+geometry.** The planner and the OCP both act on the nominal pose until the drone is 0.7 m away, and
+0.7 m at 1.7 m/s is 0.41 s against a 0.46 s correction. The next lever is therefore P1.2/P1.3 —
+reserve the pose uncertainty in the plan while the object is unrevealed, and cap the approach speed
+at 1.5 m/s where it is.
+
+## Planning cost, before and after (branch `faster-planning`)
+
+`_smooth_path` was 90 % of the plan: 600 Laplacian sweeps over 1500 points, 0.083 ms each. One sweep
+only spreads the rounding by one point, so the rounded length is `spacing * sqrt(sweeps)` — the point
+count and the sweep count are interchangeable through that product. Smoothing every 4th point for
+`600 / 16 = 38` sweeps therefore rounds the same distance for 64 times less work, and the result is
+resampled back onto the input spacing so nothing downstream changes.
+
+| stage | before | after | share now |
+| --- | --- | --- | --- |
+| `_smooth_path` | 50.0 ms | **1.0 ms** | 13 % |
+| `_avoid_obstacles` | 3.8 ms | **3.6 ms** | **48 %** |
+| `_connect_blocks` (A*) | 1.6 ms | **1.5 ms** | **20 %** |
+| `_to_arc_path` | 0.8 ms | **0.7 ms** | 9 % |
+| everything else | 0.7 ms | 0.7 ms | 9 % |
+| **total** | **55.8 ms** | **7.5 ms** | |
+
+The path is unchanged where it matters: length 13.522 -> 13.521 m, clearance 0.150 m, gate centring
+within 4 mm, curvature p95 3.43 -> 3.45, kappa max 5.81 -> 6.46. The 20-seed screen still gives
+**13/20 at 8.17 s** with the same failing seeds, and levels 0/1 are unchanged.
+
+Two things follow for the branches below:
+
+- A* is no longer 3 % of the plan, it is 20 %. The caching and bounding-box work listed under
+  `dslite-replan` is now worth 1.5 ms per re-plan rather than noise.
+- `_avoid_obstacles` is the new hotspot at half the plan, and it is the same shape of problem: a
+  per-point push-out over the full 1500-point array, once per pole per iteration.
 
 ## Idea 1: remember observed poses: already done, do not rebuild
 

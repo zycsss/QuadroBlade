@@ -379,7 +379,7 @@ def episode_arrays(ep: dict[str, Any]) -> dict[str, Any]:
     )
     plans = ep["plan_log"]
     arrays["plan_reason"] = np.array([plan["reason"] for plan in plans], dtype="<U120")
-    for key in ("t", "tick", "theta", "length", "n_waypoints"):
+    for key in ("t", "tick", "theta", "length", "n_waypoints", "ms"):
         arrays[f"plan_{key}"] = np.array([plan[key] for plan in plans], dtype=float)
     arrays["plan_drone_pos"] = np.array([plan["drone_pos"] for plan in plans], dtype=float)
     arrays["plan_points"] = np.array([plan["points"] for plan in plans], dtype=float)
@@ -562,11 +562,11 @@ def main(
             )
             if log:
                 solver_ms = ep["record"].get("solver_ms", np.zeros(0))
+                plan_ms = [entry["ms"] for entry in ep["plan_log"]]
                 print(
                     f"          log  -> {log_path}  ({len(ep['plan_log'])} plans, "
-                    f"{len(ep['record']['t'])} steps, solver "
-                    + (f"{np.mean(solver_ms):.1f} ms mean" if len(solver_ms) else "n/a")
-                    + ")"
+                    f"{len(ep['record']['t'])} steps, plan {np.mean(plan_ms):.1f} ms mean, "
+                    f"solver {np.mean(solver_ms):.1f} ms mean)"
                 )
             if plot:
                 # Plotted from the file that was just written, never from memory.

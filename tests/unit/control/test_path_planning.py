@@ -6,7 +6,13 @@ import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation as R
 
-from lsy_drone_racing.control.path_planning import ArcPath, PathConfig, PathPlanner, track_reference
+from lsy_drone_racing.control.path_planning import (
+    ArcPath,
+    PathConfig,
+    PathPlanner,
+    PathSeed,
+    track_reference,
+)
 from lsy_drone_racing.envs.utils import load_gate_order, load_track
 from lsy_drone_racing.utils import load_config
 
@@ -200,3 +206,72 @@ def test_progress_weight_peaks_at_gates(planned: tuple):
     assert np.all(at_gates > 0.3)
     away = track_reference(path, np.array([path.length]), info.gate_centers, info.obstacles)[2]
     assert away[0] < 0.3
+
+
+def replan_from(old: ArcPath, progress: float, config: PathConfig | None = None) -> tuple:
+    """Re-plan the level-0 track from a point on ``old``, as the controller does on a reveal."""
+    obs = make_obs()
+    anchor = old.pos(progress)
+    seed = PathSeed(
+        position=anchor,
+        tangent=old.tangent(progress),
+        length=PathConfig().seed_length,
+        path=old,
+        progress=progress,
+    )
+    return PathPlanner(config or PathConfig()).plan(obs, anchor, climb=False, seed=seed)
+
+
+def largest_turn_within(path: ArcPath, window: float, samples: int = 2000) -> float:
+    """Return the largest direction change [deg] within the first ``window`` metres of a path."""
+    arc = np.linspace(0.0, min(window, path.length), samples)
+    tangents = path.tangent(arc)
+    cosine = np.einsum("ij,ij->i", tangents[:-1], tangents[1:])
+    return float(np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0))).max())
+
+
+@pytest.mark.unit
+def test_seed_is_stored_as_a_unit_tangent():
+    """A seed normalizes its tangent and rejects a degenerate one."""
+    seed = PathSeed(
+        position=np.array([1.0, 2.0, 3.0]), tangent=np.array([0.0, 0.0, 4.0]), length=0.2
+    )
+    np.testing.assert_allclose(seed.tangent, [0.0, 0.0, 1.0])
+    np.testing.assert_allclose(seed.position, [1.0, 2.0, 3.0])
+    with pytest.raises(ValueError):
+        PathSeed(position=np.zeros(3), tangent=np.zeros(3), length=0.2)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("progress", [1.0, 2.5, 4.0, 6.0])
+def test_seeded_replan_starts_on_the_old_path(planned: tuple, progress: float):
+    """The new path must begin where the old one was, pointing the way the old one pointed."""
+    old = planned[0]
+    new, _ = replan_from(old, progress)
+    np.testing.assert_allclose(new.pos(0.0), old.pos(progress), atol=1e-6)
+    cosine = float(np.dot(new.tangent(0.0), old.tangent(progress)))
+    assert cosine > np.cos(np.deg2rad(10.0)), (
+        f"start tangent is {np.degrees(np.arccos(cosine)):.0f} deg off the old path"
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("progress", [1.0, 2.5, 4.0, 6.0])
+def test_seeded_replan_does_not_turn_back_at_the_anchor(planned: tuple, progress: float):
+    """A re-plan must not reverse within its first metres, which is the anchor fold."""
+    new, _ = replan_from(planned[0], progress)
+    assert largest_turn_within(new, 0.35) < 90.0
+
+
+@pytest.mark.unit
+def test_seeded_replan_keeps_clearance_and_visits_every_gate(planned: tuple):
+    """Pinning the start must not break the clearance or the gate passes that follow it."""
+    _, info, _ = planned
+    new, new_info = replan_from(planned[0], 2.5)
+    positions = new.pos(np.linspace(0.0, new.length, 6000))
+    required = PathConfig().safety_distance
+    assert PathPlanner.clearance(positions, new_info.obstacles) >= 0.9 * required
+    assert positions[:, 2].min() > 0.0
+    for centre in new_info.gate_centers:
+        assert np.min(np.linalg.norm(positions - centre, axis=1)) < 0.1
+    assert len(new_info.gate_centers) == len(info.gate_centers)

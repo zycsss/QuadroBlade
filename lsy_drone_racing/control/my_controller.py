@@ -37,7 +37,7 @@ import logging
 import os
 import time
 from collections import deque
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -53,6 +53,7 @@ from lsy_drone_racing.control.path_planning import (
     ArcPath,
     PathInfo,
     PathPlanner,
+    PathSeed,
     path_config_from,
     track_reference,
 )
@@ -69,7 +70,18 @@ SOLVER_JSON = CODE_EXPORT_DIR / "mpcc_racing.json"
 SIGNATURE_FILE = CODE_EXPORT_DIR / "mpcc_racing.signature"
 
 #: State and input dimensions of the OCP.
-NX, NU, NP = 15, 5, 7
+NX, NU = 15, 5
+
+#: Obstacle centres carried in the OCP parameter vector, for the distance penalty. Fixed at compile
+#: time so the generated solver does not depend on the track; unused slots are sent far away, where
+#: the penalty is inactive.
+MAX_BARRIER_POLE = 6
+
+#: Value written into an unused obstacle slot [m]. Far enough that the penalty is exactly zero.
+BARRIER_OFF = 1.0e3
+
+#: Number of OCP parameters: reference position, tangent, proximity weight, then the pole centres.
+NP = 7 + 2 * MAX_BARRIER_POLE
 
 #: MPCC settings for a randomized track, i.e. for the levels that re-plan on sensor updates.
 #:
@@ -85,8 +97,12 @@ RANDOMIZED_TRACK_MPCC = {
     "a_lat_max": 8.0,
     "v_max": 3.5,
     "replan_slowdown_time": 0.3,
+    # The distance penalty is left off: measured on level 2 it changed nothing (13/20 either way,
+    # pose the plan does, so it pushes away from the wrong place; and where the pose is known the
+    # path already keeps 0.187 m, outside the 0.14 m radius. The planning page has the numbers.
+    # path already keeps 0.187 m, outside the 0.14 m radius. See the planning page for the numbers.
+    "w_obstacle": 0.0,
 }
-#: In-process solver cache, so that multi-episode evaluation scripts build the solver only once.
 _SOLVER_CACHE: dict[str, tuple[AcadosOcpSolver, AcadosOcp]] = {}
 
 
@@ -105,6 +121,14 @@ class MPCCConfig:
         q_contour: Contour error weight.
         q_lag_peak: Additional lag weight at the gates and obstacles.
         q_contour_peak: Additional contour weight at the gates and obstacles.
+        w_obstacle: Weight of the one-sided distance penalty that pushes the drone away from an
+            obstacle centre inside ``obstacle_radius``. Zero disables it and leaves the avoidance
+            entirely to the planned path. It is a soft net, not a guarantee: it acts on the flown
+            trajectory, so it can only react to a clearance the path did not provide.
+        obstacle_radius: Distance [m] from an obstacle centre below which the penalty is active. Set
+            it just above the drone's collision reach (0.085 m face-on, 0.114 m corner-on for the
+            0.14 x 0.14 x 0.04 m box) so the term only fights a contact that is about to happen
+            rather than reshaping the whole corner.
         contour_z_weight: Extra emphasis on the vertical contour error. The gates are only 0.4 m
             tall, so altitude accuracy, not lateral accuracy, limits the pass margin.
         q_attitude: Penalty on the absolute roll/pitch/yaw.
@@ -150,6 +174,27 @@ class MPCCConfig:
             A revealed gate can be up to 0.2 m away from its nominal pose, and the drone needs a
             moment to converge onto the corrected approach line before it reaches the gate.
         replan_slowdown_factor: Factor applied to the reference speed during that time.
+        replan_coalesce_ticks: Quiet period in control ticks before a pending reveal is planned for.
+            Reveals arrive in bursts, 36 percent of them within the previous re-plan's slowdown
+            window, and three paths in a quarter of a second buy nothing.
+        replan_max_defer_ticks: Hard cap on how long a pending reveal may wait, in control ticks. It
+            overrides both the quiet period and the passage deferral, so a reveal can never be
+            starved.
+        replan_defer_in_passage: Whether to hold a re-plan while the drone flies a gate passage.
+            Re-planning there puts the first block behind the drone, which folds the path back on
+            itself within centimetres of the anchor.
+        reveal_speed: Reference speed ceiling [m/s] in front of a gate that has not been seen yet.
+            The ceiling is ``sensor_range / 0.46 s``, the time the drone needs to correct the worst
+            pose error, so it is an information limit rather than a tuning knob.
+        reveal_window: Arc length [m] in front of a gate over which ``reveal_speed`` applies.
+        reveal_hold_time: Time [s] the cap stays on after a gate pose was corrected. The reveal is
+            when the correction starts, not when it is finished.
+        gate_correction_hold_time: Time [s] a gate correction keeps the approach cap on. A revealed
+            gate 0.21 m from its nominal pose needs 0.46 s of lateral travel, and the reveal lands
+            0.7 m out, so the correction is still being paid for when the drone reaches the gate.
+        reveal_speed_corrected: Speed ceiling [m/s] while a gate correction is still being paid for.
+            Lower than ``reveal_speed`` because the lateral distance to make up is known and finite,
+            while an unseen gate's is not.
         name: Name of the acados model and of the generated code.
     """
 
@@ -157,6 +202,13 @@ class MPCCConfig:
     dt: float = 0.02
     q_lag: float = 100.0
     q_contour: float = 100.0
+    # Measured on level 2, seeds 0-39, at 300 with a 0.16 m radius: 29/40 at 9.20 s against 32/40 at
+    # 8.86 s, and the pole failures it targets (8, 9, 33) all still fail, so its lap time is
+    # spent for nothing. Left off; the transients that hit a pole are a timing problem, not a
+    # controller-weight problem. The code path stays: it is the right place for a barrier once
+    # the plan can guarantee a larger margin.
+    w_obstacle: float = 0.0
+    obstacle_radius: float = 0.14
     q_lag_peak: float = 2000.0
     q_contour_peak: float = 6000.0
     contour_z_weight: float = 2.0
@@ -186,7 +238,31 @@ class MPCCConfig:
     mass_adapt_min_balance: float = 1.0
     mass_adapt_max_speed: float = 1.5
     replan_slowdown_time: float = 0.8
+    # Measured on level 2: any deferral loses the marginal cases. Debouncing by three ticks (0.06 s)
+    # dropped the 20-seed screen from 17/20 to 9/20, because the first-leg reveals already have no
+    # slack to give. Left at immediate re-plan; see the planning page for the numbers.
+    replan_coalesce_ticks: int = 0
+    replan_max_defer_ticks: int = 0
+    replan_defer_in_passage: bool = False
     replan_slowdown_factor: float = 0.5
+    # Measured on level 2: braking to 0.15 of the reference speed for 0.15 s after every re-plan
+    # costs 0.31 s of lap time, 8.99 s to 9.30 s, and does not raise the finish count on the 20-seed
+    # screen. The hold is therefore off: a factor of 1.0 with a zero window makes it a no-op.
+    replan_hold_time: float = 0.0
+    replan_hold_factor: float = 1.0
+    # A gate that has not been seen yet may be up to 0.21 m from the pose the plan aims at, and the
+    # drone needs about 0.46 s of lateral travel to make that up. 0.7 m of sensor range therefore
+    # only leaves a safe speed of 0.7 / 0.46 = 1.5 m/s, and the cap is applied over an arc-length
+    # window in front of the gate so the drone has already paid for the correction when it gets
+    # there. Measured on level 2: see the planning page.
+    reveal_speed: float = 1.5
+    reveal_window: float = 1.2
+    reveal_hold_time: float = 0.5
+    # Measured: capping the approach at 1.1 m/s for 2 s after a gate correction costs 0.4 s a lap
+    # and does not save seeds 4, 13, 31 or 39 - they cross the plane 0.13-0.15 m off a plan that is
+    # dead centre whatever the speed, because the correction is lateral and the path left is short.
+    gate_correction_hold_time: float = 0.0
+    reveal_speed_corrected: float = 1.5
     name: str = "mpcc_racing"
 
     @property
@@ -198,6 +274,13 @@ class MPCCConfig:
 def _signature(config: MPCCConfig, params: dict) -> str:
     """Compute a signature of everything that defines the generated solver.
 
+    Only the fields [build_ocp][lsy_drone_racing.control.my_controller.build_ocp] reads are hashed.
+    Hashing the whole dataclass meant every controller-only tweak - a replan slowdown factor, a
+    reveal window, a gate-correction hold - threw away the compiled solver and paid a one minute
+    rebuild, which is how a run ended in a killed cmake build. The opposite mistake is worse: a
+    field that does reach the OCP but is missing here would silently reuse a stale solver, so the
+    list below is checked against `build_ocp` and the dimensions are hashed alongside it.
+
     Args:
         config: MPCC configuration.
         params: Drone parameters used by the model.
@@ -206,7 +289,9 @@ def _signature(config: MPCCConfig, params: dict) -> str:
         A short hexadecimal signature.
     """
     payload = {
-        "config": asdict(config),
+        "config": {name: getattr(config, name) for name in _OCP_FIELDS},
+        # The trap the planning page records: a changed NP reuses the stale generated code silently.
+        "dimensions": [NX, NU, NP],
         "mass": float(params["mass"]),
         "thrust": [float(params["thrust_min"]), float(params["thrust_max"])],
         "lag": [np.asarray(params[k], dtype=float).tolist() for k in _LAG_KEYS],
@@ -215,6 +300,33 @@ def _signature(config: MPCCConfig, params: dict) -> str:
     digest = json.dumps(payload, sort_keys=True, default=str).encode()
     return hashlib.sha256(digest).hexdigest()[:16]
 
+
+#: The MPCCConfig fields that `build_ocp` reads. Everything else only affects the running
+#: controller, so changing it must not invalidate the compiled solver.
+_OCP_FIELDS = (
+    "N",
+    "dt",
+    "q_lag",
+    "q_contour",
+    "w_obstacle",
+    "obstacle_radius",
+    "q_lag_peak",
+    "q_contour_peak",
+    "contour_z_weight",
+    "q_attitude",
+    "r_rates",
+    "mu_speed",
+    "r_vtheta",
+    "v_max",
+    "thrust_lag",
+    "qp_solver",
+    "condensing_N",
+    "attitude_limit",
+    "rate_limit",
+    "pos_low",
+    "pos_high",
+    "name",
+)
 
 _LAG_KEYS = ("rpy_coef", "rpy_rates_coef", "cmd_rpy_coef")
 
@@ -304,6 +416,19 @@ def build_ocp(config: MPCCConfig, params: dict) -> AcadosOcp:
     rates = u[0:4]
     cost += cs.dot(rates, cs.mtimes(cs.DM(np.diag(config.r_rates)), rates))
     cost += config.r_vtheta * v_theta * v_theta - config.mu_speed * v_theta
+    # One-sided distance penalty: zero while the drone keeps ``obstacle_radius`` from a pole centre,
+    # quadratic inside it. ``max(0, r - d)**2`` is continuously differentiable at the boundary,
+    # so it adds no kink to the cost, and unused slots sit at BARRIER_OFF where it is zero. It is
+    # a soft net over a planned path, not a substitute for one: it can only react to a clearance
+    # path did not provide, and it trades against the progress reward.
+    if config.w_obstacle > 0.0:
+        for slot in range(MAX_BARRIER_POLE):
+            offset = 1 + 2 * slot
+            gap_x = x[0] - p[offset]
+            gap_y = x[1] - p[offset + 1]
+            distance = cs.sqrt(gap_x * gap_x + gap_y * gap_y + 1e-9)
+            violation = cs.fmax(0.0, config.obstacle_radius - distance)
+            cost += config.w_obstacle * violation * violation
     model.cost_expr_ext_cost = cost
     model.cost_expr_ext_cost_e = cs.SX(0)
 
@@ -313,7 +438,8 @@ def build_ocp(config: MPCCConfig, params: dict) -> AcadosOcp:
 
     ocp.cost.cost_type = "EXTERNAL"
     ocp.cost.cost_type_e = "EXTERNAL"
-    ocp.parameter_values = np.zeros(NP)
+    ocp.parameter_values = np.full(NP, BARRIER_OFF)
+    ocp.parameter_values[:7] = 0.0
 
     # Box constraints on position, thrust setpoints, attitude setpoints and path progress.
     ocp.constraints.idxbx = np.array([0, 1, 2, 9, 10, 11, 12, 13, 14])
@@ -489,11 +615,19 @@ class MPCCController(Controller):
         # already passes the gates cleanly. `path_config_from` applies that rule and the config
         # overrides of the race config in one place.
         self._planner = PathPlanner(path_config_from(config))
+        # The reveal-aware approach cap is information, not tuning: it buys the time to correct a
+        # pose that is still unknown. A track that does not randomize its poses has nothing to
+        # correct, so the cap would be pure lap time there.
+        randomizations = config.env.get("randomizations") or {}
+        self._randomized_track = any(
+            key in randomizations for key in ("gate_pos", "gate_rpy", "obstacle_pos")
+        )
         self._solver, _ = get_solver(self._mpcc, self._params)
         self._nominal_mass = float(self._params["mass"])
         self._mass_ratio = 1.0
         self._applied_thrust = self._hover_thrust
         self._prev_vel: NDArray[np.floating] | None = None
+        self._accel = np.zeros(3)
         self._reset_mass_history()
         self._path: ArcPath | None = None
         self._gate_centers = np.zeros((0, 3))
@@ -507,6 +641,8 @@ class MPCCController(Controller):
         self._stall_reported = False
         self.status = 0
         self.solve_time = 0.0
+        # Set before the first plan so the opening plan is timed like every re-plan.
+        self._last_plan_ms = 0.0
         self._init_episode(obs)
 
     # region lifecycle
@@ -519,7 +655,9 @@ class MPCCController(Controller):
             reason: What to record as the reason for the path in the plan log.
         """
         self._plan_origin = np.asarray(obs["pos"], dtype=float).copy()
+        started = time.perf_counter()
         path, info = self._planner.plan(obs, self._plan_origin)
+        self._last_plan_ms = (time.perf_counter() - started) * 1e3
         self._install_path(path, info)
         self._reset_state(obs, reason)
 
@@ -537,8 +675,13 @@ class MPCCController(Controller):
         self._reproject_wide = False
         self._projection_window = (-0.15, 0.6)
         self._slowdown_until = 0
+        self._hold_until = 0
         self.replans = 0
         self.plan_log: list[dict[str, object]] = []
+        # Reveals waiting to be planned for, and when the first and latest of them arrived.
+        self._pending: list[str] = []
+        self._pending_since = 0
+        self._pending_tick = 0
         self._last_v_ref = 0.0
         self._last_f_col = self._hover_thrust
         self._last_f_cmd = self._hover_thrust
@@ -546,12 +689,15 @@ class MPCCController(Controller):
         self._mass_ratio = 1.0
         self._applied_thrust = self._hover_thrust
         self._prev_vel = None
+        self._accel = np.zeros(3)
         self._reset_mass_history()
         self._theta = 0.0
         self._tick = 0
         self._failures = 0
         self._stall_time = 0.0
         self._stall_reported = False
+        self._next_gate_seen = True
+        self._gate_corrected_tick = -(10**6)
         self._needs_plan = False
         self._solver.reset()
         # Last, so the entry sees the reset progress and tick, not the previous episode's.
@@ -572,8 +718,31 @@ class MPCCController(Controller):
         self._gate_centers = info.gate_centers
         self._obstacles = info.obstacles
         self._draw_points = path.pos(np.linspace(0.0, path.length, 200))
+        # Arc length of every remaining gate pass on this path, for the approach speed cap: a gate
+        # that has not been seen yet may be up to 0.21 m away from the pose the plan aims at, and
+        # correction has to be paid for before the drone reaches it.
+        self._gate_arc = np.array(
+            [path.closest(centre, 0.0, window=(-0.15, path.length)) for centre in info.gate_centers]
+        )
         self._build_speed_limit()
         self._apply_progress_bound()
+
+    def _barrier_params(self) -> NDArray[np.floating]:
+        """Return the obstacle centres for the distance penalty, padded with the off value.
+
+        The centres are whatever the controller currently believes: the nominal pose for an obstacle
+        it has not seen yet, the true pose once revealed. That is the information the plan uses,
+        so the penalty inherits the plan's uncertainty rather than adding a new failure mode.
+
+        Returns:
+            The flattened XY centres, shape ``(2 * MAX_BARRIER_POLE,)``.
+        """
+        values = np.full(2 * MAX_BARRIER_POLE, BARRIER_OFF, dtype=float)
+        obstacles = np.asarray(self._obstacles, dtype=float).reshape(-1, 3)
+        count = min(len(obstacles), MAX_BARRIER_POLE)
+        if count:
+            values[: 2 * count] = obstacles[:count, :2].ravel()
+        return values
 
     def _reference(
         self, thetas: NDArray[np.floating]
@@ -610,6 +779,9 @@ class MPCCController(Controller):
                 "theta": float(self._theta),
                 "length": float(self._path.length),
                 "n_waypoints": int(len(self._path_info.waypoints)),
+                # Wall clock the planner took for this path. It is the cost the control loop pays
+                # inside one tick, so it is worth recording next to the path it produced.
+                "ms": float(self._last_plan_ms),
                 "points": np.asarray(self._draw_points, dtype=float).copy(),
             }
         )
@@ -691,27 +863,136 @@ class MPCCController(Controller):
                 changes.append(f"pole {pole_id} moved {shift * 100:.1f} cm")
         return changes
 
+    def _replan_due(self, obs: dict[str, NDArray[np.floating]]) -> bool:
+        """Return whether the pending track information should be turned into a new path now.
+
+        Three things hold a re-plan back, and a hard cap overrides all of them:
+
+        * a quiet period, so a burst of reveals near the same place produces one path, not three;
+        * being inside a gate passage, where re-planning puts the first block behind the drone and
+          folds the path back on itself — that cusp is what the smoothing then has to eat;
+        * nothing pending at all.
+
+        Args:
+            obs: The current observation.
+
+        Returns:
+            ``True`` if the pending changes should be planned for now.
+        """
+        if not self._pending:
+            return False
+        waited = self._tick - self._pending_since
+        if waited >= self._mpcc.replan_max_defer_ticks:
+            return True
+        if self._tick - self._pending_tick < self._mpcc.replan_coalesce_ticks:
+            return False
+        if self._mpcc.replan_defer_in_passage and self._in_passage(obs):
+            return False
+        return True
+
+    def _in_passage(self, obs: dict[str, NDArray[np.floating]]) -> bool:
+        """Return whether the drone is close enough to the next gate to be flying its passage.
+
+        Args:
+            obs: The current observation.
+
+        Returns:
+            ``True`` while the drone is within twice the straight passage length of the next gate.
+        """
+        if len(self._gate_centers) == 0:
+            return False
+        here = np.asarray(obs["pos"], dtype=float)[:2]
+        next_gate = np.asarray(self._gate_centers, dtype=float)[0, :2]
+        radius = 2.0 * float(self._planner.config.gate_straight_length)
+        return bool(np.linalg.norm(here - next_gate) < radius)
+
     def _replan(self, obs: dict[str, NDArray[np.floating]], reason: str = "sensor update"):
-        """Re-plan the path with the newly revealed gate and obstacle poses.
+        """Re-plan the path from where the drone is, through the passes that are still to come.
 
         Only the path reference changes: the optimal control problem and its solver are untouched,
         because the path enters the cost as per-stage parameters. The speed limit table and the
-        progress bound are rebuilt for the new path, and the projection window is widened for one
-        step so that the drone re-anchors onto the new arc length immediately.
+        progress bound are rebuilt for the new path.
+
+        The new path starts on the *old* path, at the projection of the pose the drone will have
+        when the new path takes effect, and it leaves that point along the old path's tangent. Two
+        things follow from anchoring on the path rather than on the measured pose: the new path
+        begins on the trajectory the drone is already flying, so the reference at progress zero is a
+        point the drone is heading for and not a point it has to reach sideways; and the tangent is
+        the direction it is already moving, so the first metres of the plan cannot ask it to turn
+        around. Planning from the take-off point, or from the measured pose toward the next gate,
+        did both of those wrong, and the folds that the smoothing then had to eat came out of it.
+
+        Progress restarts at zero because the new path begins at the drone.
+
+        The anchor is the drone's pose at the *end* of this control interval, not its pose now: the
+        command computed this tick still applies for one interval, so by the time the new path takes
+        effect the drone has moved ``velocity * dt`` further on. Anchoring at the current position
+        put the start of the path behind the drone, which turns the first segment into a catch-up
+        and makes the spline curve sharply right where the curvature limit then throttles the drone.
 
         Args:
             obs: The current observation.
             reason: Why the path is re-planned, recorded in the plan log.
         """
-        path, info = self._planner.plan(obs, self._plan_origin)
+        here = np.asarray(obs["pos"], dtype=float)
+        velocity = np.asarray(obs["vel"], dtype=float)
+        trimmed = self._remaining_obs(obs)
+        if trimmed is None:
+            return
+        assert self._path is not None
+        predicted = here + velocity / self._freq
+        progress = self._path.closest(predicted, self._theta)
+        seed = PathSeed(
+            position=self._path.pos(progress),
+            tangent=self._path.tangent(progress),
+            length=self._planner.config.seed_length,
+            path=self._path,
+            progress=progress,
+            velocity=velocity,
+            acceleration=self._accel,
+        )
+        started = time.perf_counter()
+        path, info = self._planner.plan(trimmed, seed.position, climb=False, seed=seed)
+        self._last_plan_ms = (time.perf_counter() - started) * 1e3
         self._install_path(path, info)
+        self._theta = 0.0
+        self._projection_window = (-0.15, 1.0)
         self._reproject_wide = True
         self._slowdown_until = self._tick + int(round(self._mpcc.replan_slowdown_time * self._freq))
+        self._hold_until = self._tick + int(round(self._mpcc.replan_hold_time * self._freq))
         self.replans += 1
         self._record_plan(f"re-plan: {reason}", obs)
         logger.info(
-            "Re-planned path after sensor update: %.2f m (replan %d)", path.length, self.replans
+            "Re-planned from progress %.2f m: %.2f m, %d passes left, %.1f ms (replan %d)",
+            progress,
+            path.length,
+            len(np.asarray(trimmed["gate_sequence"]).ravel()),
+            self._last_plan_ms,
+            self.replans,
         )
+
+    @staticmethod
+    def _remaining_obs(
+        obs: dict[str, NDArray[np.floating]],
+    ) -> dict[str, NDArray[np.floating]] | None:
+        """Return the observation with the gate sequence cut down to the passes still to come.
+
+        Args:
+            obs: The current observation.
+
+        Returns:
+            A shallow copy whose ``gate_sequence`` and ``gate_sequence_direction`` start at the next
+            pass, or ``None`` when every pass is already done and there is nothing left to plan.
+        """
+        passed = int(np.asarray(obs["n_gates_passed"]))
+        sequence = np.asarray(obs["gate_sequence"], dtype=int).ravel()
+        direction = np.asarray(obs["gate_sequence_direction"], dtype=float).ravel()
+        if passed >= len(sequence):
+            return None
+        trimmed = dict(obs)
+        trimmed["gate_sequence"] = sequence[passed:]
+        trimmed["gate_sequence_direction"] = direction[passed:]
+        return trimmed
 
     def _apply_progress_bound(self):
         """Push the path length into the per-stage upper bound of the theta state.
@@ -816,6 +1097,54 @@ class MPCCController(Controller):
             ]
         )
 
+    def _gate_seen(self, obs: dict[str, NDArray[np.floating]]) -> bool:
+        """Return whether the gate of the next pass has been observed at its true pose.
+
+        The environment reports the nominal pose of an object until the drone comes within the
+        sensor range of it, and the true one afterwards, and it says which by the ``visited`` flags.
+        A track without pose randomisation never changes a pose and its flags stay false, so there
+        "seen" is the right answer: the nominal pose is the true one.
+
+        Args:
+            obs: The current observation.
+
+        Returns:
+            ``True`` when the next gate's pose is trustworthy, or when there is no next gate.
+        """
+        gate_ids = np.asarray(self._path_info.gate_ids).ravel()
+        if len(gate_ids) == 0:
+            return True
+        flags = np.asarray(obs.get("gates_visited", np.zeros(0)), dtype=bool).ravel()
+        gate = int(gate_ids[0])
+        if len(flags) <= gate:
+            return True
+        return bool(flags[gate])
+
+    def _approach_capped(self, theta: float) -> bool:
+        """Return whether the approach to the next gate has to be flown at ``reveal_speed``.
+
+        Two cases ask for it. A gate that has not been seen yet is only nominal, and the correction
+        the reveal will demand has to be flown before the drone gets there. A gate that *was* just
+        corrected keeps the cap for ``reveal_hold_time``, because the reveal is when the correction
+        starts, not when it is finished: measured on level 2, the reveal lands at 0.7 m and the
+        0.46 s of lateral travel needed is the whole distance that is left.
+
+        Args:
+            theta: Path progress in meters.
+
+        Returns:
+            ``True`` if the reference speed should be capped.
+        """
+        if not self._randomized_track or len(self._gate_arc) == 0:
+            return False
+        gap = float(self._gate_arc[0]) - theta
+        if not -0.2 <= gap < self._mpcc.reveal_window:
+            return False
+        if not self._next_gate_seen:
+            return True
+        hold = int(round(self._mpcc.gate_correction_hold_time * self._freq))
+        return self._tick - self._gate_corrected_tick <= hold
+
     def _reference_speed(self, theta: float, speed_actual: float) -> float:
         """Return the reference path speed at a given path progress.
 
@@ -837,7 +1166,20 @@ class MPCCController(Controller):
         speed = cfg.mu_speed / (2.0 * (cfg.w_speed_gate * float(weight[0]) + cfg.r_vtheta))
         speed = min(speed, speed_actual + cfg.v_lead)
         speed = min(speed, float(np.interp(theta, self._speed_grid, self._speed_limit)))
-        if self._tick < self._slowdown_until:
+        if self._approach_capped(theta):
+            corrected = self._tick - self._gate_corrected_tick <= int(
+                round(cfg.gate_correction_hold_time * self._freq)
+            )
+            speed = min(speed, cfg.reveal_speed_corrected if corrected else cfg.reveal_speed)
+        if self._tick < self._hold_until:
+            # Brake hard right after a re-plan: this is the only place where the controller spends
+            # time to buy geometry. The revealed pose can be 0.21 m from the nominal one, and the
+            # drone needs about 0.46 s of lateral travel to make that up, against the 0.41 s the
+            # 0.7 m sensor range gives it at race speed. Slowing to a crawl for a moment shortens
+            # the distance still to fly, so the correction lands before the obstacle instead of
+            # after it.
+            speed *= cfg.replan_hold_factor
+        elif self._tick < self._slowdown_until:
             speed *= cfg.replan_slowdown_factor
         return float(np.clip(speed, cfg.v_min, cfg.v_max))
 
@@ -900,11 +1242,32 @@ class MPCCController(Controller):
         self._tick += 1
 
         pos = np.asarray(obs["pos"], dtype=float)
+        # The acceleration a B-spline plan starts with. It has to be taken before the mass estimate
+        # overwrites the previous velocity with the current one.
+        velocity = np.asarray(obs["vel"], dtype=float)
+        self._accel = (
+            np.clip((velocity - self._prev_vel) * self._freq, -25.0, 25.0)
+            if self._prev_vel is not None
+            else np.zeros(3)
+        )
         self._update_mass_estimate(obs)
         changes = self._track_info_changed(obs)
         if changes:
-            self._replan(obs, ", ".join(changes))
+            # Collect rather than act immediately: a reveal often arrives in a burst, and a re-plan
+            # inside a gate passage folds the path back towards the approach the drone has already
+            # flown through. Both are handled by waiting for a quiet tick outside a passage.
+            if not self._pending:
+                self._pending_since = self._tick
+            self._pending.extend(changes)
+            self._pending_tick = self._tick
+            if any("gate" in change for change in changes):
+                self._gate_corrected_tick = self._tick
+        if self._replan_due(obs):
+            reason = ", ".join(dict.fromkeys(self._pending))
+            self._pending = []
+            self._replan(obs, reason)
         theta = self._progress(pos)
+        self._next_gate_seen = self._gate_seen(obs)
         speed = self._reference_speed(theta, float(np.linalg.norm(np.asarray(obs["vel"], float))))
         self._last_v_ref = float(speed)
         thetas = np.clip(
@@ -912,8 +1275,9 @@ class MPCCController(Controller):
         )
         positions, tangents, weights = self._reference(thetas)
         self._horizon_points = positions
+        barrier = self._barrier_params()
         for k in range(self._mpcc.N + 1):
-            params = np.concatenate((positions[k], tangents[k], [weights[k]]))
+            params = np.concatenate((positions[k], tangents[k], [weights[k]], barrier))
             self._solver.set(k, "p", np.ascontiguousarray(params, dtype=np.float64))
 
         x0 = self._state_vector(obs, theta)
