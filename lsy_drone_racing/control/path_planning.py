@@ -204,6 +204,10 @@ class PathConfig:
     trim_seeded_passage: bool = True
     gate_straight_length: float = 0.275
     gate_straight_blend: float = 0.25
+    # Measured: 0.55 was requested and 0.447 delivered, because the push runs on the waypoints and
+    # the fit through them cuts the corner. Asking for 0.65 to cover that loss costs 0.3 s a lap and
+    # does not save seed 7, so the request stays at 0.55 and the gap is recorded here instead: a
+    # tangent pass over a bar can deliver ~0.1 m less than requested.
     gate_frame_clearance: float = 0.55
     gate_frame_window: float = 0.3
     gate_frame_slab: float = 0.13
@@ -216,7 +220,7 @@ class PathConfig:
     bspline_speed: float = 2.0
     bspline_speed_limit: float = 2.3
     bspline_accel_limit: float = 8.0
-    bspline_relax_iters: int = 0
+    bspline_relax_iters: int = 150
     climb_height: float = 0.25
     runout: float = 0.4
     duration: float = 30.0
