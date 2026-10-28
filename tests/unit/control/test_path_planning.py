@@ -212,13 +212,7 @@ def replan_from(old: ArcPath, progress: float, config: PathConfig | None = None)
     """Re-plan the level-0 track from a point on ``old``, as the controller does on a reveal."""
     obs = make_obs()
     anchor = old.pos(progress)
-    seed = PathSeed(
-        position=anchor,
-        tangent=old.tangent(progress),
-        length=PathConfig().seed_length,
-        path=old,
-        progress=progress,
-    )
+    seed = PathSeed(position=anchor, tangent=old.tangent(progress), length=PathConfig().seed_length)
     return PathPlanner(config or PathConfig()).plan(obs, anchor, climb=False, seed=seed)
 
 

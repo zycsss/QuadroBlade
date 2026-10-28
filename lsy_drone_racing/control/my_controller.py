@@ -938,8 +938,6 @@ class MPCCController(Controller):
             position=self._path.pos(progress),
             tangent=self._path.tangent(progress),
             length=self._planner.config.seed_length,
-            path=self._path,
-            progress=progress,
             velocity=velocity,
             acceleration=self._accel,
         )

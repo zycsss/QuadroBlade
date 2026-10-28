@@ -44,15 +44,18 @@ The re-plan is now seeded (`PathSeed`, `PathPlanner.plan(seed=...)`):
 2. it leaves along the old path's **tangent**, not toward the next gate;
 3. the part of the first passage behind the seed step is dropped, and the seed step is clamped so it
    never overshoots that passage (`PathConfig.trim_seeded_passage`);
-4. `_pin_anchor` puts the first 0.25 m of the *finished* path back onto the old path, with a smootherstep
-   blend, because the smoothing, the gate straightening and the clearance pass each drag the start a
-   few centimetres away — that is how the fold survived every earlier attempt.
+4. the plan is a B-spline whose first three control points are the anchor and the drone's measured
+   velocity and acceleration, so the start cannot be dragged away by a later stage: the pin is a
+   boundary condition, not a correction applied afterwards.
 
-The pin has to run on the dense samples, not on the waypoints (`_to_arc_path`, not `plan`). The
-arc-length reparameterization refits a natural cubic and resamples it up to twenty times, and its first
+That last point used to be a different mechanism. Before the B-spline the planner drew a natural cubic
+spline, arc-length reparameterized it, and then moved the first 0.25 m of the finished path back onto
+the old one with a smootherstep blend. It had to run on the dense samples rather than on the waypoints,
+because the reparameterization refits the spline and resamples it up to twenty times, and its first
 tangent drifts a little on every sweep: measured on a real re-plan, a start that was straight along the
-old path came out **100 deg off it**, which is a fold recreated by the stage that was supposed to remove
-it. On the samples the fitted path is actually built from, the drift cannot undo the pin.
+old path came out **100 deg off it**, a fold recreated by the stage that was supposed to remove it. The
+B-spline removes the need for that stage entirely - the first control points *are* the state - and the
+pin, `_pin_anchor`, is gone.
 
 Level 2, seeds 0-39:
 
@@ -353,7 +356,7 @@ resampled back onto the input spacing so nothing downstream changes.
 | `_smooth_path` | 50.0 ms | **1.0 ms** | 13 % |
 | `_avoid_obstacles` | 3.8 ms | **3.6 ms** | **48 %** |
 | `_connect_blocks` (A*) | 1.6 ms | **1.5 ms** | **20 %** |
-| `_to_arc_path` | 0.8 ms | **0.7 ms** | 9 % |
+| `_to_arc_path` (now `_to_bspline_path`) | 0.8 ms | **0.7 ms** | 9 % |
 | everything else | 0.7 ms | 0.7 ms | 9 % |
 | **total** | **55.8 ms** | **7.5 ms** | |
 
@@ -438,8 +441,9 @@ ESDF, fast-restarting L-BFGS, and no requirement for a collision-free initialisa
 1. `control/bspline_path.py`: `BsplinePath`, uniform cubic, clamped ends, implementing the `ArcPath`
    duck type (`length`, `pos`, `tangent`, `curvature`, `closest` with the monotone `window`
    contract). `length` stays arc-length based, so the MPCC progress code is unchanged.
-2. `PathPlanner` returns a `BsplinePath` behind `PathConfig.path_kind = "bspline"`. The existing
-   spline stays the default until the branch proves itself.
+2. `PathPlanner` returns a `BsplinePath`, and it is the only representation left: the natural cubic
+   spline, its arc-length reparameterization and the anchor pin that went with them were deleted once
+   the B-spline replaced them.
 3. `PathPlanner.repair(path, obs, theta)`:
    - window = control points covering `[theta - 0.2, theta + repair_window]` (`repair_window` ~3 m),
    - free variables = the control points in that window, everything else pinned,
