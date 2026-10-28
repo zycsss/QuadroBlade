@@ -139,7 +139,10 @@ class PathConfig:
     smooth_stride: int = 4
     smoothing_margin: float = 1.25
     enforce_clearance: bool = True
-    anchor_window: float = 0.25
+    # Measured: trimming the first passage removes the anchor fold, 85 of 574 plans down to 2,
+    # but costs three successes out of 20, because the straight approach is what centres the drone
+    # through the opening. Left off; the fold is cheaper to avoid by not re-planning in a passage.
+    trim_first_passage: bool = False
     gate_straight_length: float = 0.275
     gate_straight_blend: float = 0.25
     gate_frame_clearance: float = 0.55
@@ -434,6 +437,8 @@ class PathPlanner:
         start = np.asarray(start_pos, dtype=float).reshape(3)
         blocks = self._gate_blocks(start, pass_pos, pass_normals, obstacles, climb=climb)
         blocks = self._insert_detours(blocks, pass_pos, pass_normals, pass_y_axes, pass_z_axes)
+        if not climb and self.config.trim_first_passage:
+            blocks = self._trim_first_passage(blocks, pass_normals)
         runout = self._runout(blocks, pass_pos, pass_normals)
         if self.config.use_astar and len(obstacles):
             waypoints = self._connect_blocks(blocks, runout, obstacles, gate_pos, frames.y_axes)
@@ -1072,6 +1077,37 @@ class PathPlanner:
             span = np.maximum(np.linalg.norm(direction, axis=1, keepdims=True), 1e-9)
             pts[violation, :2] = anchors[nearest[violation]] + radius * direction / span
         return pts
+
+    def _trim_first_passage(
+        self, blocks: list[NDArray[np.floating]], pass_normals: NDArray[np.floating]
+    ) -> list[NDArray[np.floating]]:
+        """Drop the part of the first gate passage that lies behind the drone.
+
+        A passage block runs from ``approach_distance`` before the gate to beyond it. On a re-plan
+        the drone is often already *inside* that approach, so the block starts behind it and the
+        polyline turns 180 degrees within a few centimetres of the anchor: a cusp that the smoothing
+        polyline turns 180 degrees within a few centimetres of the anchor: a cusp the smoothing then
+        are still ahead removes the fold without changing where the path crosses the gate.
+
+        Args:
+            blocks: The waypoint blocks, ``blocks[0]`` the start and ``blocks[1]`` its anchor step.
+            pass_normals: Gate normals in passing order, shape ``(n_passes, 3)``.
+
+        Returns:
+            The blocks with the first passage trimmed to the part ahead of the start.
+        """
+        if len(blocks) < 3 or len(pass_normals) == 0:
+            return blocks
+        start = blocks[0][0]
+        normal = np.asarray(pass_normals[0], dtype=float)
+        passage = blocks[2]
+        ahead = (passage - start[None, :]) @ normal
+        keep = ahead >= -0.02
+        if keep.sum() >= 2:
+            trimmed = list(blocks)
+            trimmed[2] = passage[keep]
+            return trimmed
+        return blocks
 
     def _to_arc_path(self, waypoints: NDArray[np.floating]) -> ArcPath:
         """Fit and reparameterize the path, then hand it to an [ArcPath][...ArcPath]."""
