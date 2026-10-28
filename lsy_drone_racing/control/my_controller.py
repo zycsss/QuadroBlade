@@ -173,6 +173,15 @@ class MPCCConfig:
             A revealed gate can be up to 0.2 m away from its nominal pose, and the drone needs a
             moment to converge onto the corrected approach line before it reaches the gate.
         replan_slowdown_factor: Factor applied to the reference speed during that time.
+        replan_coalesce_ticks: Quiet period in control ticks before a pending reveal is planned for.
+            Reveals arrive in bursts, 36 percent of them within the previous re-plan's slowdown
+            window, and three paths in a quarter of a second buy nothing.
+        replan_max_defer_ticks: Hard cap on how long a pending reveal may wait, in control ticks. It
+            overrides both the quiet period and the passage deferral, so a reveal can never be
+            starved.
+        replan_defer_in_passage: Whether to hold a re-plan while the drone flies a gate passage.
+            Re-planning there puts the first block behind the drone, which folds the path back on
+            itself within centimetres of the anchor.
         name: Name of the acados model and of the generated code.
     """
 
@@ -211,6 +220,12 @@ class MPCCConfig:
     mass_adapt_min_balance: float = 1.0
     mass_adapt_max_speed: float = 1.5
     replan_slowdown_time: float = 0.8
+    # Measured on level 2: any deferral loses the marginal cases. Debouncing by three ticks (0.06 s)
+    # dropped the 20-seed screen from 17/20 to 9/20, because the first-leg reveals already have no
+    # slack to give. Left at immediate re-plan; see the planning page for the numbers.
+    replan_coalesce_ticks: int = 0
+    replan_max_defer_ticks: int = 0
+    replan_defer_in_passage: bool = False
     replan_slowdown_factor: float = 0.5
     name: str = "mpcc_racing"
 
@@ -582,6 +597,10 @@ class MPCCController(Controller):
         self._slowdown_until = 0
         self.replans = 0
         self.plan_log: list[dict[str, object]] = []
+        # Reveals waiting to be planned for, and when the first and latest of them arrived.
+        self._pending: list[str] = []
+        self._pending_since = 0
+        self._pending_tick = 0
         self._last_v_ref = 0.0
         self._last_f_col = self._hover_thrust
         self._last_f_cmd = self._hover_thrust
@@ -753,6 +772,49 @@ class MPCCController(Controller):
             if shift > 1e-6:
                 changes.append(f"pole {pole_id} moved {shift * 100:.1f} cm")
         return changes
+
+    def _replan_due(self, obs: dict[str, NDArray[np.floating]]) -> bool:
+        """Return whether the pending track information should be turned into a new path now.
+
+        Three things hold a re-plan back, and a hard cap overrides all of them:
+
+        * a quiet period, so a burst of reveals near the same place produces one path, not three;
+        * being inside a gate passage, where re-planning puts the first block behind the drone and
+          folds the path back on itself — that cusp is what the smoothing then has to eat;
+        * nothing pending at all.
+
+        Args:
+            obs: The current observation.
+
+        Returns:
+            ``True`` if the pending changes should be planned for now.
+        """
+        if not self._pending:
+            return False
+        waited = self._tick - self._pending_since
+        if waited >= self._mpcc.replan_max_defer_ticks:
+            return True
+        if self._tick - self._pending_tick < self._mpcc.replan_coalesce_ticks:
+            return False
+        if self._mpcc.replan_defer_in_passage and self._in_passage(obs):
+            return False
+        return True
+
+    def _in_passage(self, obs: dict[str, NDArray[np.floating]]) -> bool:
+        """Return whether the drone is close enough to the next gate to be flying its passage.
+
+        Args:
+            obs: The current observation.
+
+        Returns:
+            ``True`` while the drone is within twice the straight passage length of the next gate.
+        """
+        if len(self._gate_centers) == 0:
+            return False
+        here = np.asarray(obs["pos"], dtype=float)[:2]
+        next_gate = np.asarray(self._gate_centers, dtype=float)[0, :2]
+        radius = 2.0 * float(self._planner.config.gate_straight_length)
+        return bool(np.linalg.norm(here - next_gate) < radius)
 
     def _replan(self, obs: dict[str, NDArray[np.floating]], reason: str = "sensor update"):
         """Re-plan the path from where the drone is, through the passes that are still to come.
@@ -1018,7 +1080,17 @@ class MPCCController(Controller):
         self._update_mass_estimate(obs)
         changes = self._track_info_changed(obs)
         if changes:
-            self._replan(obs, ", ".join(changes))
+            # Collect rather than act immediately: a reveal often arrives in a burst, and a re-plan
+            # inside a gate passage folds the path back towards the approach the drone has already
+            # flown through. Both are handled by waiting for a quiet tick outside a passage.
+            if not self._pending:
+                self._pending_since = self._tick
+            self._pending.extend(changes)
+            self._pending_tick = self._tick
+        if self._replan_due(obs):
+            reason = ", ".join(dict.fromkeys(self._pending))
+            self._pending = []
+            self._replan(obs, reason)
         theta = self._progress(pos)
         speed = self._reference_speed(theta, float(np.linalg.norm(np.asarray(obs["vel"], float))))
         self._last_v_ref = float(speed)
