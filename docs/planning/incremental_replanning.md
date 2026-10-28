@@ -156,6 +156,61 @@ unchanged: 2/2 at 8.52 s and 2/2 at 8.50 s.
   ring while flying past a gate, and seed 9 still strikes pole 0 on the take-off leg. Seed 33 is the
   pole case that the weight change did not save.
 
+## Measured: the B-spline trajectory, and the geometry relaxation (branch `seeded-replan`)
+
+The path was a natural cubic spline in arc length, so the drone's state entered it only as a position
+(the anchor) and a direction (a pin onto the old tangent). Two things followed, both visible in the
+figures: the plan could contain curvature no speed can fly - the 0.19 m hairpin around pole 3 in seed
+8, which needs 12 m/s² at 1.5 m/s - and the controller could only answer by cutting the corner.
+
+`control/bspline_path.py` replaces that with a **clamped cubic B-spline in time**, following
+Fast-Planner (Zhou et al., RA-L 2019):
+
+- velocity and acceleration are B-splines of the same control points, `v_i = (Q_{i+1} - Q_i)/dt` and
+  `a_i = (Q_{i+2} - 2Q_{i+1} + Q_i)/dt²`, so the convex hull property turns the dynamic limits into
+  bounds on control points;
+- the first three control points **are** the drone's state, `Q_0 = p`, `Q_1 = p + v dt/3`,
+  `Q_2 = p + 2v dt/3 + a dt²/6`, so the plan starts with the measured velocity and acceleration
+  instead of an approximation of the old path's tangent - this is what `PathSeed.velocity` and
+  `.acceleration` now carry, taken from the observation and a finite difference of it;
+- `retime` stretches the knot spacing until the speed and acceleration bounds hold, which is the
+  cheapest form of Fast-Planner's time adjustment (Sec. V).
+
+The controller is unchanged: `BsplinePath` implements the `ArcPath` duck type (`length`, `pos`,
+`tangent`, `curvature`, `closest`), with an arc-length table so `theta` stays a length in metres.
+
+Level 2, seeds 0-39, same machine and session:
+
+| | arc path | **B-spline** |
+| --- | --- | --- |
+| success | 31/40 | **32/40** |
+| mean lap time | 8.88 s | 8.86 s |
+| worst turn, mean | 52.9 deg | **52.7 deg** |
+| worst turn in the first 0.35 m, mean | 40.2 deg | **38.0 deg** |
+| turns > 120 deg | 1 in 302 | 1 in 301 |
+
+A wash on success, one degree better at the anchor, and it is the representation the next step needs
+(local support for repair, dynamic limits at plan time).
+
+**The geometry relaxation is implemented and measured but left off** (`bspline_relax_iters = 0`).
+`relax_control_points` minimises the curvature energy of the control polygon with a fidelity term
+onto the fitted polyline, projects control points out of every pole's clearance sphere, and locks the
+points within 0.3 m of a gate centre. With 150 iterations the geometry improves a lot and the lap
+gets *faster*:
+
+| 150 relaxation steps | off | on |
+| --- | --- | --- |
+| success | **32/40** | 29/40 |
+| mean lap time | 8.86 s | **8.45 s** |
+| worst turn, mean | 52.7 deg | **37.8 deg** |
+| worst turn in the first 0.35 m, mean | 38.0 deg | **25.7 deg** |
+| turns > 90 deg | 4 in 301 | **2 in 293** |
+
+It is 0.4 s a lap quicker and much smoother, and it loses three finishes: the new failures are gate
+passes (6, 11, 28, 33, 34, 36, 39) and two early take-off contacts (30, and 8 at 2.5 s), i.e. the
+relaxation pulls the curve off the passages and distorts the first metres after the anchor. It needs
+a wider passage lock and a stronger fidelity term before it can be adopted; the knobs are in place.
+
 ## The numbers to build on
 
 All measured, see `docs/control/characterisation.md` and the failure analysis.
