@@ -19,6 +19,84 @@ Merged into `main` from `A-star-mpcc`:
   `utils/characterization.py`, `scripts/characterize.py`, `docs/control/characterisation.md`).
 
 Measured baseline on `config/level2.toml`, seeds 0-19: **13/20 finished, mean 8.17 s**.
+Re-measured at `caa8855`, the branch point of `seeded-replan`, on this machine: **14/20 at 8.99 s** on
+seeds 0-19, **27/40 at 9.03 s** on seeds 0-39. The 13/20 is the pre-`clearance-fix` number.
+
+## Measured: the seeded re-plan (branch `seeded-replan`)
+
+The complaint this answers is that committed paths are not smooth and sometimes go backwards then come
+back. It is the same complaint `fdc43c0` diagnosed and left unfixed, and the numbers below are that
+diagnosis made quantitative: on the 200 samples of every plan the controller logs, **27 % of re-plans
+turned by more than 120 deg in one 6 cm step, 42 % by more than 90 deg, and 133 deg of the mean worst
+turn sat inside the first 0.35 m** — at the anchor.
+
+The cause is that a re-plan was anchored where the drone happened to be and then stepped *toward the
+next gate*. Two consequences: the first block of the first gate passage is laid `approach_distance` =
+0.6 m before the gate, so a drone that is already 0.3 m into that approach gets a block *behind* it
+and the polyline reverses within centimetres of the start; and the leaving direction is the direction
+to the gate, not the direction the drone is flying, so a drone that is turning can be asked to turn
+back.
+
+The re-plan is now seeded (`PathSeed`, `PathPlanner.plan(seed=...)`):
+
+1. the anchor is the projection of the *predicted* pose (`pos + vel / freq`) onto the **old path**, so
+   the new path starts on the old one rather than beside it;
+2. it leaves along the old path's **tangent**, not toward the next gate;
+3. the part of the first passage behind the seed step is dropped, and the seed step is clamped so it
+   never overshoots that passage (`PathConfig.trim_seeded_passage`);
+4. `_pin_anchor` puts the first 0.25 m of the *finished* path back onto the old path, with a smootherstep
+   blend, because the smoothing, the gate straightening and the clearance pass each drag the start a
+   few centimetres away — that is how the fold survived every earlier attempt.
+
+The pin has to run on the dense samples, not on the waypoints (`_to_arc_path`, not `plan`). The
+arc-length reparameterization refits a natural cubic and resamples it up to twenty times, and its first
+tangent drifts a little on every sweep: measured on a real re-plan, a start that was straight along the
+old path came out **100 deg off it**, which is a fold recreated by the stage that was supposed to remove
+it. On the samples the fitted path is actually built from, the drift cannot undo the pin.
+
+Level 2, seeds 0-39:
+
+| | before | after |
+| --- | --- | --- |
+| turns > 120 deg | 75 in 275 re-plans (27 %) | **4 in 285 (1.4 %)** |
+| turns > 90 deg | 115 in 275 (42 %) | **6 in 285 (2.1 %)** |
+| worst turn, mean | 149.5 deg | **57.6 deg** |
+| worst turn in the first 0.35 m, mean | 133.1 deg | **40.5 deg** |
+| success | 27/40 | 26/40 |
+| mean lap time | 9.03 s | **8.71 s** |
+
+So the geometry was not bought with pace: one seed in forty is inside the noise of a 40-seed binomial
+(sd ~ 3.5 seeds) and the lap is 3.5 % faster. The failures change identity — the t ~ 1.3 s pole strikes
+(seeds 9, 12, 14, 27) are gone, while seeds 7, 8, 28, 29, 31, 32, 38, 39 now end later, most of them on
+a gate frame.
+
+Two variants were measured, and the difference between them is the pin's target. Following the **old
+path** (what the code does now) gives 26/40 at 8.71 s and the numbers above; following the **straight
+tangent** gives 27/40 at 8.75 s with 4 folds in 289, worst turn 60.6 deg and anchor turn 42.9 deg. One
+seed and one degree apart, so the old path is kept: it is the literal reading of "the new path starts
+from the old path", and it inherits the old path's curvature at the anchor instead of a straight line's.
+
+The trim is what buys the geometry. With `trim_seeded_passage = False` (pin only) the 20-seed screen is
+**11/20 with 46 folds**, worse than the baseline on both axes: the untrimmed passage still folds, and
+the pin only covers the first 0.25 m of it.
+
+**What is left, in order:**
+
+- **The remaining 4 folds** are all the case where the drone is already past the gate plane when the
+  reveal arrives. The trim has to keep one approach sample or the gate would never be crossed, and that
+  sample is behind the anchor. This needs the gate pass re-planned, not the anchor.
+- **The 30-70 deg turns that remain at 0.25 m are not folds**: they are the correction biting where the
+  pin lets go. Softening them means a longer `anchor_pin_length` (later correction) or a real
+  trajectory optimisation, not a better anchor.
+- **Mid-path reversals are untouched.** 3 of the 40 seeds still contain a 160-173 deg corner *between*
+  two passages. That is the inter-gate turnaround the track asks for (order 1,2,3,4,2, gates facing
+  different ways), and the fix is the fillet of radius `v^2 / a_lat` at the block join that `fdc43c0`
+  already identified as belonging with the B-spline path, not an anchor fix.
+- **The trim costs gate centring**, which is why the failures that remain are mostly `HIT_GATE`. A
+  reveal at 0.7 m asks for a 0.21 m lateral correction that the drone needs 0.46 s to make, and a path
+  that starts at the drone spends the first 0.3 m of that budget doing nothing. Shortening the deferral
+  (`replan_defer_in_passage`) or capping the approach speed in front of an unrevealed gate (P1.3 below)
+  attacks the same term from the information side.
 
 ## The numbers to build on
 
