@@ -98,6 +98,64 @@ the pin only covers the first 0.25 m of it.
   (`replan_defer_in_passage`) or capping the approach speed in front of an unrevealed gate (P1.3 below)
   attacks the same term from the information side.
 
+## Measured: the failure classes, one by one (branch `seeded-replan`)
+
+The 14 failures of the 40-seed screen were classified from their logs, at the **true** poses, because
+the verdict itself is computed against the nominal ones (`classify` in `scripts/debug_run.py` names the
+wrong object in 4 of the 14). The split:
+
+| class | seeds | cause |
+| --- | --- | --- |
+| gate frame of a gate already passed | 7, 11, 17, 28, 29, 38, 39 | `_avoid_gate_frames` only ever saw the remaining passes |
+| gate frame, tangential graze | 32 | the same stage only reacted to plane *crossings* |
+| gate frame, pass completed on the same tick | 17 | the re-plan still contained the pass being flown |
+| pole strike, drone 6-9 cm inside the plan | 6, 8, 9, 33 | contouring weight at a pole was half the gate weight |
+| gate pass 0.14 m off centre, plan 0.08 s old | 13, 31 | the reveal lands at 0.7 m, the correction needs 0.46 s |
+
+Four fixes, in that order:
+
+1. **Every gate of the track is given to the frame-avoidance stage**, with the number of legitimate
+   crossings per gate (`PathPlanner.plan` builds `crossing_count` from the remaining sequence). A gate
+   the drone has already flown through is still a solid ring, and on a track that doubles back the
+   route to the next gate crosses its plane - through the opening, because A* only models the posts.
+2. **The test is a slab around the gate plane**, not a sign change (`gate_frame_slab` = 0.13 m), so a
+   path that comes close and turns away is caught too. The push is capped at `gate_frame_step` = 0.15 m
+   per pass over five passes, because clearing 0.5 m in one go left a kink where its taper ended, and
+   the samples of the gate's own passage plus the first 0.3 m (the drone's own position) are protected.
+3. **A pass the drone is completing is not re-flown** (`_completed_pass`): if the anchor is at or just
+   past the first pass's plane, inside the opening and heading through it, the trim does not force a
+   crossing (`crossing_required=False`). Forcing one is what made seed 17 reverse through the gate it
+   had just left.
+4. **The approach to a gate that is not yet seen is capped at 1.5 m/s** (`reveal_speed`,
+   `reveal_window` = 1.2 m, held for `reveal_hold_time` = 0.5 s after a correction), and **the pole
+   contouring weight is raised from 0.2 to 0.4**, matching the gate weight: a pole is a hard obstacle,
+   not a corner to cut. The cap is disabled on a track without pose randomisation, where there is
+   nothing to correct.
+
+Level 2, seeds 0-39, same machine and session:
+
+| | before | after |
+| --- | --- | --- |
+| success | 26/40 (65 %) | **31/40 (78 %)** |
+| mean lap time | 8.71 s | 8.88 s |
+| turns > 120 deg | 4 in 285 re-plans | **1 in 302** |
+| turns > 90 deg | 6 in 285 | **3 in 302** |
+| worst turn, mean | 57.6 deg | **52.9 deg** |
+| worst turn in the first 0.35 m, mean | 40.5 deg | **40.2 deg** |
+
+Five more finishes for 2 % of lap time, and the geometry does not regress. Level 0 and level 1 are
+unchanged: 2/2 at 8.52 s and 2/2 at 8.50 s.
+
+**What is left, all with the same signature - a gate pass 0.15-0.28 m off centre:**
+
+- seeds 13, 29, 31, 39 fail at gate 2 with the plan crossing dead centre and the drone 0.11-0.16 m off
+  it. The reveal arrives at 0.7 m and the 0.46 s correction is the whole distance left; even capped at
+  1.5 m/s the drone reaches the plane before it has converged. This wants the correction to start
+  earlier (`P1.2` uncertainty inflation), not another path tweak.
+- seeds 4, 7, 8 clip a frame 0.28-0.38 m outside the opening, i.e. clipping the *outer* part of the
+  ring while flying past a gate, and seed 9 still strikes pole 0 on the take-off leg. Seed 33 is the
+  pole case that the weight change did not save.
+
 ## The numbers to build on
 
 All measured, see `docs/control/characterisation.md` and the failure analysis.
