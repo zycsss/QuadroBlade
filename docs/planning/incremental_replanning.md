@@ -275,6 +275,47 @@ Two knobs were removed while measuring this. `gate_correction_hold_time` and `re
 existed only to hold the approach cap after a gate correction; the 35/40 configuration runs with the
 cap off, so they are gone and `reveal_hold_time` carries its measured default of 0.0 s.
 
+## Measured: what A* and the polyline stages are worth
+
+The planner has three switches (`PathConfig.use_astar`, `use_push_out`, `use_smoothing`) so the
+question "can the B-spline connect the gate waypoints on its own?" can be answered rather than
+argued. Seeds 0-19, level 2, baseline 17/20 at 7.58 s:
+
+| configuration | success | mean lap | note |
+| --- | --- | --- | --- |
+| baseline: A* + push-out + smoothing | **17/20** | **7.58 s** | |
+| no A* | 13/20 | 8.28 s | straight chords pass poles; the local push-out bends the line late, which is the kink A* was introduced to avoid |
+| no A*, no push-out, no smoothing ("only the B-spline") | 0/20 | - | the fit does not visit the gates: see below |
+| no smoothing (A* + push-out kept) | 17/20 | 7.58 s | the fit and the relaxation round the corners on their own |
+
+The geometry of one plan (the seed-0 opening plan, measured directly, not through the simulator):
+
+| configuration | waypoints | polyline | spline | max turn | pole clearance |
+| --- | --- | --- | --- | --- | --- |
+| baseline | 1500 | 11.03 m | 10.89 m | 3.8 deg | 0.149 m |
+| no A* | 1500 | 11.04 m | 10.89 m | 4.1 deg | 0.147 m |
+| only the B-spline | 24 | 10.77 m | **7.85 m** | 4.8 deg | 0.143 m |
+| no push-out | 26 | 5.16 m | 381 m | 170 deg | 0.036 m |
+
+Two things follow, and they are the answer to "can the spline be the only connector":
+
+* **The fit is not a connector.** Fitted with well-conditioned settings (six control points for 24
+  waypoints) it *shortcuts* the polyline - 7.85 m of spline through a 10.77 m waypoint line - so the
+  passages it should fly through are cut off. With more control points it diverges: one control point
+  per sample makes the least-squares problem square and degenerate, and the same plan came out as a
+  **1.5e10 m** spline. The code now requires at least four samples per control point
+  (`n_control <= len(waypoints) // 4`), which is inert for the normal path (169 control points against
+  375 allowed) and is what keeps a sparse input conditioned.
+* **The relaxation is not a clearance solver.** With the push-out off - so the pole projection inside
+  `relax_control_points` is the only thing keeping the curve clear - the same plan diverges to 381 m
+  with 4 turns over 90 deg and 3.6 cm of clearance. The projection is a local repair on top of a clear
+  polyline; it cannot create one.
+
+So A* is worth four finishes, and the polyline stages are what make the fit well posed. The one stage
+that could go is the smoothing - the B-spline and its relaxation already round the corners - and it is
+a clean removal (17/20 at 7.58 s on these seeds). **What cannot go is the dense, pole-clear polyline
+that A* and the push-out produce.**
+
 ## The numbers to build on
 
 All measured, see `docs/control/characterisation.md` and the failure analysis.

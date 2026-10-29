@@ -94,6 +94,12 @@ class PathConfig:
             after each pass and the loop stops as soon as the required clearance is achieved.
         length_growth_max: Maximum factor by which obstacle avoidance may lengthen the path before
             it is rejected. A rejected pass keeps the previous, shorter path.
+        use_push_out: Whether to push the waypoint line out of an obstacle it crosses
+            (`_avoid_obstacles`). Off, the B-spline relaxation is the only thing keeping the curve
+        use_push_out: Whether to push the waypoint line out of an obstacle it crosses
+            means.
+        use_smoothing: Whether to round the polyline with the Laplacian pass (`_smooth_path`). Off,
+            the corners between chords stay sharp and the B-spline relaxation has to round them.
         use_astar: Whether to decide the route around the obstacles with a grid A* search. When
             enabled, every chord between two gate passages that violates the clearance is replaced
             by the shortest clearance-keeping route found on a rasterized top view of the track, so
@@ -180,6 +186,8 @@ class PathConfig:
     obstacle_iter_max: int = 2
     length_growth_max: float = 1.25
     use_astar: bool = True
+    use_push_out: bool = True
+    use_smoothing: bool = True
     astar_resolution: float = 0.05
     astar_frame_margin: float = 0.02
     astar_bounds: tuple[tuple[float, float], tuple[float, float]] = ((-2.45, -1.45), (2.45, 1.45))
@@ -584,8 +592,10 @@ class PathPlanner:
             waypoints = self._connect_blocks(blocks, runout, obstacles, gate_pos, frames.y_axes)
         else:
             waypoints = np.concatenate([np.concatenate(blocks, axis=0), runout])
-        waypoints = self._avoid_obstacles(waypoints, obstacles)
-        waypoints = self._smooth_path(waypoints, obstacles)
+        if self.config.use_push_out:
+            waypoints = self._avoid_obstacles(waypoints, obstacles)
+        if self.config.use_smoothing:
+            waypoints = self._smooth_path(waypoints, obstacles)
         waypoints = self._straighten_gate_passages(waypoints, pass_pos, pass_normals)
         # Every gate of the track, not only the remaining passes: a gate the drone has already flown
         # through is still a solid ring, and on a track that doubles back the route to the next gate
@@ -1291,6 +1301,7 @@ class PathPlanner:
         xy = obstacle[:2] + distance * direction
         return np.array([xy[0], xy[1], 0.5 * (entry[2] + exit_[2])])
 
+
     def _create_spline(self, waypoints: NDArray[np.floating], duration: float) -> CubicSpline:
         """Fit a cubic spline through the waypoints, parameterized by chord length."""
         pts = np.asarray(waypoints, dtype=float).reshape(-1, 3)
@@ -1434,7 +1445,15 @@ class PathPlanner:
         cfg = self.config
         points = np.asarray(waypoints, dtype=float).reshape(-1, 3)
         length = float(np.sum(np.linalg.norm(np.diff(points, axis=0), axis=1)))
-        n_control = max(DEGREE + 4, int(round(length / max(cfg.bspline_spacing, 1e-3))) + 4)
+        # One control point per ``bspline_spacing`` of arc, but at least four samples per control
+        # point: the fit is least squares, and when the control points approach the sample count it
+        # becomes square and degenerate and the minimum-norm solution diverges. Measured on a
+        # sparsely sampled polyline (135 samples), one control point per sample produced a 1.5e10 m
+        # spline from a 10.7 m line.
+        n_control = max(
+            DEGREE + 4,
+            min(int(round(length / max(cfg.bspline_spacing, 1e-3))) + 4, len(points) // 4),
+        )
         time_step = max(cfg.bspline_spacing / max(cfg.bspline_speed, 1e-3), 1e-3)
         control = fit_control_points(points, n_control, time_step)
         if seed is None:
@@ -1496,7 +1515,8 @@ def _pass_arcs(
     centres = np.asarray(pass_pos, dtype=float).reshape(-1, 3)
     if not len(centres):
         return np.zeros(0)
-    samples = max(200, int(path.length / 0.01))
+    # A pathological path (a diverged fit) must not try to allocate ten billion samples.
+    samples = int(np.clip(path.length / 0.01, 200, 20000))
     grid = np.linspace(0.0, path.length, samples)
     points = np.asarray(path.pos(grid), dtype=float).reshape(-1, 3)
     arcs = np.zeros(len(centres))
