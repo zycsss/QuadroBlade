@@ -1,8 +1,9 @@
-"""Unit tests for the gate-passage tunnel: the barrier, the funnel and the frame.
+"""Unit tests for the gate-passage tunnel: the barrier, the funnel, the frame and the schedule.
 
-A wrong sign or a wrong frame in the tunnel makes the barrier push the drone *out* of the opening
-instead of in, and the run still looks like a normal flight until it clips a gate. These tests pin
-the formula, the funnel and the frame.
+A wrong sign or a wrong frame makes the barrier push the drone *out* of the opening instead of in,
+a wrong arc length puts the funnel somewhere the drone is not, and either way the run still looks
+like a normal flight until it clips a gate. These tests pin the formula, the funnel, the frame, and
+the arc lengths that place it.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation as R
 
+from lsy_drone_racing.control.bspline_path import BsplinePath, fit_control_points
 from lsy_drone_racing.control.my_controller import (
     MAX_TUNNEL,
     TUNNEL_ALPHA,
@@ -20,6 +22,7 @@ from lsy_drone_racing.control.my_controller import (
     MPCCController,
     tunnel_barrier,
 )
+from lsy_drone_racing.control.path_planning import _pass_arcs
 
 
 def barrier(slack: np.ndarray | list) -> float:
@@ -170,3 +173,68 @@ def test_frames_use_gate_ids_and_fall_back_to_the_nearest_pose():
     _, normals_fallback, lateral_fallback, _ = fallback._pass_frames(obs)
     np.testing.assert_allclose(normals_fallback[0], expected[:, 0], atol=1e-9)
     np.testing.assert_allclose(lateral_fallback[0], expected[:, 1], atol=1e-9)
+
+
+@pytest.mark.unit
+def test_pass_arcs_pick_the_crossing_inside_the_opening():
+    """A plane crossed twice must be reported at the crossing that goes through the opening.
+
+    This is the bug that made the tunnel inert: the arc length of the next pass was a nearest-point
+    lookup, and on this track the nearest point to a gate can be metres from the passage.
+    Here the path crosses ``x = 1`` twice, once through the opening and once a metre to the side.
+    """
+    polyline = np.array(
+        [[0.0, 0.0, 1.0], [1.5, 0.0, 1.0], [1.5, 1.2, 1.0], [0.4, 1.2, 1.0], [0.4, 2.0, 1.0]]
+    )
+    dense = np.concatenate(
+        [np.linspace(polyline[i], polyline[i + 1], 60) for i in range(len(polyline) - 1)]
+    )
+    path = BsplinePath(fit_control_points(dense, 40, 0.05), 0.05)
+    centre = np.array([[1.0, 0.0, 1.0]])
+    normal = np.array([[1.0, 0.0, 0.0]])
+    arcs = _pass_arcs(path, centre, normal)
+    crossing = path.pos(np.array([arcs[0]]))[0]
+    np.testing.assert_allclose(crossing[0], 1.0, atol=0.02)
+    # The first crossing is the one through the opening, at y ~ 0; the second is a metre out.
+    np.testing.assert_allclose(crossing[1], 0.0, atol=0.15)
+
+
+@pytest.mark.unit
+def test_pass_arcs_are_monotone():
+    """Passes are visited in order, so their crossing arc lengths must be non-decreasing."""
+    polyline = np.array([[0.0, 0.0, 1.0], [1.0, 0.2, 1.0], [2.0, -0.2, 1.0], [3.0, 0.1, 1.0]])
+    dense = np.concatenate(
+        [np.linspace(polyline[i], polyline[i + 1], 60) for i in range(len(polyline) - 1)]
+    )
+    path = BsplinePath(fit_control_points(dense, 40, 0.05), 0.05)
+    centres = np.array([[1.0, 0.2, 1.0], [2.0, -0.2, 1.0]])
+    normals = np.tile([1.0, 0.0, 0.0], (2, 1))
+    arcs = _pass_arcs(path, centres, normals)
+    assert arcs[0] < arcs[1]
+    assert arcs[0] >= 0.0
+
+
+@pytest.mark.unit
+def test_speed_weight_is_independent_of_the_contour_weight():
+    """With the gate contour weight off, the speed law must still see a bump at the gate.
+
+    This coupling is what made the earlier tunnel experiments meaningless: the throttle was
+    multiplied by the same proximity weight the contour cost used, so turning the gate contour term
+    off also disabled the slowdown.
+    """
+    from lsy_drone_racing.control.path_planning import proximity_weight
+
+    centre = np.array([[0.0, 0.0, 1.0]])
+    at_gate = proximity_weight(centre, centre, 0.4)
+    np.testing.assert_allclose(at_gate[0], 0.4)
+    assert proximity_weight(centre, None, 0.4)[0] == 0.0
+    np.testing.assert_allclose(proximity_weight(centre, centre, 0.0)[0], 0.0)
+
+
+@pytest.mark.unit
+def test_tunnel_geometry_does_not_invalidate_the_solver():
+    """Tunnel half width and window only reach the controller, so they are not OCP fields."""
+    from lsy_drone_racing.control.my_controller import _OCP_FIELDS
+
+    for name in ("tunnel_gate_half_width", "tunnel_nominal_half_width", "tunnel_window"):
+        assert name not in _OCP_FIELDS

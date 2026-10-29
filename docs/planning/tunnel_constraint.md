@@ -57,10 +57,69 @@ guarantee" is not what is actually flying — it is a very steep cost, and we de
 | polynomial residual dynamics | **left** | it models aerodynamic effects identified from *real flight data*; level 2 is simulated, and the mismatch we do have (mass, inertia) is already handled by the online mass estimate |
 | terminal set, recursive feasibility | **left** | it needs an offline *periodic feasible* trajectory through the gates; our reference is re-planned at every reveal, so a fixed terminal set does not survive a re-plan |
 
-## Measured: it does not pay on this track
+## Debugging: the first explanation was wrong, and so was the experiment
 
-Seeds 0-19 are the fast screen used throughout the planning pages. The baseline is the configuration
-this page started from - gate Gaussian, gate throttle, no tunnel - at **17/20 and 7.58 s**.
+The first measurement said the tunnel lost three finishes and concluded that the gate throttle was
+also protecting the poles. **That comparison was invalid.** The speed law and the contour cost read the
+same proximity weight (`_reference_speed` had `mu / (2 (w_speed_gate * weight + r))`, and `_reference`
+passed `gate_weight = 0` whenever the tunnel was on), so switching the tunnel on silently killed the
+gate throttle. The cell the paper's formulation needs - *low gate contour weight, approach speed
+unchanged* - could not be run at all, and every cell in the old table had the throttle dead.
+
+Two more defects came out of the debugging, both of them mine:
+
+1. **The funnel was placed at the wrong arc length.** `_gate_arc` was the *nearest point of the path to
+   a gate centre* (`path.closest`). On this track the nearest point to the next gate can be metres from
+   the passage: measured on a seed-4 re-plan, the next gate's arc came out at **8.36 m on a 9.39 m
+   path** while the drone was already **0.41 m from that gate's plane**. The tunnel was therefore
+   switched off exactly where it had to act - the audit showed a progress gap of 2.5-3.6 m and a slack
+   of the inactive sentinel at the tick of every failure. The fix is `PathInfo.pass_arcs`: for each
+   pass in order, the first crossing of its plane *inside the opening* (the path crosses some planes
+   twice - flying past, then through - so a bare sign change is not enough).
+2. **The tunnel's corridor was narrower than the controller's tracking error.** 0.09 m half width
+   against a measured 0.04 m mean and 0.10-0.11 m p95 tracking error.
+
+With the activation fixed, the tunnel binds - 52 % of ticks on a finishing seed, all five crossings
+constrained - and the honest grid at seeds 0-19 is:
+
+| configuration | success | mean lap |
+| --- | --- | --- |
+| baseline: gate Gaussian + throttle, no tunnel | **17/20** | **7.58 s** |
+| tunnel `w=300`, corridor 0.09 m | 8/20 | 8.23 s |
+| tunnel `w=30`, corridor 0.09 m | 12/20 | 8.41 s |
+| tunnel `w=300`, corridor 0.13 m | 8/20 | 8.33 s |
+| tunnel `w=30`, corridor 0.13 m | 12/20 | 8.38 s |
+
+The pattern is the answer. Softening the barrier recovers four finishes (8 -> 12); **widening the
+corridor changes nothing** (8 -> 8, 12 -> 12). A tight corridor is a constraint the drone cannot meet -
+its tracking error is wider than the corridor - so the barrier fights for the whole approach and loses.
+A wide corridor is simply inert, and the cell then equals "the gate contour weight is gone", which is
+12/20. So the tunnel reaches at best the level of *not having a gate term at all*: on this track the
+gate accuracy comes from the quadratic contour weight acting over the whole approach, and a corridor
+that only exists near the plane cannot replace it.
+
+That is the opposite of the paper's result, and the reason is measurable: their drone holds a 0.09 m
+corridor at 80 km/h, ours has a tracking error half the corridor's width. The tunnel is not the wrong
+idea; it is a constraint that presupposes accuracy we do not have.
+
+## What we keep from it
+
+- **`PathInfo.pass_arcs`** (the fix above) is used by the approach speed cap as well as the tunnel, and
+  it is the correct way to ask "how far am I from the next gate". Unit tested on a path that crosses a
+  plane twice.
+- **The speed weight is decoupled** from the contour weight (`gate_speed_weight`), so the throttle can
+  be kept while the gate contour term is turned off. Without this the comparison above is impossible.
+- **The tunnel itself ships off** (`w_tunnel = 0.0`): fixed, tested, audited, and measurably worse. The
+  code path stays, because the next attempt should be aimed at the tracking error (a corridor is only
+  as useful as the accuracy it can demand), not at the constraint form.
+- `tunnel_gate_half_width`, `tunnel_nominal_half_width` and `tunnel_window` left `_OCP_FIELDS`: the cost
+  reads the width from the parameter vector, so a corridor experiment no longer costs a solver rebuild.
+
+## The earlier measurement, kept for the record
+
+Seeds 0-19, baseline **17/20 and 7.58 s**. Every row below has the gate throttle dead, because turning
+the tunnel on set `gate_weight = 0` and the speed law shared that weight - so the table conflates "no
+gate contour weight" with "no gate slowdown", and only the last two rows added something else.
 
 | configuration | success | mean lap |
 | --- | --- | --- |
@@ -69,22 +128,10 @@ this page started from - gate Gaussian, gate throttle, no tunnel - at **17/20 an
 | tunnel 100, kept | 15/20 | 8.34 s |
 | tunnel 300, kept | 16/20 | 8.21 s |
 | tunnel 1000, kept | 13/20 | 8.18 s |
-| tunnel 300, Gaussian and throttle **removed** (the paper's formulation) | 7/20 | 8.51 s |
+| tunnel 300, Gaussian and throttle **removed** | 7/20 | 8.51 s |
 | + pole barrier `w_obstacle=300`, radius 0.16 | 10/20 | 8.49 s |
 | + pole barrier 1000, radius 0.18 | 10/20 | 8.34 s |
 | + half the gate throttle back (`w_speed_gate=2`) | 10/20 | 8.49 s |
-
-The tunnel alone is not free: it fights the gate Gaussian (both try to place the drone at the gate,
-one by cost, one by constraint), which costs a finish and 0.6 s. Removing the Gaussian as well - the
-step that should unlock the speed - costs **ten** finishes. The reason is the track, not the
-formulation: the poles sit in the gate approaches, and the gate throttle doubles as pole protection.
-Removing it frees the drone to cut corners at the curvature limit, and the pole barrier only recovers
-three of the ten. The paper's track has no poles between gates, and its gate poses are known to the
-controller at all times, so both of the mechanisms that were doing the work here are absent there.
-
-The tunnel therefore ships **off** (`w_tunnel = 0.0`), measured, with the code path and the numbers in
-place. It is not a dead end: it is the right constraint for the gate, and what fails is the assumption
-that it can replace the slowdown while the poles are still only protected by that slowdown.
 
 ## What did come out of the paper
 

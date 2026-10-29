@@ -51,12 +51,14 @@ from scipy.spatial.transform import Rotation as R
 from lsy_drone_racing.control import Controller
 from lsy_drone_racing.control.path_planning import (
     GATE_PROXIMITY_WEIGHT,
+    OBSTACLE_PROXIMITY_WEIGHT,
     ArcPath,
     GateFrames,
     PathInfo,
     PathPlanner,
     PathSeed,
     path_config_from,
+    proximity_weight,
     track_reference,
 )
 
@@ -205,6 +207,10 @@ class MPCCConfig:
         mu_speed: Weight of the progress reward.
         r_vtheta: Quadratic regularization of the path progress rate.
         w_speed_gate: Proximity-dependent penalty on the path progress rate.
+        gate_speed_weight: Peak of the speed law's own proximity bump at a gate, independent of the
+            contour weight. Keeping it non-zero is what lets a controller lower the gate contour
+            weight (or hand the gate to a tunnel) without also losing the approach slowdown that the
+            revealed-pose correction depends on.
         v_min: Minimum reference path speed [m/s].
         v_max: Maximum reference path speed [m/s] and input bound on the progress rate.
         v_lead: Maximum speed [m/s] by which the path reference may run ahead of the drone. Without
@@ -286,6 +292,7 @@ class MPCCConfig:
     mu_speed: float = 10.0
     r_vtheta: float = 0.2
     w_speed_gate: float = 18.0
+    gate_speed_weight: float = GATE_PROXIMITY_WEIGHT
     v_min: float = 0.5
     v_max: float = 2.3
     v_lead: float = 0.6
@@ -376,9 +383,6 @@ _OCP_FIELDS = (
     "dt",
     "w_obstacle",
     "obstacle_radius",
-    "tunnel_gate_half_width",
-    "tunnel_nominal_half_width",
-    "tunnel_window",
     "contour_z_weight",
     "q_attitude",
     "r_rates",
@@ -790,6 +794,8 @@ class MPCCController(Controller):
         self._reset_mass_history()
         self._theta = 0.0
         self.min_slack = TUNNEL_OFF
+        self.gate_gap = float("nan")
+        self.plane_gap = float("nan")
         self._tunnel_warned = False
         self._tick = 0
         self._failures = 0
@@ -817,12 +823,21 @@ class MPCCController(Controller):
         self._gate_centers = info.gate_centers
         self._obstacles = info.obstacles
         self._draw_points = path.pos(np.linspace(0.0, path.length, 200))
-        # Arc length of every remaining gate pass on this path, for the approach speed cap: a gate
-        # that has not been seen yet may be up to 0.21 m away from the pose the plan aims at, and
-        # correction has to be paid for before the drone reaches it.
-        self._gate_arc = np.array(
-            [path.closest(centre, 0.0, window=(-0.15, path.length)) for centre in info.gate_centers]
-        )
+        # Arc length of every remaining gate pass on this path, for the tunnel funnel and the
+        # approach speed cap. The planner computes these as plane *crossings*: a nearest-point
+        # lookup put the next gate 8.36 m away on a 9.39 m path and left both mechanisms inert.
+        arcs = np.asarray(getattr(info, "pass_arcs", np.zeros(0)), dtype=float).reshape(-1)
+        if len(arcs) == len(info.gate_centers):
+            self._gate_arc = arcs
+        else:
+            # A path handed in without crossing arcs (the scenario controller) falls back to the
+            # nearest point, which is only used for its gates.
+            self._gate_arc = np.array(
+                [
+                    path.closest(centre, 0.0, window=(-0.15, path.length))
+                    for centre in info.gate_centers
+                ]
+            )
         self._build_speed_limit()
         self._apply_progress_bound()
 
@@ -1023,6 +1038,38 @@ class MPCCController(Controller):
             }
         )
 
+    def _gate_gaps(self, obs: dict[str, NDArray[np.floating]]) -> tuple[float, float]:
+        """Return the progress gap and the plane gap to the nearest remaining pass.
+
+        The tunnel narrows where the *path* crosses a gate, at ``_gate_arc``. If the drone crosses
+        the plane at a different progress - it cuts the corner, or the schedule is ahead of it - the
+        narrowest section of the funnel is never where the drone is, and the constraint is inert
+        exactly when it should bind. These two numbers say which of those happened.
+
+        Args:
+            obs: The current observation.
+
+        Returns:
+            ``min |theta - gate_arc|`` and ``min |(p - centre) . normal|`` over the remaining
+            passes, both in metres.
+        """
+        centres = np.asarray(self._gate_centers, dtype=float).reshape(-1, 3)
+        arcs = np.asarray(self._gate_arc, dtype=float).reshape(-1)
+        if not len(centres) or not len(arcs) or self._path is None:
+            return float("nan"), float("nan")
+        position = np.asarray(obs["pos"], dtype=float)
+        frames = GateFrames.from_quaternions(np.asarray(obs["gates_quat"], dtype=float))
+        ids = np.asarray(getattr(self._path_info, "gate_ids", np.zeros(0, dtype=int)), dtype=int)
+        if len(ids) == len(centres):
+            normals = frames.normals[np.clip(ids, 0, len(frames.normals) - 1)]
+        else:
+            observed = np.asarray(obs["gates_pos"], dtype=float).reshape(-1, 3)
+            distance = np.linalg.norm(centres[:, None, :] - observed[None, :, :], axis=-1)
+            normals = frames.normals[np.argmin(distance, axis=1)]
+        return float(np.min(np.abs(self._theta - arcs[: len(centres)]))), float(
+            np.min(np.abs(np.einsum("pc,pc->p", position[None, :] - centres, normals)))
+        )
+
     def diagnostics(self) -> dict[str, float]:
         """Return the controller's per-step state for logging.
 
@@ -1040,6 +1087,8 @@ class MPCCController(Controller):
             "mass_ratio": float(self._mass_ratio),
             "replans": float(self.replans),
             "tunnel_slack": float(self.min_slack),
+            "gate_gap": float(self.gate_gap),
+            "plane_gap": float(self.plane_gap),
             "thrust": float(self._last_f_cmd),
             "roll_cmd": float(self._last_rpy_cmd[0]),
             "pitch_cmd": float(self._last_rpy_cmd[1]),
@@ -1398,8 +1447,17 @@ class MPCCController(Controller):
         """
         cfg = self._mpcc
         assert self._path is not None
-        _, _, weight = self._reference(np.array([theta]))
-        speed = cfg.mu_speed / (2.0 * (cfg.w_speed_gate * float(weight[0]) + cfg.r_vtheta))
+        # The speed bump is its own knob: it slows the drone where a corrected gate pose has to be
+        # paid for, a different job from keeping the contour error small at the gate. Sharing one
+        # weight with the contour cost made the throttle vanish as soon as the gate contour weight
+        # was off, so no experiment could separate gate accuracy from approach speed. The pole
+        # bump still contributes, exactly as it did when the two shared one array.
+        position = self._path.pos(np.array([theta]))
+        speed_weight = max(
+            float(proximity_weight(position, self._gate_centers, cfg.gate_speed_weight)[0]),
+            float(proximity_weight(position, self._obstacles, OBSTACLE_PROXIMITY_WEIGHT)[0]),
+        )
+        speed = cfg.mu_speed / (2.0 * (cfg.w_speed_gate * speed_weight + cfg.r_vtheta))
         speed = min(speed, speed_actual + cfg.v_lead)
         speed = min(speed, float(np.interp(theta, self._speed_grid, self._speed_limit)))
         if self._approach_capped(theta):
@@ -1527,6 +1585,7 @@ class MPCCController(Controller):
         self.min_slack = (
             TUNNEL_OFF if frames is None else self._current_slack(pos, self._theta, frames)
         )
+        self.gate_gap, self.plane_gap = self._gate_gaps(obs)
 
         x0 = self._state_vector(obs, theta)
         self._solver.set(0, "lbx", np.ascontiguousarray(x0))

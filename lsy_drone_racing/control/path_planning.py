@@ -39,7 +39,7 @@ Deviations from the reference implementation (all required for this environment)
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -255,6 +255,12 @@ class PathInfo:
         gate_ids: Index of the gate of every pass in passing order, shape ``(n_passes, )``. The
             controller needs it to look up whether that gate has been seen yet, which is what its
             approach speed cap is keyed on.
+        pass_arcs: Arc length at which the path crosses each pass's plane, shape ``(n_passes, )``,
+            in passing order and therefore increasing. This is *not* the nearest point of the path
+            to a gate centre: on a track whose gates sit close together, the nearest point to a gate
+            can be metres from where the path flies through it, a different arc and a different
+            place. Anything that keys on "where am I relative to a gate" - the tunnel funnel, the
+            approach cap - has to use these.
         obstacles: Obstacle positions used for collision avoidance, shape ``(n_obstacles, 3)``.
     """
 
@@ -262,6 +268,7 @@ class PathInfo:
     gate_centers: NDArray[np.floating]
     gate_ids: NDArray[np.integer]
     obstacles: NDArray[np.floating]
+    pass_arcs: NDArray[np.floating] = field(default_factory=lambda: np.zeros(0))
 
 
 @dataclass(frozen=True)
@@ -600,6 +607,7 @@ class PathPlanner:
             gate_centers=pass_pos,
             gate_ids=np.asarray(sequence, dtype=int),
             obstacles=obstacles if len(obstacles) else np.zeros((0, 3)),
+            pass_arcs=_pass_arcs(path, pass_pos, pass_normals),
         )
         return path, info
 
@@ -1460,6 +1468,68 @@ class PathPlanner:
         return BsplinePath(control, time_step)
 
 
+def _pass_arcs(
+    path: ArcPath, pass_pos: NDArray[np.floating], pass_normals: NDArray[np.floating]
+) -> NDArray[np.floating]:
+    """Return the arc length at which the path crosses each pass's plane, in passing order.
+
+    A nearest-point lookup is the wrong tool here, and using one was the bug that made the gate
+    tunnel inert: on a track whose gates sit close together, the nearest point of the path to a
+    gate centre can be metres away from where the path flies through it. Measured on a level 2
+    re-plan, the nearest-point arc for the *next* gate came out at 8.36 m on a 9.39 m path while the
+    drone was already 0.41 m from that gate's plane - so every consumer that keys on "how far am I
+    from this gate" was told the gate sat at the far end of the path.
+
+    The passes are visited in order, so the crossing of pass ``i`` is the first plane crossing at or
+    after the crossing of pass ``i - 1``. Searching forward from the previous crossing is
+    correct and monotone by construction.
+    monotone by construction.
+
+    Args:
+        path: The planned path.
+        pass_pos: Gate centres in passing order, shape ``(n_passes, 3)``.
+        pass_normals: Signed traversal normal of each pass, shape ``(n_passes, 3)``.
+
+    Returns:
+        The crossing arc lengths, shape ``(n_passes, )``, non-decreasing.
+    """
+    centres = np.asarray(pass_pos, dtype=float).reshape(-1, 3)
+    if not len(centres):
+        return np.zeros(0)
+    samples = max(200, int(path.length / 0.01))
+    grid = np.linspace(0.0, path.length, samples)
+    points = np.asarray(path.pos(grid), dtype=float).reshape(-1, 3)
+    arcs = np.zeros(len(centres))
+    previous = 0.0
+    for index, (centre, normal) in enumerate(zip(centres, pass_normals, strict=True)):
+        normal = np.asarray(normal, dtype=float)
+        local = (points - centre) @ normal
+        changes = np.flatnonzero(np.diff(np.sign(local)) != 0)
+        changes = changes[grid[changes] >= previous - 1e-9]
+        # The path can cross a gate's plane more than once - the route to a later gate flies past
+        # an earlier one, and the runout leaves through a plane it has already used. Only the
+        # crossing *inside the opening* (0.101 m, the offset a body still fits at) is the passage,
+        # so prefer the first such crossing and fall back to the closest to the centre.
+        best_arc, best_offset = None, np.inf
+        for crossing in changes:
+            first = int(crossing)
+            fraction = -local[first] / (local[first + 1] - local[first] + 1e-12)
+            point = points[first] + fraction * (points[first + 1] - points[first])
+            offset = float(np.linalg.norm((point - centre) - ((point - centre) @ normal) * normal))
+            if offset < best_offset:
+                best_arc = grid[first] + fraction * (grid[first + 1] - grid[first])
+                best_offset = offset
+            if offset <= 0.101:
+                break
+        if best_arc is None:
+            # A pass the path only grazes has no sign change; the nearest sample is at most one
+            # sample spacing away from the truth.
+            best_arc = float(grid[int(np.argmin(np.abs(local)))])
+        arcs[index] = best_arc
+        previous = float(best_arc)
+    return arcs
+
+
 def track_reference(
     path: ArcPath,
     thetas: NDArray[np.floating],
@@ -1495,12 +1565,7 @@ def track_reference(
     thetas = np.asarray(thetas, dtype=float).ravel()
     positions = path.pos(thetas)
     tangents = path.tangent(thetas)
-    weights = np.zeros(len(thetas))
-    if gate_weight > 0.0 and gate_centers is not None and len(gate_centers):
-        dist_sq = np.sum((positions[:, None, :] - np.asarray(gate_centers)[None, :, :]) ** 2, -1)
-        weights = np.maximum(
-            weights, (gate_weight * np.exp(-_PROXIMITY_DECAY * dist_sq)).max(axis=1)
-        )
+    weights = proximity_weight(positions, gate_centers, gate_weight)
     if obstacles is not None and len(obstacles):
         delta = positions[:, None, :2] - np.asarray(obstacles)[None, :, :2]
         dist_sq = np.sum(delta**2, -1)
@@ -1508,3 +1573,31 @@ def track_reference(
             weights, (OBSTACLE_PROXIMITY_WEIGHT * np.exp(-_PROXIMITY_DECAY * dist_sq)).max(axis=1)
         )
     return positions, tangents, weights
+
+
+def proximity_weight(
+    positions: NDArray[np.floating], centres: NDArray[np.floating] | None, peak: float
+) -> NDArray[np.floating]:
+    """Return the Gaussian proximity bump around the nearest centre.
+
+    The contour cost and the speed law want the same shape of bump but for different reasons, and
+    they must not share one knob: the contour cost wants the drone on the path at a gate, while the
+    speed law wants it slow enough to correct a revealed pose error before the gate. Coupling them -
+    which is what one ``weight`` array does - meant turning the gate contour weight off to let a
+    tunnel take over the gate also switched the speed throttle off, and no measurement could tell
+    the two apart.
+
+    Args:
+        positions: Positions to evaluate, shape ``(n, 3)``.
+        centres: Bump centres, shape ``(n_centres, 3)``, or ``None``.
+        peak: Value at a centre.
+
+    Returns:
+        The weight at each position, shape ``(n, )``, in ``[0, peak]``.
+    """
+    positions = np.asarray(positions, dtype=float).reshape(-1, 3)
+    if peak <= 0.0 or centres is None or not len(centres):
+        return np.zeros(len(positions))
+    centres = np.asarray(centres, dtype=float).reshape(-1, 3)
+    dist_sq = np.sum((positions[:, None, :] - centres[None, :, :]) ** 2, -1)
+    return (peak * np.exp(-_PROXIMITY_DECAY * dist_sq)).max(axis=1)
