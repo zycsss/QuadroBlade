@@ -895,6 +895,7 @@ class MPCCController(Controller):
     def _tunnel_params(
         self,
         theta: float,
+        position: NDArray[np.floating],
         frames: tuple[
             NDArray[np.floating], NDArray[np.floating], NDArray[np.floating], NDArray[np.floating]
         ]
@@ -910,11 +911,18 @@ class MPCCController(Controller):
         metre of each other in space, so a plane-distance trigger punishes the drone for passing a
         gate it is not crossing yet, which measured 0/20 before this was fixed.
 
+        The slot is centred on the *path point* of the stage, not on the gate centre, so the
+        corridor is a tube that follows the path. Centring it on the gate tests only the in-plane
+        offset and demands a straight approach: measured, a 0.10 m corridor over a 1.2 m window was
+        0/20 as a slab at the gate and is a flyable tube around the path.
+
         A stage can sit inside the window of two passages at once; the two slots take the narrower
         pair.
 
         Args:
             theta: Arc length of the stage on the active path [m].
+            position: Reference position of the stage on the path, shape ``(3,)``, which is the
+                centre of the tube.
             frames: The pass frames from [MPCCController._pass_frames][].
 
         Returns:
@@ -949,7 +957,7 @@ class MPCCController(Controller):
             offset = 10 * slot
             values[offset : offset + 3] = lateral_axes[gate]
             values[offset + 3 : offset + 6] = vertical_axes[gate]
-            values[offset + 6 : offset + 9] = centres[gate]
+            values[offset + 6 : offset + 9] = np.asarray(position, dtype=float)
             values[offset + 9] = float(half_width[gate])
         return values
 
@@ -974,7 +982,9 @@ class MPCCController(Controller):
             The smallest half-space slack of the active tunnel slots, or ``TUNNEL_OFF`` when no gate
             plane is inside ``tunnel_window``.
         """
-        tunnel = self._tunnel_params(float(theta), frames)
+        assert self._path is not None
+        centre = self._path.pos(np.array([float(theta)]))[0]
+        tunnel = self._tunnel_params(float(theta), centre, frames)
         slack = []
         for slot in range(MAX_TUNNEL):
             offset = 10 * slot
@@ -1574,7 +1584,7 @@ class MPCCController(Controller):
         # tunnel is on. With it off every slot is inactive and the cost term is exactly zero.
         frames = self._pass_frames(obs) if self._mpcc.w_tunnel > 0.0 else None
         for k in range(self._mpcc.N + 1):
-            tunnel = self._tunnel_params(thetas[k], frames)
+            tunnel = self._tunnel_params(thetas[k], positions[k], frames)
             params = np.concatenate(
                 (positions[k], tangents[k], [weights[k]], barrier, tunnel, weight_block)
             )

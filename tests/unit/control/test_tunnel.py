@@ -33,6 +33,17 @@ def barrier(slack: np.ndarray | list) -> float:
     return float(function(cs.DM(values)))
 
 
+class StubPath:
+    """A path whose only job is to give the tunnel a centre: the line at the gate height."""
+
+    def pos(self, tau: np.ndarray) -> np.ndarray:
+        """Return points on the line ``z = 1`` at the given arc lengths."""
+        values = np.atleast_1d(np.asarray(tau, dtype=float))
+        out = np.zeros((len(values), 3))
+        out[:, 2] = 1.0
+        return out
+
+
 class Harness:
     """The controller's tunnel helpers, bound to a stub instead of the acados solver.
 
@@ -43,6 +54,8 @@ class Harness:
     def __init__(self, config: MPCCConfig, gate_ids: tuple[int, ...] = (0,)):
         """Bind the helpers and set up a single gate at the origin, one metre up."""
         self._mpcc = config
+        self._path_info = type("Info", (), {"gate_ids": np.asarray(gate_ids, dtype=int)})()
+        self._path = StubPath()
         self._tunnel_warned = False
         self._gate_centers = np.array([[0.0, 0.0, 1.0]])
         # The passage sits at arc length 1 m, so a stage's theta selects the funnel width.
@@ -64,7 +77,8 @@ class Harness:
 
     def tunnel(self, theta: float, frames: tuple[np.ndarray, ...]) -> np.ndarray:
         """Call the controller's per-stage tunnel helper at a decoded arc length."""
-        return self._tunnel_params(float(theta), frames)
+        centre = self._path.pos(np.array([float(theta)]))[0]
+        return self._tunnel_params(float(theta), centre, frames)
 
     def slack(self, position: np.ndarray, theta: float, frames: tuple[np.ndarray, ...]) -> float:
         """Call the controller's slack helper for a position at a given arc length."""

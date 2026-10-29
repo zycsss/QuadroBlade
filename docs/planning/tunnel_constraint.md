@@ -102,6 +102,50 @@ That is the opposite of the paper's result, and the reason is measurable: their 
 corridor at 80 km/h, ours has a tracking error half the corridor's width. The tunnel is not the wrong
 idea; it is a constraint that presupposes accuracy we do not have.
 
+## Two more defects, and the level 0/1 test
+
+**The corridor was a slab, not a tube.** The slot was centred on the *gate centre*, so the constraint
+only tested the in-plane offset at that point: a narrow corridor over a long window demanded a straight
+approach and measured **0/20**. The paper's tunnel is a tube around the path. Centring the slot on the
+*path point of every stage* makes it one, and the same cells give:
+
+| configuration (seeds 0-19) | success | mean lap |
+| --- | --- | --- |
+| baseline, no tunnel | **17/20** | **7.58 s** |
+| slab at the gate, corridor 0.10 m over 1.2 m | 0/20 | - |
+| **tube around the path**, corridor 0.10 m over 1.2 m | **14/20** | 8.96 s |
+| **tube around the path**, corridor 0.14 m over 1.0 m | **14/20** | 8.75 s |
+
+So a correct tube is two finishes better than the funnel (12/20) and six better than the slab, and
+still three short of the baseline - and 1.2 s a lap slower. The barrier is a last-resort mechanism: it
+only pushes within centimetres of a face, so holding a 0.10 m corridor costs the OCP speed and
+progress, for a constraint the drone was almost satisfying anyway. The contour weight does the same job
+by shaping the whole approach, which is where a revealed pose error has to be corrected, and it costs
+nothing.
+
+**Did the drone leave the corridor?** Almost never. With the tube and `w=300` on level 2:
+
+| seed | verdict | active ticks | ticks outside | worst violation |
+| --- | --- | --- | --- | --- |
+| 0 | FINISHED | 52 % | **0 %** | 0 mm |
+| 4 | HIT_GATE | 35 % | 2 % | **15 mm** |
+| 8 | CONTACT (pole) | 26 % | 0 % | 0 mm (tunnel inactive, 0.53 m from any plane) |
+
+So "the tunnel is violated" is not the failure mode. The drone holds the corridor and loses anyway,
+which is the strongest evidence that the constraint is not the right lever here.
+
+**Levels 0 and 1 were not tested before, and should have been.** With poses known (no reveal, no
+re-plan), the corridor is held comfortably and costs almost nothing:
+
+| level | no tunnel | tunnel `w=300` | ticks outside | min slack |
+| --- | --- | --- | --- | --- |
+| 0 (perfect knowledge) | 2/2, 8.32 / 8.28 s | 2/2, 8.34 / 8.30 s | **0 %** | +11 mm |
+| 1 (randomised mass) | 2/2, 8.38 / 8.26 s | 2/2, 8.40 / 8.28 s | **0 %** | +3 mm |
+
+That is the discriminator: where the plan is not replaced in flight the tunnel is harmless and the
+corridor is held to within a millimetre; the level 2 loss comes from the interaction with the
+post-reveal transient, not from the constraint's shape or weight.
+
 ## What we keep from it
 
 - **`PathInfo.pass_arcs`** (the fix above) is used by the approach speed cap as well as the tunnel, and
