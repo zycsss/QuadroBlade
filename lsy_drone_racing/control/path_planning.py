@@ -1465,6 +1465,7 @@ def track_reference(
     thetas: NDArray[np.floating],
     gate_centers: NDArray[np.floating],
     obstacles: NDArray[np.floating],
+    gate_weight: float = GATE_PROXIMITY_WEIGHT,
 ) -> tuple[NDArray[np.floating], NDArray[np.floating], NDArray[np.floating]]:
     """Evaluate the path reference used by the MPCC stage cost.
 
@@ -1473,11 +1474,19 @@ def track_reference(
     its contouring and lag weights with it, so the drone hugs the path exactly where it has to pass
     through a gate and is free to cut corners in between.
 
+    ``gate_weight`` exists because the gate Gaussian and the tunnel
+    ([docs/planning/tunnel_constraint.md](../../docs/planning/tunnel_constraint.md)) are two answers
+    to the same problem, and they fight when both are on: the Gaussian pulls the drone onto the path
+    at the gate while the tunnel allows the whole opening, so both add cost without safety.
+    A controller that runs the tunnel passes ``gate_weight = 0`` and leaves gate accuracy to the
+    constraint, which is the formulation of MPCC++ (Krinner, Romero et al., RSS 2024).
+
     Args:
         path: The planned path.
         thetas: Arc length parameters at which to evaluate, shape ``(n, )``.
         gate_centers: Gate centres in passing order, shape ``(n_passes, 3)``.
         obstacles: Obstacle positions, shape ``(n_obstacles, 3)``.
+        gate_weight: Peak contour weight at a gate. Zero disables the gate term.
 
     Returns:
         The reference positions ``(n, 3)``, unit tangents ``(n, 3)`` and proximity weights
@@ -1487,10 +1496,10 @@ def track_reference(
     positions = path.pos(thetas)
     tangents = path.tangent(thetas)
     weights = np.zeros(len(thetas))
-    if gate_centers is not None and len(gate_centers):
+    if gate_weight > 0.0 and gate_centers is not None and len(gate_centers):
         dist_sq = np.sum((positions[:, None, :] - np.asarray(gate_centers)[None, :, :]) ** 2, -1)
         weights = np.maximum(
-            weights, (GATE_PROXIMITY_WEIGHT * np.exp(-_PROXIMITY_DECAY * dist_sq)).max(axis=1)
+            weights, (gate_weight * np.exp(-_PROXIMITY_DECAY * dist_sq)).max(axis=1)
         )
     if obstacles is not None and len(obstacles):
         delta = positions[:, None, :2] - np.asarray(obstacles)[None, :, :2]

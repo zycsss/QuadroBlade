@@ -75,6 +75,7 @@ MPCC over a 40-step horizon at 50 Hz (acados, `SQP_RTI`), following
            - mu_speed  x progress along the path ← the racing objective
            + r_vtheta  x (path speed)^2
            + attitude / rate penalties
+           (+ w_tunnel x log-barrier, implemented and off: see the tunnel page)
 
    model     identified first-order attitude lag + thrust
    command   attitude + collective thrust
@@ -83,6 +84,10 @@ MPCC over a 40-step horizon at 50 Hz (acados, `SQP_RTI`), following
                            mu_speed / (2 (w_gate · proximity + r_vtheta)),
                            v_actual + v_lead )            ← no jumps
 ```
+
+The six weights that a sweep touches travel in the OCP parameter vector, so re-tuning costs episodes
+rather than a one-minute solver rebuild: `scripts/tune_mpcc.py` runs a trust-region Bayesian
+optimiser (TuRBO-8) over them with lap time as the objective.
 
 Two mechanisms carry the success rate: the mass is estimated online and rescales the commanded thrust
 (level 1), and the contouring weight is scaled up near gates so the drone gives up speed there and
@@ -115,6 +120,7 @@ each failure, the mechanism behind it, and what was tried:
 | [incremental_replanning.md](docs/planning/incremental_replanning.md) | re-plan design, failure classes, B-spline, speed sweep |
 | [fast_replanning.md](docs/planning/fast_replanning.md) | the acados formulation, and how to add a term |
 | [characterisation.md](docs/control/characterisation.md) | what the drone can do: lines, circles, corners, steps |
+| [tunnel_constraint.md](docs/planning/tunnel_constraint.md) | gate safety as a constraint (MPCC++, RSS 2024), measured and left off |
 
 The failures that remain are one class: margins. The plan keeps 0.17–0.19 m from a pole whose contact
 radius is 0.114 m, and the drone's transient after a reveal reaches 0.10–0.23 m, so the margin is spent
@@ -133,6 +139,7 @@ lsy_drone_racing/control/
   controller.py        the interface every controller implements
 tests/unit/control/    planner and trajectory tests (26)
 scripts/debug_run.py   headless episodes with a verdict, log and figure per seed
+scripts/tune_mpcc.py   trust-region Bayesian tuning of the MPCC weights
 docs/planning/         the design record: measurements, failures, decisions
 ```
 
