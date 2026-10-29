@@ -44,15 +44,17 @@ from scripts.debug_run import run_episode  # noqa: E402
 #: on the planning page rather than physical limits, because a trust region that starts far from
 #: the working point spends its budget rediscovering it.
 SPACE: tuple[tuple[str, float, float, bool], ...] = (
-    ("q_contour", 10.0, 1.0e3, True),
-    ("q_lag", 10.0, 1.0e3, True),
     ("q_contour_peak", 10.0, 5.0e3, True),
     ("mu_speed", 1.0, 60.0, True),
-    ("r_vtheta", 0.01, 10.0, True),
-    ("w_speed_gate", 0.0, 40.0, False),
     ("a_lat_max", 1.0, 12.0, False),
-    ("w_tunnel", 0.0, 1.0e3, True),
+    ("replan_slowdown_factor", 0.30, 0.90, False),
+    ("reveal_speed", 1.0, 2.5, False),
 )
+
+#: Parameters that were measured to do nothing and are therefore not worth a dimension: the gate
+#: throttle ``w_speed_gate`` (4.0 and 2.0 give bit-identical runs, the speed there is clamped by
+#: ``reveal_speed`` and ``v_max``) and ``w_tunnel`` (the tunnel measures worse at every setting).
+#: The two that did move the clock - the post-re-plan slowdown and the approach cap - are in SPACE.
 
 CONFIG_FILE = "level2.toml"
 SOLVER_PENALTY = 100.0
@@ -216,6 +218,7 @@ def main(
     episodes: int = 10,
     region_count: int = 8,
     start: int = 0,
+    seed_pool: int = 60,
     device: str = "cpu",
     apply: bool = False,
 ) -> None:
@@ -226,6 +229,9 @@ def main(
         episodes: Episodes per evaluation, i.e. the reward is a mean over this many seeds.
         region_count: Number of parallel trust regions.
         start: First seed of the rotating pool, so a second run can use different tracks.
+        seed_pool: Number of seeds the pool rotates over. Scoring a fixed ten seeds overfitted: a
+            candidate that read 80 % instead of 70 % on its own subsample measured 30/40 against the
+            shipped 34/40 on unseen seeds.
         device: Simulation device.
         apply: Print the best parameters as a ``[controller]`` block when done.
     """
@@ -242,15 +248,26 @@ def main(
     )
     centre = to_unit(values)
     regions = [
-        TrustRegion(centre + rng.normal(0.0, 0.05, len(SPACE)), 0.4, rng)
+        TrustRegion(centre + rng.normal(0.0, 0.02, len(SPACE)), 0.1, rng)
         for _ in range(region_count)
     ]
     trials: list[Trial] = []
-    pool = max(episodes, 20)
+    pool = max(episodes, seed_pool)
     start_time = time.perf_counter()
     evaluations = max(1, budget // max(episodes, 1))
     print(f"{evaluations} evaluations of {episodes} episodes, {region_count} regions")
-    for evaluation in range(evaluations):
+    # The first evaluation is the shipped configuration itself: without it the optimiser can only
+    # claim an improvement over its own random samples, not over what we run. Measured without it,
+    # twelve evaluations of a five parameter space all landed 20-45 points of reward below the
+    # default and none of them was recognised as such.
+    seeded = [evaluate(from_unit(centre), [start + k for k in range(episodes)], device)]
+    trials.append(Trial(centre, seeded[0][0], seeded[0][1]["lap"], seeded[0][1]["success"],
+                        seeded[0][1]["solver_failure"]))
+    print(
+        f"[  0/{evaluations}] reward {trials[0].reward:8.2f}  lap {trials[0].lap:5.2f}  "
+        f"success {trials[0].success:3.0%}  (shipped configuration)"
+    )
+    for evaluation in range(evaluations - 1):
         region = regions[evaluation % region_count]
         point = region.propose(len(trials), evaluations)
         values = from_unit(point)
@@ -264,7 +281,11 @@ def main(
         y = np.array([trial.reward for trial in trials])
         region.surrogate.fit(x, y)
         best = max(trials, key=lambda trial: trial.reward)
-        region.update(score > best.reward or score > np.mean(y[-region_count:]))
+        region_best = max(
+            (trial.reward for trial in trials if id(trial.unit) in {id(point), id(region.centre)}),
+            default=-np.inf,
+        )
+        region.update(score > region_best)
         print(
             f"[{evaluation + 1:3d}/{evaluations}] reward {score:8.2f}  lap {summary['lap']:5.2f}  "
             f"success {summary['success']:3.0%}  solver {summary['solver_failure']:4.1%}  "

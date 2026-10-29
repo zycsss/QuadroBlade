@@ -316,6 +316,43 @@ that could go is the smoothing - the B-spline and its relaxation already round t
 a clean removal (17/20 at 7.58 s on these seeds). **What cannot go is the dense, pole-clear polyline
 that A* and the push-out produce.**
 
+## Measured: joint tuning does not beat the hand setting
+
+The eight weights were swept one at a time on this page, so `scripts/tune_mpcc.py` runs a trust-region
+Bayesian optimiser (TuRBO-8) over them instead. Four things had to be fixed before it could say
+anything, and each was a measurement:
+
+* the incumbent must be the **shipped configuration**, evaluated first. Without that, twelve
+  evaluations of a five-parameter space all landed 20-45 reward points *below* the default and the
+  optimiser could not tell.
+* the trust region has to **start narrow** (0.1, not 0.4 of the whole log range); at 0.4 the "local"
+  search was sampling the whole space.
+* `w_speed_gate` and `w_tunnel` came out of the space: the first is inert (4.0 and 2.0 give
+  bit-identical runs, because the gate speed is clamped by `reveal_speed` and `v_max`), the second
+  measures worse at every setting.
+* the seeds must **rotate over a pool**. Scoring ten fixed seeds overfits, and the first run proved it.
+
+Two runs, each validated on 40 unseen seeds (60-99) where the shipped configuration scores
+**34/40 at 8.20 s**:
+
+| run | what the optimiser saw | candidate | unseen seeds |
+| --- | --- | --- | --- |
+| 300 episodes, 10 fixed seeds | 80 % against the shipped 70 % | `q_contour_peak 3832, mu_speed 27.2, a_lat_max 5.4, slowdown 0.62, reveal 1.73` | **30/40, 8.55 s** |
+| 600 episodes, 20 seeds rotating over 60 | 85 % against the shipped 65 % | `q_contour_peak 3906, mu_speed 19.3, a_lat_max 7.4, slowdown 0.55, reveal 1.87` | **32/40, 8.14 s** |
+
+Both regress, and the reason is measurable rather than mysterious: at 20 episodes the standard error of
+an 85 % success rate is about 8 %, i.e. **±2.6 seeds** - the same size as the "improvements" the
+optimiser found - and the reward makes it worse by pricing one crash at 2.0, which is two seconds of
+lap time. So the search is fitting seed noise, not the controller.
+
+What would work: 100+ episodes per evaluation (a 1-2 seed difference is then resolvable) at ~10 s per
+episode, i.e. a 20-30 minute evaluation per candidate and a budget of several hours. Or optimise lap
+time only, on a seed set where every candidate is known to finish - which is not the problem we have.
+
+The hand setting therefore stands: **35/40 at 8.37 s** on seeds 0-39. The one clean trade remains the
+post-re-plan slowdown, which is weaker than it was: `factor 0.7` gives **32/40 at 7.78 s** on the same
+40 seeds, i.e. 0.59 s for three finishes.
+
 ## The numbers to build on
 
 All measured, see `docs/control/characterisation.md` and the failure analysis.
