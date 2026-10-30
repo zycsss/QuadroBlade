@@ -349,9 +349,10 @@ What would work: 100+ episodes per evaluation (a 1-2 seed difference is then res
 episode, i.e. a 20-30 minute evaluation per candidate and a budget of several hours. Or optimise lap
 time only, on a seed set where every candidate is known to finish - which is not the problem we have.
 
-The hand setting therefore stands: **35/40 at 8.37 s** on seeds 0-39. The one clean trade remains the
-post-re-plan slowdown, which is weaker than it was: `factor 0.7` gives **32/40 at 7.78 s** on the same
-40 seeds, i.e. 0.59 s for three finishes.
+The hand setting therefore stands, with one deliberate change: the post-re-plan slowdown is now
+`factor 0.7`, which is **32/40 at 7.78 s** on seeds 0-39 against 35/40 at 8.37 s for 0.5 - 0.59 s a lap
+for three finishes, taken because the lap time is what the competition scores. Everything else on this
+page is unchanged.
 
 ## The numbers to build on
 

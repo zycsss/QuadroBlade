@@ -202,7 +202,7 @@ gate contour weight" with "no gate slowdown", and only the last two rows added s
   drove it into the wall.
 - `w_tunnel = 0` disables it completely: every slot is sent inactive (`W = 1e3`, zero axes) and the
   barrier evaluates to exactly zero, which is how the parameter wiring was verified to be inert -
-  the 40-seed screen reproduces 35/40 at 8.37 s with it off.
+  the 40-seed screen reproduced 35/40 at 8.37 s with it off (32/40 at 7.78 s after the slowdown factor moved to 0.7).
 - `min_slack` is logged per tick (as `tunnel_slack` in the run record). A gate clip with a positive
   slack means the tunnel was not the constraint that failed, and that is the audit to run on any
   remaining gate failure.

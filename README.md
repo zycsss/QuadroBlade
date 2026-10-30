@@ -9,7 +9,7 @@ B-spline trajectory through the gates, and re-plans whenever a gate or pole is r
 | --- | --- | --- |
 | level 0 (perfect knowledge) | 2/2 | 8.43 s |
 | level 1 (randomized mass) | 2/2 | 8.43 s |
-| **level 2 (randomized poses, revealed in flight)** | **35/40** | **8.37 s** |
+| **level 2 (randomized poses, revealed in flight)** | **32/40** | **7.78 s** |
 
 Level 2 is the competition setting and the only one where re-planning matters. All figures are 40
 seeds on CPU; the measurement protocol and the failure analysis behind them are in

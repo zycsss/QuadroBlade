@@ -248,7 +248,10 @@ class MPCCConfig:
         replan_slowdown_time: Time [s] for which the reference speed is reduced after a re-plan.
             A revealed gate can be up to 0.2 m away from its nominal pose, and the drone needs a
             moment to converge onto the corrected approach line before it reaches the gate.
-        replan_slowdown_factor: Factor applied to the reference speed during that time.
+        replan_slowdown_factor: Factor applied to the reference speed during that time. Measured on
+            level 2, seeds 0-39: 0.5 gives 35/40 at 8.37 s, 0.7 gives **32/40 at 7.78 s**, 0.8 gives
+            14/20 at 7.49 s and 0.35 with a 0.5 s window gives 14/20 at 9.34 s. The default is 0.7:
+            0.59 s a lap for three finishes, taken deliberately because the lap time is the score.
         replan_coalesce_ticks: Quiet period in control ticks before a pending reveal is planned for.
             Reveals arrive in bursts, 36 percent of them within the previous re-plan's slowdown
             window, and three paths in a quarter of a second buy nothing.
@@ -320,7 +323,7 @@ class MPCCConfig:
     replan_coalesce_ticks: int = 0
     replan_max_defer_ticks: int = 0
     replan_defer_in_passage: bool = False
-    replan_slowdown_factor: float = 0.5
+    replan_slowdown_factor: float = 0.7
     # Measured on level 2: braking to 0.15 of the reference speed for 0.15 s after every re-plan
     # costs 0.31 s of lap time, 8.99 s to 9.30 s, and does not raise the finish count on the 20-seed
     # screen. The hold is therefore off: a factor of 1.0 with a zero window makes it a no-op.
