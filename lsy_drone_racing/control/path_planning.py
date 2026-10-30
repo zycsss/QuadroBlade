@@ -39,7 +39,7 @@ Deviations from the reference implementation (all required for this environment)
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -94,6 +94,12 @@ class PathConfig:
             after each pass and the loop stops as soon as the required clearance is achieved.
         length_growth_max: Maximum factor by which obstacle avoidance may lengthen the path before
             it is rejected. A rejected pass keeps the previous, shorter path.
+        use_push_out: Whether to push the waypoint line out of an obstacle it crosses
+            (`_avoid_obstacles`). Off, the B-spline relaxation is the only thing keeping the curve
+        use_push_out: Whether to push the waypoint line out of an obstacle it crosses
+            means.
+        use_smoothing: Whether to round the polyline with the Laplacian pass (`_smooth_path`). Off,
+            the corners between chords stay sharp and the B-spline relaxation has to round them.
         use_astar: Whether to decide the route around the obstacles with a grid A* search. When
             enabled, every chord between two gate passages that violates the clearance is replaced
             by the shortest clearance-keeping route found on a rasterized top view of the track, so
@@ -151,13 +157,6 @@ class PathConfig:
         seed_length: Length [m] of the straight seed step that a re-plan puts after its anchor. It
             sets the direction the new path leaves the old one with, so it has to be long enough for
             the waypoint spline to feel it and short enough not to delay the correction.
-        anchor_pin_length: Arc length [m] at the start of a re-planned path that is moved back onto
-            the anchor's own geometry, the old path where the seed carries it and the straight
-            tangent otherwise. This is the stage that makes the promise "the new path starts where
-            the drone is and along the old path" true after every later stage has moved the path.
-        path_kind: ``"bspline"`` fits the plan as a cubic B-spline trajectory with the drone's state
-            as its initial condition, ``"spline"`` uses the natural cubic spline and the anchor pin.
-            See [bspline_path][lsy_drone_racing.control.bspline_path].
         bspline_spacing: Target arc length [m] per control point of the B-spline. Fewer, further
             apart control points give a smoother and less faithful path; more of them follow the
             waypoints more closely.
@@ -175,9 +174,6 @@ class PathConfig:
         runout: Extra length [m] the path continues behind the last gate.
         duration: Duration [s] of the auxiliary time-parameterized spline.
         sampling_freq: Sampling frequency [Hz] of the obstacle collision scan.
-        arc_step: Target spacing [m] of the arc-length reparameterization.
-        arc_tol: Relative segment-length deviation at which the arc-length loop stops.
-        arc_iter_max: Maximum number of arc-length reparameterization iterations.
     """
 
     approach_distance: float = 0.6
@@ -190,6 +186,8 @@ class PathConfig:
     obstacle_iter_max: int = 2
     length_growth_max: float = 1.25
     use_astar: bool = True
+    use_push_out: bool = True
+    use_smoothing: bool = True
     astar_resolution: float = 0.05
     astar_frame_margin: float = 0.02
     astar_bounds: tuple[tuple[float, float], tuple[float, float]] = ((-2.45, -1.45), (2.45, 1.45))
@@ -200,7 +198,6 @@ class PathConfig:
     # Measured: trimming the first passage removes the anchor fold, 85 of 574 plans down to 2,
     # but costs three successes out of 20, because the straight approach is what centres the drone
     # through the opening. Left off; the fold is cheaper to avoid by not re-planning in a passage.
-    trim_first_passage: bool = False
     trim_seeded_passage: bool = True
     gate_straight_length: float = 0.275
     gate_straight_blend: float = 0.25
@@ -214,8 +211,6 @@ class PathConfig:
     gate_frame_step: float = 0.15
     gate_opening_limit: float = 0.101
     seed_length: float = 0.15
-    anchor_pin_length: float = 0.25
-    path_kind: str = "bspline"
     bspline_spacing: float = 0.08
     bspline_speed: float = 2.0
     bspline_speed_limit: float = 2.3
@@ -225,9 +220,6 @@ class PathConfig:
     runout: float = 0.4
     duration: float = 30.0
     sampling_freq: float = 50.0
-    arc_step: float = 0.05
-    arc_tol: float = 1e-3
-    arc_iter_max: int = 20
 
 
 @dataclass(frozen=True)
@@ -271,6 +263,12 @@ class PathInfo:
         gate_ids: Index of the gate of every pass in passing order, shape ``(n_passes, )``. The
             controller needs it to look up whether that gate has been seen yet, which is what its
             approach speed cap is keyed on.
+        pass_arcs: Arc length at which the path crosses each pass's plane, shape ``(n_passes, )``,
+            in passing order and therefore increasing. This is *not* the nearest point of the path
+            to a gate centre: on a track whose gates sit close together, the nearest point to a gate
+            can be metres from where the path flies through it, a different arc and a different
+            place. Anything that keys on "where am I relative to a gate" - the tunnel funnel, the
+            approach cap - has to use these.
         obstacles: Obstacle positions used for collision avoidance, shape ``(n_obstacles, 3)``.
     """
 
@@ -278,6 +276,7 @@ class PathInfo:
     gate_centers: NDArray[np.floating]
     gate_ids: NDArray[np.integer]
     obstacles: NDArray[np.floating]
+    pass_arcs: NDArray[np.floating] = field(default_factory=lambda: np.zeros(0))
 
 
 @dataclass(frozen=True)
@@ -293,10 +292,6 @@ class PathSeed:
             the new path starts from the old one, not from wherever tracking error left the drone.
         tangent: Unit direction of the old path at the anchor.
         length: Length [m] of the straight seed step, see ``PathConfig.seed_length``.
-        path: The old path itself, when it is known. Given it, the anchor pin follows the old path
-            for its first ``anchor_pin_length`` metres instead of following the straight tangent,
-            which keeps the new path's curvature continuous at the anchor as well as its direction.
-        progress: Arc length of the anchor on ``path``. Ignored without ``path``.
         velocity: The drone's measured velocity at the anchor, shape ``(3,)``, in m/s. A B-spline
             plan uses it as a boundary condition, so the new path leaves the anchor with the speed
             and direction the drone actually has rather than with whatever the old path was doing.
@@ -308,8 +303,6 @@ class PathSeed:
     position: NDArray[np.floating]
     tangent: NDArray[np.floating]
     length: float
-    path: ArcPath | None = None
-    progress: float = 0.0
     velocity: NDArray[np.floating] | None = None
     acceleration: NDArray[np.floating] | None = None
 
@@ -323,27 +316,11 @@ class PathSeed:
         object.__setattr__(self, "position", position)
         object.__setattr__(self, "tangent", tangent / norm)
         object.__setattr__(self, "length", float(self.length))
-        object.__setattr__(self, "progress", float(self.progress))
         for name in ("velocity", "acceleration"):
             value = getattr(self, name)
             object.__setattr__(
                 self, name, None if value is None else np.asarray(value, dtype=float).reshape(3)
             )
-
-    def follow(self, arcs: NDArray[np.floating]) -> NDArray[np.floating]:
-        """Return the points a re-plan should follow at the given arc lengths from the anchor.
-
-        Args:
-            arcs: Arc length from the anchor, shape ``(n, )``.
-
-        Returns:
-            The old path at those arc lengths when it is known, and the straight tangent line
-            through the anchor otherwise.
-        """
-        arcs = np.asarray(arcs, dtype=float).reshape(-1)
-        if self.path is not None:
-            return self.path.pos(self.progress + arcs)
-        return self.position[None, :] + arcs[:, None] * self.tangent[None, :]
 
 
 def path_config_from(config: object = None, **overrides: object) -> PathConfig:
@@ -594,10 +571,7 @@ class PathPlanner:
         # A re-plan starts inside the first passage often enough that the part of it behind the
         # has to go before anything else looks at the waypoints: it is a fold within centimetres of
         # the anchor, and the smoothing can only turn it into a corner.
-        trim = (seed is not None and self.config.trim_seeded_passage) or (
-            not climb and self.config.trim_first_passage
-        )
-        if trim:
+        if seed is not None and self.config.trim_seeded_passage:
             blocks = self._trim_first_passage(
                 blocks,
                 pass_pos,
@@ -618,8 +592,10 @@ class PathPlanner:
             waypoints = self._connect_blocks(blocks, runout, obstacles, gate_pos, frames.y_axes)
         else:
             waypoints = np.concatenate([np.concatenate(blocks, axis=0), runout])
-        waypoints = self._avoid_obstacles(waypoints, obstacles)
-        waypoints = self._smooth_path(waypoints, obstacles)
+        if self.config.use_push_out:
+            waypoints = self._avoid_obstacles(waypoints, obstacles)
+        if self.config.use_smoothing:
+            waypoints = self._smooth_path(waypoints, obstacles)
         waypoints = self._straighten_gate_passages(waypoints, pass_pos, pass_normals)
         # Every gate of the track, not only the remaining passes: a gate the drone has already flown
         # through is still a solid ring, and on a track that doubles back the route to the next gate
@@ -635,16 +611,13 @@ class PathPlanner:
             # smoothing rounds corners and the gate handling pushes sideways. This is the pass that
             # makes the promise true.
             waypoints = self._enforce_clearance(waypoints, obstacles)
-        if self.config.path_kind == "bspline":
-            path = self._to_bspline_path(waypoints, obstacles, pass_pos, seed)
-        else:
-            pin_length = self.config.anchor_pin_length if seed is not None else 0.0
-            path = self._to_arc_path(waypoints, seed, pin_length)
+        path = self._to_bspline_path(waypoints, obstacles, pass_pos, seed)
         info = PathInfo(
             waypoints=waypoints,
             gate_centers=pass_pos,
             gate_ids=np.asarray(sequence, dtype=int),
             obstacles=obstacles if len(obstacles) else np.zeros((0, 3)),
+            pass_arcs=_pass_arcs(path, pass_pos, pass_normals),
         )
         return path, info
 
@@ -1328,6 +1301,7 @@ class PathPlanner:
         xy = obstacle[:2] + distance * direction
         return np.array([xy[0], xy[1], 0.5 * (entry[2] + exit_[2])])
 
+
     def _create_spline(self, waypoints: NDArray[np.floating], duration: float) -> CubicSpline:
         """Fit a cubic spline through the waypoints, parameterized by chord length."""
         pts = np.asarray(waypoints, dtype=float).reshape(-1, 3)
@@ -1337,23 +1311,6 @@ class PathPlanner:
         pts, cumulative = pts[keep], cumulative[keep]
         knots = cumulative / (cumulative[-1] + 1e-9) * duration
         return CubicSpline(knots, pts, bc_type="natural")
-
-    def _reparametrize(self, spline: CubicSpline) -> CubicSpline:
-        """Reparameterize a spline so that its parameter is the arc length."""
-        cfg = self.config
-        current = spline
-        for _ in range(cfg.arc_iter_max):
-            span = float(current.x[-1] - current.x[0])
-            n_segments = max(2, int(span / cfg.arc_step))
-            params = np.linspace(float(current.x[0]), float(current.x[-1]), n_segments)
-            points = np.asarray(current(params), dtype=float)
-            segment_lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
-            cumulative = np.concatenate(([0.0], np.cumsum(segment_lengths)))
-            current = CubicSpline(cumulative, points, bc_type="natural")
-            mean = float(np.mean(segment_lengths))
-            if mean > 0.0 and float(np.std(segment_lengths)) / mean < cfg.arc_tol:
-                break
-        return current
 
     def _enforce_clearance(
         self, points: NDArray[np.floating], obstacles: NDArray[np.floating]
@@ -1452,56 +1409,6 @@ class PathPlanner:
             return trimmed
         return blocks
 
-    def _pin_anchor(
-        self, points: NDArray[np.floating], seed: PathSeed, length: float
-    ) -> NDArray[np.floating]:
-        """Move the first ``length`` metres of a re-planned path onto the anchor.
-
-        Every stage between the waypoints and here moves the start of the path: the smoothing rounds
-        it, the gate straightening pulls it onto the gate normal, the clearance pass pushes it away
-        from a pole. What survives is a path that starts somewhere near the drone, pointing near the
-        next gate. This pass restores the two properties the controller relies on: ``pos(0)`` is the
-        anchor, which lies on the old path, and ``tangent(0)`` is the old path's tangent, i.e. the
-        direction the drone is already flying. The drone therefore never has to turn around at the
-        start of a new path.
-
-        The target of the blend is the old path itself when the seed carries it, so the new path
-        also inherits the old one's curvature at the anchor and the correction only starts to bite
-        in. With a tangent only, the target is the straight line through the anchor.
-
-        The displacement is blended with a smootherstep weight, so the weight and its first *and*
-        second derivatives vanish at both ends: the path joins the rest of the plan with continuous
-        position, tangent and curvature, and nothing downstream sees a corner.
-
-        Args:
-            points: The finished path samples, shape ``(n_points, 3)``.
-            seed: The anchor, the tangent and optionally the old path to pin the start to.
-            length: Arc length [m] of the prefix to pin, from
-                [_anchor_pin_length][lsy_drone_racing.control.path_planning.PathPlanner._anchor_pin_length].
-
-        Returns:
-            The samples with their first ``length`` metres on the seed's own geometry.
-        """
-        length = float(length)
-        pts = np.asarray(points, dtype=float).reshape(-1, 3).copy()
-        if length <= 0.0 or len(pts) < 3:
-            return pts
-        # Window in samples: at least three points, at most the whole path.
-        steps = np.linalg.norm(np.diff(pts, axis=0), axis=1)
-        arc = np.concatenate(([0.0], np.cumsum(steps)))
-        count = int(np.searchsorted(arc, length)) + 1
-        count = max(3, min(count, len(pts)))
-        window = pts[:count]
-        # Targets are laid out from the anchor at the window's own arc length, so the first point is
-        # the anchor itself and not the anchor plus however far the smoothing or the gate
-        # straightening dragged the start forward.
-        target = np.asarray(seed.follow(arc[:count]), dtype=float).reshape(-1, 3)
-        # 1 at the anchor, 0 at the end of the window.
-        fraction = np.clip(1.0 - arc[:count] / max(length, 1e-9), 0.0, 1.0)
-        weight = fraction * fraction * fraction * (fraction * (6.0 * fraction - 15.0) + 10.0)
-        pts[:count] = (1.0 - weight)[:, None] * window + weight[:, None] * target
-        return pts
-
     def _to_bspline_path(
         self,
         waypoints: NDArray[np.floating],
@@ -1538,7 +1445,15 @@ class PathPlanner:
         cfg = self.config
         points = np.asarray(waypoints, dtype=float).reshape(-1, 3)
         length = float(np.sum(np.linalg.norm(np.diff(points, axis=0), axis=1)))
-        n_control = max(DEGREE + 4, int(round(length / max(cfg.bspline_spacing, 1e-3))) + 4)
+        # One control point per ``bspline_spacing`` of arc, but at least four samples per control
+        # point: the fit is least squares, and when the control points approach the sample count it
+        # becomes square and degenerate and the minimum-norm solution diverges. Measured on a
+        # sparsely sampled polyline (135 samples), one control point per sample produced a 1.5e10 m
+        # spline from a 10.7 m line.
+        n_control = max(
+            DEGREE + 4,
+            min(int(round(length / max(cfg.bspline_spacing, 1e-3))) + 4, len(points) // 4),
+        )
         time_step = max(cfg.bspline_spacing / max(cfg.bspline_speed, 1e-3), 1e-3)
         control = fit_control_points(points, n_control, time_step)
         if seed is None:
@@ -1571,29 +1486,68 @@ class PathPlanner:
         )
         return BsplinePath(control, time_step)
 
-    def _to_arc_path(
-        self, waypoints: NDArray[np.floating], seed: PathSeed | None = None, pin_length: float = 0.0
-    ) -> ArcPath:
-        """Fit and reparameterize the path, then hand it to an [ArcPath][...ArcPath].
 
-        The anchor pin of a seeded re-plan is applied *here*, to the dense samples, and not to the
-        waypoints: the arc-length reparameterization refits a natural cubic spline and resamples it
-        to twenty times, and its first tangent drifts away from the first chord a little on every
-        sweep. Measured on a real re-plan, the drift turned a start that was straight along the old
-        path into one pointing 100 degrees off it. Pinning the samples the fitted path is actually
-        built from is immune to that, because the pinned prefix already has the geometry it is
-        to.
-        """
-        cfg = self.config
-        spline = self._reparametrize(self._create_spline(waypoints, cfg.duration))
-        span = float(spline.x[-1] - spline.x[0])
-        n_points = max(2, int(span / 0.02))
-        points = np.asarray(
-            spline(np.linspace(float(spline.x[0]), float(spline.x[-1]), n_points)), dtype=float
-        ).reshape(-1, 3)
-        if seed is not None and pin_length > 0.0:
-            points = self._pin_anchor(points, seed, pin_length)
-        return ArcPath(points)
+def _pass_arcs(
+    path: ArcPath, pass_pos: NDArray[np.floating], pass_normals: NDArray[np.floating]
+) -> NDArray[np.floating]:
+    """Return the arc length at which the path crosses each pass's plane, in passing order.
+
+    A nearest-point lookup is the wrong tool here, and using one was the bug that made the gate
+    tunnel inert: on a track whose gates sit close together, the nearest point of the path to a
+    gate centre can be metres away from where the path flies through it. Measured on a level 2
+    re-plan, the nearest-point arc for the *next* gate came out at 8.36 m on a 9.39 m path while the
+    drone was already 0.41 m from that gate's plane - so every consumer that keys on "how far am I
+    from this gate" was told the gate sat at the far end of the path.
+
+    The passes are visited in order, so the crossing of pass ``i`` is the first plane crossing at or
+    after the crossing of pass ``i - 1``. Searching forward from the previous crossing is
+    correct and monotone by construction.
+    monotone by construction.
+
+    Args:
+        path: The planned path.
+        pass_pos: Gate centres in passing order, shape ``(n_passes, 3)``.
+        pass_normals: Signed traversal normal of each pass, shape ``(n_passes, 3)``.
+
+    Returns:
+        The crossing arc lengths, shape ``(n_passes, )``, non-decreasing.
+    """
+    centres = np.asarray(pass_pos, dtype=float).reshape(-1, 3)
+    if not len(centres):
+        return np.zeros(0)
+    # A pathological path (a diverged fit) must not try to allocate ten billion samples.
+    samples = int(np.clip(path.length / 0.01, 200, 20000))
+    grid = np.linspace(0.0, path.length, samples)
+    points = np.asarray(path.pos(grid), dtype=float).reshape(-1, 3)
+    arcs = np.zeros(len(centres))
+    previous = 0.0
+    for index, (centre, normal) in enumerate(zip(centres, pass_normals, strict=True)):
+        normal = np.asarray(normal, dtype=float)
+        local = (points - centre) @ normal
+        changes = np.flatnonzero(np.diff(np.sign(local)) != 0)
+        changes = changes[grid[changes] >= previous - 1e-9]
+        # The path can cross a gate's plane more than once - the route to a later gate flies past
+        # an earlier one, and the runout leaves through a plane it has already used. Only the
+        # crossing *inside the opening* (0.101 m, the offset a body still fits at) is the passage,
+        # so prefer the first such crossing and fall back to the closest to the centre.
+        best_arc, best_offset = None, np.inf
+        for crossing in changes:
+            first = int(crossing)
+            fraction = -local[first] / (local[first + 1] - local[first] + 1e-12)
+            point = points[first] + fraction * (points[first + 1] - points[first])
+            offset = float(np.linalg.norm((point - centre) - ((point - centre) @ normal) * normal))
+            if offset < best_offset:
+                best_arc = grid[first] + fraction * (grid[first + 1] - grid[first])
+                best_offset = offset
+            if offset <= 0.101:
+                break
+        if best_arc is None:
+            # A pass the path only grazes has no sign change; the nearest sample is at most one
+            # sample spacing away from the truth.
+            best_arc = float(grid[int(np.argmin(np.abs(local)))])
+        arcs[index] = best_arc
+        previous = float(best_arc)
+    return arcs
 
 
 def track_reference(
@@ -1601,6 +1555,7 @@ def track_reference(
     thetas: NDArray[np.floating],
     gate_centers: NDArray[np.floating],
     obstacles: NDArray[np.floating],
+    gate_weight: float = GATE_PROXIMITY_WEIGHT,
 ) -> tuple[NDArray[np.floating], NDArray[np.floating], NDArray[np.floating]]:
     """Evaluate the path reference used by the MPCC stage cost.
 
@@ -1609,11 +1564,19 @@ def track_reference(
     its contouring and lag weights with it, so the drone hugs the path exactly where it has to pass
     through a gate and is free to cut corners in between.
 
+    ``gate_weight`` exists because the gate Gaussian and the tunnel
+    ([docs/planning/tunnel_constraint.md](../../docs/planning/tunnel_constraint.md)) are two answers
+    to the same problem, and they fight when both are on: the Gaussian pulls the drone onto the path
+    at the gate while the tunnel allows the whole opening, so both add cost without safety.
+    A controller that runs the tunnel passes ``gate_weight = 0`` and leaves gate accuracy to the
+    constraint, which is the formulation of MPCC++ (Krinner, Romero et al., RSS 2024).
+
     Args:
         path: The planned path.
         thetas: Arc length parameters at which to evaluate, shape ``(n, )``.
         gate_centers: Gate centres in passing order, shape ``(n_passes, 3)``.
         obstacles: Obstacle positions, shape ``(n_obstacles, 3)``.
+        gate_weight: Peak contour weight at a gate. Zero disables the gate term.
 
     Returns:
         The reference positions ``(n, 3)``, unit tangents ``(n, 3)`` and proximity weights
@@ -1622,12 +1585,7 @@ def track_reference(
     thetas = np.asarray(thetas, dtype=float).ravel()
     positions = path.pos(thetas)
     tangents = path.tangent(thetas)
-    weights = np.zeros(len(thetas))
-    if gate_centers is not None and len(gate_centers):
-        dist_sq = np.sum((positions[:, None, :] - np.asarray(gate_centers)[None, :, :]) ** 2, -1)
-        weights = np.maximum(
-            weights, (GATE_PROXIMITY_WEIGHT * np.exp(-_PROXIMITY_DECAY * dist_sq)).max(axis=1)
-        )
+    weights = proximity_weight(positions, gate_centers, gate_weight)
     if obstacles is not None and len(obstacles):
         delta = positions[:, None, :2] - np.asarray(obstacles)[None, :, :2]
         dist_sq = np.sum(delta**2, -1)
@@ -1635,3 +1593,31 @@ def track_reference(
             weights, (OBSTACLE_PROXIMITY_WEIGHT * np.exp(-_PROXIMITY_DECAY * dist_sq)).max(axis=1)
         )
     return positions, tangents, weights
+
+
+def proximity_weight(
+    positions: NDArray[np.floating], centres: NDArray[np.floating] | None, peak: float
+) -> NDArray[np.floating]:
+    """Return the Gaussian proximity bump around the nearest centre.
+
+    The contour cost and the speed law want the same shape of bump but for different reasons, and
+    they must not share one knob: the contour cost wants the drone on the path at a gate, while the
+    speed law wants it slow enough to correct a revealed pose error before the gate. Coupling them -
+    which is what one ``weight`` array does - meant turning the gate contour weight off to let a
+    tunnel take over the gate also switched the speed throttle off, and no measurement could tell
+    the two apart.
+
+    Args:
+        positions: Positions to evaluate, shape ``(n, 3)``.
+        centres: Bump centres, shape ``(n_centres, 3)``, or ``None``.
+        peak: Value at a centre.
+
+    Returns:
+        The weight at each position, shape ``(n, )``, in ``[0, peak]``.
+    """
+    positions = np.asarray(positions, dtype=float).reshape(-1, 3)
+    if peak <= 0.0 or centres is None or not len(centres):
+        return np.zeros(len(positions))
+    centres = np.asarray(centres, dtype=float).reshape(-1, 3)
+    dist_sq = np.sum((positions[:, None, :] - centres[None, :, :]) ** 2, -1)
+    return (peak * np.exp(-_PROXIMITY_DECAY * dist_sq)).max(axis=1)

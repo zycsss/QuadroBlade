@@ -44,15 +44,18 @@ The re-plan is now seeded (`PathSeed`, `PathPlanner.plan(seed=...)`):
 2. it leaves along the old path's **tangent**, not toward the next gate;
 3. the part of the first passage behind the seed step is dropped, and the seed step is clamped so it
    never overshoots that passage (`PathConfig.trim_seeded_passage`);
-4. `_pin_anchor` puts the first 0.25 m of the *finished* path back onto the old path, with a smootherstep
-   blend, because the smoothing, the gate straightening and the clearance pass each drag the start a
-   few centimetres away — that is how the fold survived every earlier attempt.
+4. the plan is a B-spline whose first three control points are the anchor and the drone's measured
+   velocity and acceleration, so the start cannot be dragged away by a later stage: the pin is a
+   boundary condition, not a correction applied afterwards.
 
-The pin has to run on the dense samples, not on the waypoints (`_to_arc_path`, not `plan`). The
-arc-length reparameterization refits a natural cubic and resamples it up to twenty times, and its first
+That last point used to be a different mechanism. Before the B-spline the planner drew a natural cubic
+spline, arc-length reparameterized it, and then moved the first 0.25 m of the finished path back onto
+the old one with a smootherstep blend. It had to run on the dense samples rather than on the waypoints,
+because the reparameterization refits the spline and resamples it up to twenty times, and its first
 tangent drifts a little on every sweep: measured on a real re-plan, a start that was straight along the
-old path came out **100 deg off it**, which is a fold recreated by the stage that was supposed to remove
-it. On the samples the fitted path is actually built from, the drift cannot undo the pin.
+old path came out **100 deg off it**, a fold recreated by the stage that was supposed to remove it. The
+B-spline removes the need for that stage entirely - the first control points *are* the state - and the
+pin, `_pin_anchor`, is gone.
 
 Level 2, seeds 0-39:
 
@@ -247,6 +250,110 @@ passes (6, 11, 28, 33, 34, 36, 39) and two early take-off contacts (30, and 8 at
 relaxation pulls the curve off the passages and distorts the first metres after the anchor. It needs
 a wider passage lock and a stronger fidelity term before it can be adopted; the knobs are in place.
 
+## Measured: what it costs to go faster
+
+Six variants on level 2, seeds 0-39. The baseline is the current default (35/40, 8.37 s):
+
+| variant | success | mean lap | verdict |
+| --- | --- | --- | --- |
+| `mu_speed` 10 -> 16 | 35/40 | 8.36 s | no effect |
+| `a_lat_max` 4 -> 6 | 34/40 | 8.84 s | **slower** |
+| both | 34/40 | 8.84 s | slower |
+| `replan_slowdown_time` 0.8 -> 0.35 s, factor 0.5 -> 0.7 | 30/40 | 7.90 s | 0.47 s for 5 finishes |
+| post-replan slowdown off | 22/40 | 6.89 s | 1.5 s for 13 finishes |
+
+The reference-speed knobs do nothing, or hurt. `mu_speed` only sets the closed-form speed inside
+the high-weight zones, and the curvature and lead clamps dominate there; `a_lat_max` 6 raises the
+corner speed limit, the drone tracks worse, and the extra corrections cost more than the speed they
+buy. The only lever with a real effect is the post-replan slowdown, and it is exactly the margin the
+rest of this page is about: 1.5 s of lap time buys 13 finishes. So the lap time is set by how long the
+drone needs to correct after each reveal, not by how fast the reference asks it to fly - to go faster
+the corrections have to get cheaper (uncertainty-aware planning) or rarer (coalescing, measured worse),
+not the reference speed higher.
+
+Two knobs were removed while measuring this. `gate_correction_hold_time` and `reveal_speed_corrected`
+existed only to hold the approach cap after a gate correction; the 35/40 configuration runs with the
+cap off, so they are gone and `reveal_hold_time` carries its measured default of 0.0 s.
+
+## Measured: what A* and the polyline stages are worth
+
+The planner has three switches (`PathConfig.use_astar`, `use_push_out`, `use_smoothing`) so the
+question "can the B-spline connect the gate waypoints on its own?" can be answered rather than
+argued. Seeds 0-19, level 2, baseline 17/20 at 7.58 s:
+
+| configuration | success | mean lap | note |
+| --- | --- | --- | --- |
+| baseline: A* + push-out + smoothing | **17/20** | **7.58 s** | |
+| no A* | 13/20 | 8.28 s | straight chords pass poles; the local push-out bends the line late, which is the kink A* was introduced to avoid |
+| no A*, no push-out, no smoothing ("only the B-spline") | 0/20 | - | the fit does not visit the gates: see below |
+| no smoothing (A* + push-out kept) | 17/20 | 7.58 s | the fit and the relaxation round the corners on their own |
+
+The geometry of one plan (the seed-0 opening plan, measured directly, not through the simulator):
+
+| configuration | waypoints | polyline | spline | max turn | pole clearance |
+| --- | --- | --- | --- | --- | --- |
+| baseline | 1500 | 11.03 m | 10.89 m | 3.8 deg | 0.149 m |
+| no A* | 1500 | 11.04 m | 10.89 m | 4.1 deg | 0.147 m |
+| only the B-spline | 24 | 10.77 m | **7.85 m** | 4.8 deg | 0.143 m |
+| no push-out | 26 | 5.16 m | 381 m | 170 deg | 0.036 m |
+
+Two things follow, and they are the answer to "can the spline be the only connector":
+
+* **The fit is not a connector.** Fitted with well-conditioned settings (six control points for 24
+  waypoints) it *shortcuts* the polyline - 7.85 m of spline through a 10.77 m waypoint line - so the
+  passages it should fly through are cut off. With more control points it diverges: one control point
+  per sample makes the least-squares problem square and degenerate, and the same plan came out as a
+  **1.5e10 m** spline. The code now requires at least four samples per control point
+  (`n_control <= len(waypoints) // 4`), which is inert for the normal path (169 control points against
+  375 allowed) and is what keeps a sparse input conditioned.
+* **The relaxation is not a clearance solver.** With the push-out off - so the pole projection inside
+  `relax_control_points` is the only thing keeping the curve clear - the same plan diverges to 381 m
+  with 4 turns over 90 deg and 3.6 cm of clearance. The projection is a local repair on top of a clear
+  polyline; it cannot create one.
+
+So A* is worth four finishes, and the polyline stages are what make the fit well posed. The one stage
+that could go is the smoothing - the B-spline and its relaxation already round the corners - and it is
+a clean removal (17/20 at 7.58 s on these seeds). **What cannot go is the dense, pole-clear polyline
+that A* and the push-out produce.**
+
+## Measured: joint tuning does not beat the hand setting
+
+The eight weights were swept one at a time on this page, so `scripts/tune_mpcc.py` runs a trust-region
+Bayesian optimiser (TuRBO-8) over them instead. Four things had to be fixed before it could say
+anything, and each was a measurement:
+
+* the incumbent must be the **shipped configuration**, evaluated first. Without that, twelve
+  evaluations of a five-parameter space all landed 20-45 reward points *below* the default and the
+  optimiser could not tell.
+* the trust region has to **start narrow** (0.1, not 0.4 of the whole log range); at 0.4 the "local"
+  search was sampling the whole space.
+* `w_speed_gate` and `w_tunnel` came out of the space: the first is inert (4.0 and 2.0 give
+  bit-identical runs, because the gate speed is clamped by `reveal_speed` and `v_max`), the second
+  measures worse at every setting.
+* the seeds must **rotate over a pool**. Scoring ten fixed seeds overfits, and the first run proved it.
+
+Two runs, each validated on 40 unseen seeds (60-99) where the shipped configuration scores
+**34/40 at 8.20 s**:
+
+| run | what the optimiser saw | candidate | unseen seeds |
+| --- | --- | --- | --- |
+| 300 episodes, 10 fixed seeds | 80 % against the shipped 70 % | `q_contour_peak 3832, mu_speed 27.2, a_lat_max 5.4, slowdown 0.62, reveal 1.73` | **30/40, 8.55 s** |
+| 600 episodes, 20 seeds rotating over 60 | 85 % against the shipped 65 % | `q_contour_peak 3906, mu_speed 19.3, a_lat_max 7.4, slowdown 0.55, reveal 1.87` | **32/40, 8.14 s** |
+
+Both regress, and the reason is measurable rather than mysterious: at 20 episodes the standard error of
+an 85 % success rate is about 8 %, i.e. **±2.6 seeds** - the same size as the "improvements" the
+optimiser found - and the reward makes it worse by pricing one crash at 2.0, which is two seconds of
+lap time. So the search is fitting seed noise, not the controller.
+
+What would work: 100+ episodes per evaluation (a 1-2 seed difference is then resolvable) at ~10 s per
+episode, i.e. a 20-30 minute evaluation per candidate and a budget of several hours. Or optimise lap
+time only, on a seed set where every candidate is known to finish - which is not the problem we have.
+
+The hand setting therefore stands, with one deliberate change: the post-re-plan slowdown is now
+`factor 0.7`, which is **32/40 at 7.78 s** on seeds 0-39 against 35/40 at 8.37 s for 0.5 - 0.59 s a lap
+for three finishes, taken because the lap time is what the competition scores. Everything else on this
+page is unchanged.
+
 ## The numbers to build on
 
 All measured, see `docs/control/characterisation.md` and the failure analysis.
@@ -328,7 +435,7 @@ resampled back onto the input spacing so nothing downstream changes.
 | `_smooth_path` | 50.0 ms | **1.0 ms** | 13 % |
 | `_avoid_obstacles` | 3.8 ms | **3.6 ms** | **48 %** |
 | `_connect_blocks` (A*) | 1.6 ms | **1.5 ms** | **20 %** |
-| `_to_arc_path` | 0.8 ms | **0.7 ms** | 9 % |
+| `_to_arc_path` (now `_to_bspline_path`) | 0.8 ms | **0.7 ms** | 9 % |
 | everything else | 0.7 ms | 0.7 ms | 9 % |
 | **total** | **55.8 ms** | **7.5 ms** | |
 
@@ -413,8 +520,9 @@ ESDF, fast-restarting L-BFGS, and no requirement for a collision-free initialisa
 1. `control/bspline_path.py`: `BsplinePath`, uniform cubic, clamped ends, implementing the `ArcPath`
    duck type (`length`, `pos`, `tangent`, `curvature`, `closest` with the monotone `window`
    contract). `length` stays arc-length based, so the MPCC progress code is unchanged.
-2. `PathPlanner` returns a `BsplinePath` behind `PathConfig.path_kind = "bspline"`. The existing
-   spline stays the default until the branch proves itself.
+2. `PathPlanner` returns a `BsplinePath`, and it is the only representation left: the natural cubic
+   spline, its arc-length reparameterization and the anchor pin that went with them were deleted once
+   the B-spline replaced them.
 3. `PathPlanner.repair(path, obs, theta)`:
    - window = control points covering `[theta - 0.2, theta + repair_window]` (`repair_window` ~3 m),
    - free variables = the control points in that window, everything else pinned,

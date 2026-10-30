@@ -50,11 +50,15 @@ from scipy.spatial.transform import Rotation as R
 
 from lsy_drone_racing.control import Controller
 from lsy_drone_racing.control.path_planning import (
+    GATE_PROXIMITY_WEIGHT,
+    OBSTACLE_PROXIMITY_WEIGHT,
     ArcPath,
+    GateFrames,
     PathInfo,
     PathPlanner,
     PathSeed,
     path_config_from,
+    proximity_weight,
     track_reference,
 )
 
@@ -80,8 +84,63 @@ MAX_BARRIER_POLE = 6
 #: Value written into an unused obstacle slot [m]. Far enough that the penalty is exactly zero.
 BARRIER_OFF = 1.0e3
 
-#: Number of OCP parameters: reference position, tangent, proximity weight, then the pole centres.
-NP = 7 + 2 * MAX_BARRIER_POLE
+#: Tunnels carried in the OCP parameter vector, for the gate-passage constraint. Two, because a
+#: 0.8 s horizon can hold two gate passes on this track; a third logs a warning, not a silent drop.
+MAX_TUNNEL = 2
+
+#: Slope of the tunnel barrier. After MPCC++ (Krinner, Romero et al., RSS 2024), which uses this
+#: value: the barrier is nearly inert more than 5 cm inside the tunnel and nearly hard just outside.
+TUNNEL_ALPHA = 100.0
+
+#: Value written into an unused tunnel slot [m]. With a zero frame it makes every half-space slack
+#: ``1e3``, so the barrier is exactly zero and the slot costs nothing but three multiplications.
+TUNNEL_OFF = 1.0e3
+
+#: Number of OCP parameters: reference position, tangent, proximity weight, pole centres, the tunnel
+#: slots of ``[in-plane axis a, in-plane axis b, centre, half width]``, then the tunable weights.
+NP_REFERENCE = 7
+#: Cost weights that travel in the parameter vector rather than in the compiled expression, so a
+#: tuning sweep does not need a one minute solver rebuild per evaluation. Their order is
+#: the order of [WEIGHT_FIELDS][lsy_drone_racing.control.my_controller.WEIGHT_FIELDS].
+#: [WEIGHT_FIELDS][lsy_drone_racing.control.my_controller.WEIGHT_FIELDS].
+NP_WEIGHTS = 7
+NP = NP_REFERENCE + 2 * MAX_BARRIER_POLE + MAX_TUNNEL * 10 + NP_WEIGHTS
+
+#: The ``MPCCConfig`` weights carried in the parameter vector, in the order they are written.
+WEIGHT_FIELDS = (
+    "q_lag",
+    "q_contour",
+    "q_lag_peak",
+    "q_contour_peak",
+    "mu_speed",
+    "r_vtheta",
+    "w_tunnel",
+)
+
+#: Offset of the weight block inside the parameter vector.
+NP_WEIGHT_OFFSET = NP_REFERENCE + 2 * MAX_BARRIER_POLE + MAX_TUNNEL * 10
+
+#: Cap on the barrier exponent. ``log(1 + exp(50))`` is finite, so the cost cannot overflow the way
+#: ``log(1 + exp(-alpha * h))`` would for a drone deep inside a narrow tunnel.
+TUNNEL_BARRIER_CLIP = 50.0
+
+
+def tunnel_barrier(slack: cs.SX | cs.DM) -> cs.SX | cs.DM:
+    """Return the soft tunnel barrier over a vector of half-space slacks.
+
+    ``log(1 + exp(-alpha * slack))`` is the barrier MPCC++ (Krinner, Romero et al., RSS 2024) uses
+    in place of a hard constraint: nearly zero well inside the tunnel, ~``alpha/2`` per unit
+    violation near a face, and cheap enough for a real-time SQP iteration. It is written against
+    CasADi so the same function is what the solver evaluates and what the tests probe.
+
+    Args:
+        slack: Half-space slacks, positive inside the tunnel, as a CasADi expression or array.
+
+    Returns:
+        The sum of the barrier terms, with the same type as the input.
+    """
+    return cs.sum1(cs.log(1.0 + cs.exp(cs.fmin(-TUNNEL_ALPHA * slack, TUNNEL_BARRIER_CLIP))))
+
 
 #: MPCC settings for a randomized track, i.e. for the levels that re-plan on sensor updates.
 #:
@@ -89,18 +148,17 @@ NP = 7 + 2 * MAX_BARRIER_POLE
 #: every provided config file and reports an edited one as cheating. They were tuned on level 2,
 #: seeds 0-19: the MPCC defaults give 12.34 s per lap, this gives 8.17 s with the same success rate
 #: (13/20, the failures are pole contacts caused by late reveals, not by the pace). The reference
-#: speed is ``mu_speed / (2 * (w_speed_gate * gate_weight + r_vtheta))``, so ``w_speed_gate``
-#: sets the pace at the gates and ``a_lat_max`` the pace in the corners; ``v_max`` alone barely
-#: nothing. See the speed budget in the README.
+#: speed is ``mu_speed / (2 * (w_speed_gate * gate_weight + r_vtheta))``, so ``w_speed_gate`` sets
+#: the pace at the gates and ``a_lat_max`` the pace in the corners; ``v_max`` alone barely binds.
 RANDOMIZED_TRACK_MPCC = {
     "w_speed_gate": 4.0,
     "a_lat_max": 8.0,
     "v_max": 3.5,
     "replan_slowdown_time": 0.3,
-    # The distance penalty is left off: measured on level 2 it changed nothing (13/20 either way,
-    # pose the plan does, so it pushes away from the wrong place; and where the pose is known the
-    # path already keeps 0.187 m, outside the 0.14 m radius. The planning page has the numbers.
-    # path already keeps 0.187 m, outside the 0.14 m radius. See the planning page for the numbers.
+    # The distance penalty is left off: measured on level 2 it changed nothing (13/20 either way),
+    # because where the pose is unknown it pushes away from the nominal pose rather than the one the
+    # plan uses, and where the pose is known the path already keeps 0.187 m, outside the 0.14 m
+    # radius. See the planning page for the numbers.
     "w_obstacle": 0.0,
 }
 _SOLVER_CACHE: dict[str, tuple[AcadosOcpSolver, AcadosOcp]] = {}
@@ -129,6 +187,19 @@ class MPCCConfig:
             it just above the drone's collision reach (0.085 m face-on, 0.114 m corner-on for the
             0.14 x 0.14 x 0.04 m box) so the term only fights a contact that is about to happen
             rather than reshaping the whole corner.
+        w_tunnel: Weight of the gate-passage tunnel barrier. The tunnel is a box of half width
+            ``W(arc)`` around the planned path, wide between gates and narrowing to the opening at
+            each gate plane; the barrier makes the drone pay exponentially for approaching a face,
+            where the contour cost only pays quadratically for being off the path. Zero disables the
+            tunnel and leaves gate accuracy to ``q_contour_peak``, which is what the cost-level
+            formulation does and what MPCC++ (Krinner, Romero et al., RSS 2024) argues against.
+        tunnel_gate_half_width: Half width [m] of the tunnel at a gate plane. The opening is
+            0.40 m wide and the drone's contact radius is 0.099 m, so 0.09 leaves about 11 mm.
+        tunnel_nominal_half_width: Half width [m] of the tunnel at the edge of
+            ``tunnel_window``. Between gates the drone is free to cut the corner, so this is wide.
+        tunnel_window: Arc length [m] over which the tunnel narrows from the nominal half width to
+            the gate half width. Beyond it the tunnel is inactive, which is what keeps it from
+            fighting the pole avoidance between gates.
         contour_z_weight: Extra emphasis on the vertical contour error. The gates are only 0.4 m
             tall, so altitude accuracy, not lateral accuracy, limits the pass margin.
         q_attitude: Penalty on the absolute roll/pitch/yaw.
@@ -136,6 +207,10 @@ class MPCCConfig:
         mu_speed: Weight of the progress reward.
         r_vtheta: Quadratic regularization of the path progress rate.
         w_speed_gate: Proximity-dependent penalty on the path progress rate.
+        gate_speed_weight: Peak of the speed law's own proximity bump at a gate, independent of the
+            contour weight. Keeping it non-zero is what lets a controller lower the gate contour
+            weight (or hand the gate to a tunnel) without also losing the approach slowdown that the
+            revealed-pose correction depends on.
         v_min: Minimum reference path speed [m/s].
         v_max: Maximum reference path speed [m/s] and input bound on the progress rate.
         v_lead: Maximum speed [m/s] by which the path reference may run ahead of the drone. Without
@@ -173,7 +248,10 @@ class MPCCConfig:
         replan_slowdown_time: Time [s] for which the reference speed is reduced after a re-plan.
             A revealed gate can be up to 0.2 m away from its nominal pose, and the drone needs a
             moment to converge onto the corrected approach line before it reaches the gate.
-        replan_slowdown_factor: Factor applied to the reference speed during that time.
+        replan_slowdown_factor: Factor applied to the reference speed during that time. Measured on
+            level 2, seeds 0-39: 0.5 gives 35/40 at 8.37 s, 0.7 gives **32/40 at 7.78 s**, 0.8 gives
+            14/20 at 7.49 s and 0.35 with a 0.5 s window gives 14/20 at 9.34 s. The default is 0.7:
+            0.59 s a lap for three finishes, taken deliberately because the lap time is the score.
         replan_coalesce_ticks: Quiet period in control ticks before a pending reveal is planned for.
             Reveals arrive in bursts, 36 percent of them within the previous re-plan's slowdown
             window, and three paths in a quarter of a second buy nothing.
@@ -189,12 +267,6 @@ class MPCCConfig:
         reveal_window: Arc length [m] in front of a gate over which ``reveal_speed`` applies.
         reveal_hold_time: Time [s] the cap stays on after a gate pose was corrected. The reveal is
             when the correction starts, not when it is finished.
-        gate_correction_hold_time: Time [s] a gate correction keeps the approach cap on. A revealed
-            gate 0.21 m from its nominal pose needs 0.46 s of lateral travel, and the reveal lands
-            0.7 m out, so the correction is still being paid for when the drone reaches the gate.
-        reveal_speed_corrected: Speed ceiling [m/s] while a gate correction is still being paid for.
-            Lower than ``reveal_speed`` because the lateral distance to make up is known and finite,
-            while an unseen gate's is not.
         name: Name of the acados model and of the generated code.
     """
 
@@ -209,6 +281,12 @@ class MPCCConfig:
     # the plan can guarantee a larger margin.
     w_obstacle: float = 0.0
     obstacle_radius: float = 0.14
+    # Zero in the plumbing commit: with the tunnel off this file must reproduce the 35/40 measured
+    # before it, which is also how the parameter wiring is verified to be inert.
+    w_tunnel: float = 0.0
+    tunnel_gate_half_width: float = 0.09
+    tunnel_nominal_half_width: float = 0.40
+    tunnel_window: float = 0.6
     q_lag_peak: float = 2000.0
     q_contour_peak: float = 6000.0
     contour_z_weight: float = 2.0
@@ -217,6 +295,7 @@ class MPCCConfig:
     mu_speed: float = 10.0
     r_vtheta: float = 0.2
     w_speed_gate: float = 18.0
+    gate_speed_weight: float = GATE_PROXIMITY_WEIGHT
     v_min: float = 0.5
     v_max: float = 2.3
     v_lead: float = 0.6
@@ -244,7 +323,7 @@ class MPCCConfig:
     replan_coalesce_ticks: int = 0
     replan_max_defer_ticks: int = 0
     replan_defer_in_passage: bool = False
-    replan_slowdown_factor: float = 0.5
+    replan_slowdown_factor: float = 0.7
     # Measured on level 2: braking to 0.15 of the reference speed for 0.15 s after every re-plan
     # costs 0.31 s of lap time, 8.99 s to 9.30 s, and does not raise the finish count on the 20-seed
     # screen. The hold is therefore off: a factor of 1.0 with a zero window makes it a no-op.
@@ -257,12 +336,10 @@ class MPCCConfig:
     # there. Measured on level 2: see the planning page.
     reveal_speed: float = 1.5
     reveal_window: float = 1.2
-    reveal_hold_time: float = 0.5
-    # Measured: capping the approach at 1.1 m/s for 2 s after a gate correction costs 0.4 s a lap
-    # and does not save seeds 4, 13, 31 or 39 - they cross the plane 0.13-0.15 m off a plan that is
-    # dead centre whatever the speed, because the correction is lateral and the path left is short.
-    gate_correction_hold_time: float = 0.0
-    reveal_speed_corrected: float = 1.5
+    # Measured: keeping this at 0.5 s costs finishes now that the plan is better. The 35/40
+    # configuration runs with the hold off, and the correction is paid for by the post-replan
+    # slowdown instead - see the speed sweep on the planning page.
+    reveal_hold_time: float = 0.0
     name: str = "mpcc_racing"
 
     @property
@@ -301,22 +378,17 @@ def _signature(config: MPCCConfig, params: dict) -> str:
     return hashlib.sha256(digest).hexdigest()[:16]
 
 
-#: The MPCCConfig fields that `build_ocp` reads. Everything else only affects the running
-#: controller, so changing it must not invalidate the compiled solver.
+#: The MPCCConfig fields that `build_ocp` reads *and* bakes into the compiled expression. Everything
+#: else only affects the running controller, or travels in the parameter vector (``WEIGHT_FIELDS``),
+#: so changing it must not invalidate the compiled solver.
 _OCP_FIELDS = (
     "N",
     "dt",
-    "q_lag",
-    "q_contour",
     "w_obstacle",
     "obstacle_radius",
-    "q_lag_peak",
-    "q_contour_peak",
     "contour_z_weight",
     "q_attitude",
     "r_rates",
-    "mu_speed",
-    "r_vtheta",
     "v_max",
     "thrust_lag",
     "qp_solver",
@@ -409,13 +481,16 @@ def build_ocp(config: MPCCConfig, params: dict) -> AcadosOcp:
     # Emphasize the vertical contour error: the drone tends to arrive high at the shortest gates,
     # and the gates are only 0.4 m tall, so altitude accuracy is what limits the pass margin.
     contour = cs.vertcat(contour[0], contour[1], config.contour_z_weight * contour[2])
-    q_lag = config.q_lag + config.q_lag_peak * p[6]
-    q_contour = config.q_contour + config.q_contour_peak * p[6]
+    # The weights that a tuning sweep touches travel in the parameter vector (WEIGHT_FIELDS), so a
+    # sweep costs episodes, not one-minute solver rebuilds per evaluation.
+    w = p[NP_WEIGHT_OFFSET : NP_WEIGHT_OFFSET + NP_WEIGHTS]
+    q_lag = w[0] + w[2] * p[6]
+    q_contour = w[1] + w[3] * p[6]
     cost = q_lag * cs.dot(lag, lag) + q_contour * cs.dot(contour, contour)
     cost += config.q_attitude * cs.dot(x[6:9], x[6:9])
     rates = u[0:4]
     cost += cs.dot(rates, cs.mtimes(cs.DM(np.diag(config.r_rates)), rates))
-    cost += config.r_vtheta * v_theta * v_theta - config.mu_speed * v_theta
+    cost += w[5] * v_theta * v_theta - w[4] * v_theta
     # One-sided distance penalty: zero while the drone keeps ``obstacle_radius`` from a pole centre,
     # quadratic inside it. ``max(0, r - d)**2`` is continuously differentiable at the boundary,
     # so it adds no kink to the cost, and unused slots sit at BARRIER_OFF where it is zero. It is
@@ -429,6 +504,32 @@ def build_ocp(config: MPCCConfig, params: dict) -> AcadosOcp:
             distance = cs.sqrt(gap_x * gap_x + gap_y * gap_y + 1e-9)
             violation = cs.fmax(0.0, config.obstacle_radius - distance)
             cost += config.w_obstacle * violation * violation
+    # Gate-passage tunnel: a box of half width W(arc) around the planned path, wide between gates
+    # and narrowing to the opening at each gate plane. The paper's four half-spaces around the
+    # corner ``p0 = c - W n - W b`` collapse to ``|(x - c).n| <= W`` and ``|(x - c).b| <= W``,
+    # i.e. a square cross-section, which is the shape of the gates. The barrier
+    # ``log(1 + exp(-alpha h))`` is nearly inert well inside the tunnel and grows exponentially as a
+    # face is approached, so the drone cannot buy progress with a gate clip the way it can against a
+    # quadratic contour cost. Unused slots carry a zero frame and ``W = TUNNEL_OFF``, which makes
+    # every slack huge and the barrier exactly zero.
+    for slot in range(MAX_TUNNEL):
+        offset = NP_REFERENCE + 2 * MAX_BARRIER_POLE + 10 * slot
+        # The two axes span the gate opening; the opening's normal is the corridor axis and is
+        # deliberately not constrained, which is what makes the tunnel a corridor and not a box.
+        axis_a = p[offset : offset + 3]
+        axis_b = p[offset + 3 : offset + 6]
+        delta = x[0:3] - p[offset + 6 : offset + 9]
+        half_width = p[offset + 9]
+        along_a = cs.dot(delta, axis_a)
+        along_b = cs.dot(delta, axis_b)
+        cost += w[6] * tunnel_barrier(
+            cs.vertcat(
+                half_width - along_a,
+                half_width + along_a,
+                half_width - along_b,
+                half_width + along_b,
+            )
+        )
     model.cost_expr_ext_cost = cost
     model.cost_expr_ext_cost_e = cs.SX(0)
 
@@ -440,6 +541,9 @@ def build_ocp(config: MPCCConfig, params: dict) -> AcadosOcp:
     ocp.cost.cost_type_e = "EXTERNAL"
     ocp.parameter_values = np.full(NP, BARRIER_OFF)
     ocp.parameter_values[:7] = 0.0
+    ocp.parameter_values[9:19] = TUNNEL_OFF
+    for index, name in enumerate(WEIGHT_FIELDS):
+        ocp.parameter_values[NP_WEIGHT_OFFSET + index] = getattr(config, name)
 
     # Box constraints on position, thrust setpoints, attitude setpoints and path progress.
     ocp.constraints.idxbx = np.array([0, 1, 2, 9, 10, 11, 12, 13, 14])
@@ -692,6 +796,10 @@ class MPCCController(Controller):
         self._accel = np.zeros(3)
         self._reset_mass_history()
         self._theta = 0.0
+        self.min_slack = TUNNEL_OFF
+        self.gate_gap = float("nan")
+        self.plane_gap = float("nan")
+        self._tunnel_warned = False
         self._tick = 0
         self._failures = 0
         self._stall_time = 0.0
@@ -718,12 +826,21 @@ class MPCCController(Controller):
         self._gate_centers = info.gate_centers
         self._obstacles = info.obstacles
         self._draw_points = path.pos(np.linspace(0.0, path.length, 200))
-        # Arc length of every remaining gate pass on this path, for the approach speed cap: a gate
-        # that has not been seen yet may be up to 0.21 m away from the pose the plan aims at, and
-        # correction has to be paid for before the drone reaches it.
-        self._gate_arc = np.array(
-            [path.closest(centre, 0.0, window=(-0.15, path.length)) for centre in info.gate_centers]
-        )
+        # Arc length of every remaining gate pass on this path, for the tunnel funnel and the
+        # approach speed cap. The planner computes these as plane *crossings*: a nearest-point
+        # lookup put the next gate 8.36 m away on a 9.39 m path and left both mechanisms inert.
+        arcs = np.asarray(getattr(info, "pass_arcs", np.zeros(0)), dtype=float).reshape(-1)
+        if len(arcs) == len(info.gate_centers):
+            self._gate_arc = arcs
+        else:
+            # A path handed in without crossing arcs (the scenario controller) falls back to the
+            # nearest point, which is only used for its gates.
+            self._gate_arc = np.array(
+                [
+                    path.closest(centre, 0.0, window=(-0.15, path.length))
+                    for centre in info.gate_centers
+                ]
+            )
         self._build_speed_limit()
         self._apply_progress_bound()
 
@@ -744,6 +861,150 @@ class MPCCController(Controller):
             values[: 2 * count] = obstacles[:count, :2].ravel()
         return values
 
+    def _pass_frames(
+        self, obs: dict[str, NDArray[np.floating]]
+    ) -> tuple[
+        NDArray[np.floating], NDArray[np.floating], NDArray[np.floating], NDArray[np.floating]
+    ]:
+        """Return the gate frames of the remaining passes, in passing order.
+
+        The tunnel is the gate opening carried along the path, so it is expressed in the gate frame
+        rather than in the path's Frenet frame: a Frenet normal is undefined on a straight segment
+        and rotated relative to the opening elsewhere, while the gate's own axes are the edges of
+        the hole the drone has to fly through.
+
+        Args:
+            obs: The current observation.
+
+        Returns:
+            Centres, normals, lateral axes and vertical axes, each ``(n_passes, 3)``.
+        """
+        centres = np.asarray(self._gate_centers, dtype=float).reshape(-1, 3)
+        empty = np.zeros((0, 3))
+        if not len(centres):
+            return centres, empty, empty, empty
+        frames = GateFrames.from_quaternions(np.asarray(obs["gates_quat"], dtype=float))
+        ids = np.asarray(getattr(self._path_info, "gate_ids", np.zeros(0, dtype=int)), dtype=int)
+        if len(ids) == len(centres):
+            index = np.clip(ids, 0, len(frames.normals) - 1)
+        else:
+            # A path handed in by the scenario controller carries no gate ids: resolve each centre
+            # against the observed poses, the same fallback the planner uses.
+            observed = np.asarray(obs["gates_pos"], dtype=float).reshape(-1, 3)
+            distance = np.linalg.norm(centres[:, None, :] - observed[None, :, :], axis=-1)
+            index = np.argmin(distance, axis=1)
+        return centres, frames.normals[index], frames.y_axes[index], frames.z_axes[index]
+
+    def _tunnel_params(
+        self,
+        theta: float,
+        position: NDArray[np.floating],
+        frames: tuple[
+            NDArray[np.floating], NDArray[np.floating], NDArray[np.floating], NDArray[np.floating]
+        ]
+        | None,
+    ) -> NDArray[np.floating]:
+        """Return the tunnel slots of one stage, shape ``(MAX_TUNNEL * 10, )``.
+
+        The half width is a funnel of the *progress along the path*: it is
+        ``tunnel_gate_half_width`` at the arc length of a gate passage, widens smoothly to
+        ``tunnel_nominal_half_width`` at the edge of ``tunnel_window``, and is inactive beyond it.
+        Keying it on progress rather than on the distance to the gate plane is what keeps a gate the
+        drone merely flies *past* from being constrained: the later gates of this track sit within a
+        metre of each other in space, so a plane-distance trigger punishes the drone for passing a
+        gate it is not crossing yet, which measured 0/20 before this was fixed.
+
+        The slot is centred on the *path point* of the stage, not on the gate centre, so the
+        corridor is a tube that follows the path. Centring it on the gate tests only the in-plane
+        offset and demands a straight approach: measured, a 0.10 m corridor over a 1.2 m window was
+        0/20 as a slab at the gate and is a flyable tube around the path.
+
+        A stage can sit inside the window of two passages at once; the two slots take the narrower
+        pair.
+
+        Args:
+            theta: Arc length of the stage on the active path [m].
+            position: Reference position of the stage on the path, shape ``(3,)``, which is the
+                centre of the tube.
+            frames: The pass frames from [MPCCController._pass_frames][].
+
+        Returns:
+            The slot parameters ``[axis_a, axis_b, centre, half width]`` per slot; the two axes
+            are the gate's in-plane axes, not its normal.
+        """
+        cfg = self._mpcc
+        values = np.zeros(MAX_TUNNEL * 10)
+        values[9::10] = TUNNEL_OFF
+        if cfg.w_tunnel <= 0.0 or frames is None:
+            return values
+        centres, _, lateral_axes, vertical_axes = frames
+        if not len(centres) or not len(self._gate_arc):
+            return values
+        gaps = np.abs(float(theta) - np.asarray(self._gate_arc, dtype=float)[: len(centres)])
+        ratio = np.clip(gaps / max(cfg.tunnel_window, 1e-6), 0.0, 1.0)
+        blend = ratio * ratio * (3.0 - 2.0 * ratio)
+        half_width = cfg.tunnel_gate_half_width + blend * (
+            cfg.tunnel_nominal_half_width - cfg.tunnel_gate_half_width
+        )
+        # The tolerance keeps a stage exactly on the window edge at the nominal width instead of
+        # flipping to inactive on a rounding error: ``1.0 + 0.6 - 1.0`` is not ``0.6``.
+        edge = cfg.tunnel_window * (1.0 + 1e-9)
+        half_width = np.where(gaps > edge, TUNNEL_OFF, half_width)
+        active = int(np.sum(half_width < TUNNEL_OFF))
+        if active > MAX_TUNNEL and not self._tunnel_warned:
+            logger.warning("%d passages in one stage, only %d tunnel slots", active, MAX_TUNNEL)
+            self._tunnel_warned = True
+        for slot, gate in enumerate(np.argsort(half_width)[:MAX_TUNNEL]):
+            if half_width[gate] >= TUNNEL_OFF:
+                continue
+            offset = 10 * slot
+            values[offset : offset + 3] = lateral_axes[gate]
+            values[offset + 3 : offset + 6] = vertical_axes[gate]
+            values[offset + 6 : offset + 9] = np.asarray(position, dtype=float)
+            values[offset + 9] = float(half_width[gate])
+        return values
+
+    def _current_slack(
+        self,
+        position: NDArray[np.floating],
+        theta: float,
+        frames: tuple[
+            NDArray[np.floating], NDArray[np.floating], NDArray[np.floating], NDArray[np.floating]
+        ]
+        | None,
+    ) -> float:
+        """Return the worst tunnel slack at the drone, in metres, positive inside the opening.
+
+        Args:
+            position: The drone's position, shape ``(3,)``.
+            theta: The drone's progress on the active path [m].
+            frames: The pass frames from [MPCCController._pass_frames][], or ``None`` when the
+                tunnel is off.
+
+        Returns:
+            The smallest half-space slack of the active tunnel slots, or ``TUNNEL_OFF`` when no gate
+            plane is inside ``tunnel_window``.
+        """
+        assert self._path is not None
+        centre = self._path.pos(np.array([float(theta)]))[0]
+        tunnel = self._tunnel_params(float(theta), centre, frames)
+        slack = []
+        for slot in range(MAX_TUNNEL):
+            offset = 10 * slot
+            half_width = tunnel[offset + 9]
+            if half_width >= TUNNEL_OFF:
+                continue
+            delta = np.asarray(position, dtype=float) - tunnel[offset + 6 : offset + 9]
+            along_normal = float(delta @ tunnel[offset : offset + 3])
+            along_lateral = float(delta @ tunnel[offset + 3 : offset + 6])
+            slack += [
+                half_width - along_normal,
+                half_width + along_normal,
+                half_width - along_lateral,
+                half_width + along_lateral,
+            ]
+        return float(min(slack)) if slack else float(TUNNEL_OFF)
+
     def _reference(
         self, thetas: NDArray[np.floating]
     ) -> tuple[NDArray[np.floating], NDArray[np.floating], NDArray[np.floating]]:
@@ -757,7 +1018,11 @@ class MPCCController(Controller):
             ``(n, )``, all as used by the MPCC stage parameters.
         """
         assert self._path is not None
-        return track_reference(self._path, thetas, self._gate_centers, self._obstacles)
+        # The gate Gaussian and the tunnel are alternatives, not companions: with the tunnel on, the
+        # gate is a constraint on the state and the contour cost no longer has to hold the drone on
+        # the path there. Keeping both measured one finish worse per twenty seeds.
+        gate_weight = 0.0 if self._mpcc.w_tunnel > 0.0 else GATE_PROXIMITY_WEIGHT
+        return track_reference(self._path, thetas, self._gate_centers, self._obstacles, gate_weight)
 
     def _record_plan(self, reason: str, obs: dict[str, NDArray[np.floating]]):
         """Append the plan that is now active to the plan log.
@@ -786,14 +1051,46 @@ class MPCCController(Controller):
             }
         )
 
+    def _gate_gaps(self, obs: dict[str, NDArray[np.floating]]) -> tuple[float, float]:
+        """Return the progress gap and the plane gap to the nearest remaining pass.
+
+        The tunnel narrows where the *path* crosses a gate, at ``_gate_arc``. If the drone crosses
+        the plane at a different progress - it cuts the corner, or the schedule is ahead of it - the
+        narrowest section of the funnel is never where the drone is, and the constraint is inert
+        exactly when it should bind. These two numbers say which of those happened.
+
+        Args:
+            obs: The current observation.
+
+        Returns:
+            ``min |theta - gate_arc|`` and ``min |(p - centre) . normal|`` over the remaining
+            passes, both in metres.
+        """
+        centres = np.asarray(self._gate_centers, dtype=float).reshape(-1, 3)
+        arcs = np.asarray(self._gate_arc, dtype=float).reshape(-1)
+        if not len(centres) or not len(arcs) or self._path is None:
+            return float("nan"), float("nan")
+        position = np.asarray(obs["pos"], dtype=float)
+        frames = GateFrames.from_quaternions(np.asarray(obs["gates_quat"], dtype=float))
+        ids = np.asarray(getattr(self._path_info, "gate_ids", np.zeros(0, dtype=int)), dtype=int)
+        if len(ids) == len(centres):
+            normals = frames.normals[np.clip(ids, 0, len(frames.normals) - 1)]
+        else:
+            observed = np.asarray(obs["gates_pos"], dtype=float).reshape(-1, 3)
+            distance = np.linalg.norm(centres[:, None, :] - observed[None, :, :], axis=-1)
+            normals = frames.normals[np.argmin(distance, axis=1)]
+        return float(np.min(np.abs(self._theta - arcs[: len(centres)]))), float(
+            np.min(np.abs(np.einsum("pc,pc->p", position[None, :] - centres, normals)))
+        )
+
     def diagnostics(self) -> dict[str, float]:
         """Return the controller's per-step state for logging.
 
         Returns:
             One entry per logged quantity: path progress ``theta``, the reference speed the
             controller asked for, the solve time in milliseconds, the solver status, the online mass
-            estimate as a ratio of the nominal mass, the number of re-plans so far, and the command
-            that was applied.
+            estimate as a ratio of the nominal mass, the number of re-plans so far, the worst tunnel
+            slack at the drone (negative means outside the opening), and the applied command.
         """
         return {
             "theta": float(self._theta),
@@ -802,6 +1099,9 @@ class MPCCController(Controller):
             "solver_status": float(self.status),
             "mass_ratio": float(self._mass_ratio),
             "replans": float(self.replans),
+            "tunnel_slack": float(self.min_slack),
+            "gate_gap": float(self.gate_gap),
+            "plane_gap": float(self.plane_gap),
             "thrust": float(self._last_f_cmd),
             "roll_cmd": float(self._last_rpy_cmd[0]),
             "pitch_cmd": float(self._last_rpy_cmd[1]),
@@ -946,8 +1246,6 @@ class MPCCController(Controller):
             position=self._path.pos(progress),
             tangent=self._path.tangent(progress),
             length=self._planner.config.seed_length,
-            path=self._path,
-            progress=progress,
             velocity=velocity,
             acceleration=self._accel,
         )
@@ -1142,7 +1440,7 @@ class MPCCController(Controller):
             return False
         if not self._next_gate_seen:
             return True
-        hold = int(round(self._mpcc.gate_correction_hold_time * self._freq))
+        hold = int(round(self._mpcc.reveal_hold_time * self._freq))
         return self._tick - self._gate_corrected_tick <= hold
 
     def _reference_speed(self, theta: float, speed_actual: float) -> float:
@@ -1162,15 +1460,21 @@ class MPCCController(Controller):
         """
         cfg = self._mpcc
         assert self._path is not None
-        _, _, weight = self._reference(np.array([theta]))
-        speed = cfg.mu_speed / (2.0 * (cfg.w_speed_gate * float(weight[0]) + cfg.r_vtheta))
+        # The speed bump is its own knob: it slows the drone where a corrected gate pose has to be
+        # paid for, a different job from keeping the contour error small at the gate. Sharing one
+        # weight with the contour cost made the throttle vanish as soon as the gate contour weight
+        # was off, so no experiment could separate gate accuracy from approach speed. The pole
+        # bump still contributes, exactly as it did when the two shared one array.
+        position = self._path.pos(np.array([theta]))
+        speed_weight = max(
+            float(proximity_weight(position, self._gate_centers, cfg.gate_speed_weight)[0]),
+            float(proximity_weight(position, self._obstacles, OBSTACLE_PROXIMITY_WEIGHT)[0]),
+        )
+        speed = cfg.mu_speed / (2.0 * (cfg.w_speed_gate * speed_weight + cfg.r_vtheta))
         speed = min(speed, speed_actual + cfg.v_lead)
         speed = min(speed, float(np.interp(theta, self._speed_grid, self._speed_limit)))
         if self._approach_capped(theta):
-            corrected = self._tick - self._gate_corrected_tick <= int(
-                round(cfg.gate_correction_hold_time * self._freq)
-            )
-            speed = min(speed, cfg.reveal_speed_corrected if corrected else cfg.reveal_speed)
+            speed = min(speed, cfg.reveal_speed)
         if self._tick < self._hold_until:
             # Brake hard right after a re-plan: this is the only place where the controller spends
             # time to buy geometry. The revealed pose can be 0.21 m from the nominal one, and the
@@ -1276,9 +1580,25 @@ class MPCCController(Controller):
         positions, tangents, weights = self._reference(thetas)
         self._horizon_points = positions
         barrier = self._barrier_params()
+        # The cost weights travel in the parameter vector, so a tuning sweep costs episodes and not
+        # a solver rebuild per evaluation.
+        weight_block = np.array([getattr(self._mpcc, name) for name in WEIGHT_FIELDS], dtype=float)
+        # The gate frames cost a quaternion conversion per tick, so they are only resolved when the
+        # tunnel is on. With it off every slot is inactive and the cost term is exactly zero.
+        frames = self._pass_frames(obs) if self._mpcc.w_tunnel > 0.0 else None
         for k in range(self._mpcc.N + 1):
-            params = np.concatenate((positions[k], tangents[k], [weights[k]], barrier))
+            tunnel = self._tunnel_params(thetas[k], positions[k], frames)
+            params = np.concatenate(
+                (positions[k], tangents[k], [weights[k]], barrier, tunnel, weight_block)
+            )
             self._solver.set(k, "p", np.ascontiguousarray(params, dtype=np.float64))
+        # Worst tunnel slack at the drone itself, positive inside the opening. That is what the
+        # audit of a gate clip checks: a clip with a positive slack means the tunnel was not the
+        # constraint that failed.
+        self.min_slack = (
+            TUNNEL_OFF if frames is None else self._current_slack(pos, self._theta, frames)
+        )
+        self.gate_gap, self.plane_gap = self._gate_gaps(obs)
 
         x0 = self._state_vector(obs, theta)
         self._solver.set(0, "lbx", np.ascontiguousarray(x0))
