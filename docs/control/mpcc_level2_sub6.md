@@ -2,6 +2,12 @@
 
 `mpcc_level2_sub6_controller.py` is an opt-in Level2 speed profile. It copies the caller's configuration, fills missing pace defaults for randomized gate/obstacle layouts, and preserves explicit overrides. It uses the existing MPCC dynamics, actuator limits, observed geometry and controller interface.
 
+## Reported performance
+
+User-provided performance summary: **Level 2 completes in under 7 seconds with a stable success rate of approximately 80%.**
+
+The approximately 80% success rate has not been independently verified by this branch's fixed-seed automated tests.
+
 ## Run
 
 From the repository root, with the project's simulation environment activated:
