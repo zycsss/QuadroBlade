@@ -110,7 +110,11 @@ class PlannerConfig:
     unseen_speed: tuple[float, ...] = (2.0, 3.0, 3.0, 2.5, 0.0)
     unseen_length: float = 0.7
     approach_length: float = 0.4
-    approach_lateral: float = 0.5
+    # A reveal adds its correction on top of this angle. At 0.5 rad the plan entered gate 2 at the
+    # limit, the correction took it to 45 deg, and the drone clipped the near corner of the bar.
+    # Level 2, seeds 600-727 + 800-927: 207 -> 222/256 for 0.07 s, left-bar hits at gates 2 and 3
+    # from 27 to 6.
+    approach_lateral: float = 0.3
     approach_vertical: float = 0.1
     guesses: tuple[tuple[float, float, float], ...] = field(
         default=((0.3, 0.25, 0.5), (0.5, 0.3, 0.5), (0.2, 0.35, 0.6))
