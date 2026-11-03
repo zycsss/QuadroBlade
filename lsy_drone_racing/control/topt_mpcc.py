@@ -76,6 +76,7 @@ MOTOR_MAX = 0.2
 # u = [torque (2), df_cmd, dds], p = [disturbance (3), path point (3), tangent (3), s_lin, tunnel
 # radius, speed limit, thrust factor].
 NX, NU, NP = 16, 4, 13
+NY = 4 + 1 + 2 + NU + 1  # contour (3), lag, progress, tilt rates, inputs, vertical velocity error
 IX_TILT, IX_RATE, IX_ACC, IX_F, IX_FCMD, IX_S, IX_DS = 6, 8, 10, 12, 13, 14, 15
 
 
@@ -103,6 +104,8 @@ class MpccConfig:
         q_progress: Weight of the progress term.
         q_rate: Weight of the tilt rates.
         q_torque: Weight of the torque input.
+        q_vz: Weight of the vertical velocity error against the rate the path asks for.
+        az_max: Soft bound on the vertical acceleration [m/s^2].
         tilt_max: Bound on the total tilt [rad].
         tilt_lead: The tilt bound applies to ``tilt + tilt_lead * rate`` [s].
         cmd_max: Bound on the attitude command sent [rad].
@@ -143,6 +146,14 @@ class MpccConfig:
     q_progress: float = 60.0
     q_rate: float = 0.5
     q_torque: float = 0.0005
+    # Keep the height steady: without these the MPCC gives up height in a hard turn, because it
+    # prices it like lateral error and only reacts once it is lost. Level 2,
+    # seeds 264-391, off -> on:
+    # speed_scale 0.80 116 -> 121/128 (5.14 -> 5.19 s), 0.85 98 -> 110 (5.02 -> 5.06 s),
+    # 0.90 85 -> 101 (4.95 -> 4.98 s, 27 gained, 11 lost, p = 0.014). A heavier contour z weight
+    # does not do this.
+    q_vz: float = 600.0
+    az_max: float = 4.0
     tilt_max: float = 1.0
     tilt_lead: float = 0.08
     cmd_max: float = 1.3
@@ -172,6 +183,8 @@ _OCP_FIELDS = (
     "q_progress",
     "q_rate",
     "q_torque",
+    "q_vz",
+    "az_max",
     "tilt_max",
     "tilt_lead",
     "cmd_max",
@@ -225,13 +238,17 @@ def _model(name: str, cfg: MpccConfig) -> AcadosModel:
     model.f_expl_expr = ca.vertcat(
         v, accel, rate, acc, (u[0:2] - acc) / TAU_AL, (f_cmd - f) / TAU_F, u[2], ds, u[3]
     )
-    model.cost_y_expr = ca.vertcat(e_con, e_lag, ds, rate, u)
-    model.cost_y_expr_e = ca.vertcat(e_con, e_lag)
+    # Height is what the drone cannot get back in a hard turn, so its rate is held to the rate the
+    # path asks for: the contour error alone only reacts once the height is already lost.
+    e_vz = v[2] - ds * t_lin[2]
+    model.cost_y_expr = ca.vertcat(e_con, e_lag, ds, rate, u, e_vz)
+    model.cost_y_expr_e = ca.vertcat(e_con, e_lag, e_vz)
     lead = tilt + cfg.tilt_lead * rate
     path_terms = ca.vertcat(
         ca.sqrt(ca.dot(e_con, e_con) + 1e-6) - r_tunnel,
         ca.dot(t_lin, v) - v_limit,
         np.cos(cfg.tilt_max) - ca.cos(lead[0]) * ca.cos(lead[1]),
+        (accel[2] / cfg.az_max) ** 2 - 1.0,
     )
     # Each motor carries a quarter of the thrust plus the torque share of both tilt axes, and must
     # stay inside its range or the torque is lost and the drone keeps tipping. Normalized to 0.05 N.
@@ -258,11 +275,12 @@ def _ocp(name: str, cfg: MpccConfig, dt: float, export_dir: Path) -> AcadosOcp:
     ocp.cost.cost_type_e = "NONLINEAR_LS"
     contour = [cfg.q_contour, cfg.q_contour, cfg.q_contour_z, cfg.q_lag]
     ocp.cost.W = np.diag(
-        contour + [cfg.q_progress, cfg.q_rate, cfg.q_rate, cfg.q_torque, cfg.q_torque, 0.1, 0.01]
+        contour
+        + [cfg.q_progress, cfg.q_rate, cfg.q_rate, cfg.q_torque, cfg.q_torque, 0.1, 0.01, cfg.q_vz]
     )
-    ocp.cost.W_e = np.diag(contour)
-    ocp.cost.yref = np.zeros(4 + 1 + 2 + NU)
-    ocp.cost.yref_e = np.zeros(4)
+    ocp.cost.W_e = np.diag(contour + [cfg.q_vz])
+    ocp.cost.yref = np.zeros(NY)
+    ocp.cost.yref_e = np.zeros(5)
     ocp.parameter_values = np.zeros(NP)
     ocp.constraints.x0 = np.zeros(NX)
     ocp.constraints.idxbu = np.arange(NU)
@@ -273,16 +291,17 @@ def _ocp(name: str, cfg: MpccConfig, dt: float, export_dir: Path) -> AcadosOcp:
     ocp.constraints.lbx = np.array([cfg.z_min, -cfg.tilt_max, -cfg.tilt_max, 0.0, 0.0])
     ocp.constraints.ubx = np.array([2.4, cfg.tilt_max, cfg.tilt_max, 0.8, 10.0])
     ocp.constraints.idxsbx = np.array([0, 1, 2, 4])
-    n_h = 7
+    n_h = 8
     ocp.constraints.lh = np.full(n_h, -100.0)
     ocp.constraints.uh = np.zeros(n_h)
     ocp.constraints.idxsh = np.arange(n_h)
-    # Penalties of the soft bounds: [floor, tilt, tilt, path speed] + [tunnel, speed, total tilt]
+    # Penalties of the soft bounds: [floor, tilt, tilt, path speed]
+    # + [tunnel, speed, total tilt, vertical acceleration]
     # + [motor high, motor low, command roll, command pitch].
     lin_x = np.array([2000.0, 100.0, 100.0, 100.0])
     quad_x = np.array([2e5, 1000.0, 1000.0, 1000.0])
-    lin_h = np.array([2000.0, 1000.0, 3000.0])
-    quad_h = np.array([1e5, 1e4, 3e5])
+    lin_h = np.array([2000.0, 1000.0, 3000.0, 300.0])
+    quad_h = np.array([1e5, 1e4, 3e5, 3000.0])
     lin_in = np.array([300.0, 300.0, 300.0, 300.0])
     quad_in = 10.0 * lin_in
     ocp.cost.zl = ocp.cost.zu = np.r_[lin_x, lin_h, lin_in]
@@ -291,9 +310,9 @@ def _ocp(name: str, cfg: MpccConfig, dt: float, export_dir: Path) -> AcadosOcp:
     ocp.constraints.lbx_e = ocp.constraints.lbx.copy()
     ocp.constraints.ubx_e = ocp.constraints.ubx.copy()
     ocp.constraints.idxsbx_e = ocp.constraints.idxsbx.copy()
-    ocp.constraints.lh_e = np.full(3, -100.0)
-    ocp.constraints.uh_e = np.zeros(3)
-    ocp.constraints.idxsh_e = np.arange(3)
+    ocp.constraints.lh_e = np.full(4, -100.0)
+    ocp.constraints.uh_e = np.zeros(4)
+    ocp.constraints.idxsh_e = np.arange(4)
     ocp.cost.zl_e = ocp.cost.zu_e = np.r_[lin_x, lin_h]
     ocp.cost.Zl_e = ocp.cost.Zu_e = np.r_[quad_x, quad_h]
     opts = ocp.solver_options
@@ -330,7 +349,7 @@ def get_solver(cfg: MpccConfig, dt: float) -> AcadosOcpSolver:
             DRAG.tolist(),
             MASS,
             MOTOR_PER_ACC,
-            "topt-mpcc-1",
+            "topt-mpcc-2",
         )
     )
     key = hashlib.sha1(signature.encode()).hexdigest()[:10]
@@ -534,7 +553,7 @@ class ToptMPCC(Controller):
 
         solver.set(0, "lbx", x0)
         solver.set(0, "ubx", x0)
-        yref = np.zeros(4 + 1 + 2 + NU)
+        yref = np.zeros(NY)
         for j in range(n + 1):
             solver.set(
                 j,
