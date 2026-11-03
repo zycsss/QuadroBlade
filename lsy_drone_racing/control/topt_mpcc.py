@@ -93,7 +93,8 @@ class MpccConfig:
         speed_scale: The speed limit is ``speed_scale * planned speed + speed_add``.
         speed_add: See ``speed_scale`` [m/s].
         progress_add: The progress term asks for this much more than the speed limit [m/s].
-        unseen_speed: Speed limit in front of a gate not seen yet [m/s]; randomized tracks only.
+        unseen_speed: Speed limit in front of a gate not seen yet [m/s], per pass; randomized
+            tracks only.
         unseen_length: Distance before such a gate over which ``unseen_speed`` applies [m].
         tunnel_min: Smallest tunnel radius [m].
         tunnel_max: Largest tunnel radius [m].
@@ -135,7 +136,11 @@ class MpccConfig:
     speed_scale: float = 0.85
     speed_add: float = 0.3
     progress_add: float = 0.3
-    unseen_speed: float = 2.0
+    # What each first pass tolerates differs: gates 0 and 3 are the ones a reveal costs most, and a
+    # single 2.5 m/s cap only trades finishes for time (88/128 at 4.75 s). Level 2, seeds 400-527,
+    # unused while tuning: (2, 2, 2, 2) 107/128 at 5.07 s, this 96/128 at 4.85 s, with gate 3 at 3.0
+    # 80/128 at 4.74 s. Gate 1 gains nothing above 2.5: the plan's own speed limit binds there.
+    unseen_speed: tuple[float, ...] = (2.0, 3.0, 3.0, 2.5, 0.0)
     unseen_length: float = 0.7
     tunnel_min: float = 0.03
     tunnel_max: float = 0.15
@@ -169,7 +174,7 @@ class MpccConfig:
     dist_share: float = 0.3
     dist_max: tuple[float, float, float] = (1.5, 1.5, 2.0)
     takeoff_dz: float = 0.04
-    takeoff_vz: float = 0.5
+    takeoff_vz: float = 1.0
     takeoff_thrust: float = 0.7
     rebuild_iterations: int = 2
 
@@ -493,10 +498,10 @@ class ToptMPCC(Controller):
         visited = np.asarray(obs["gates_visited"], dtype=bool)
         n_cap = int(round((cfg.unseen_length + 0.1) / self._bender.config.spacing))
         for i, (g, k_c) in enumerate(zip(self._sequence, self._bender.crossings, strict=True)):
-            if self._unseen_pass[i] and not visited[g]:
-                limit[max(k_c - n_cap, 0) : k_c + 1] = np.minimum(
-                    limit[max(k_c - n_cap, 0) : k_c + 1], cfg.unseen_speed
-                )
+            cap = cfg.unseen_speed[i] if i < len(cfg.unseen_speed) else 0.0
+            if self._unseen_pass[i] and cap > 0 and not visited[g]:
+                first = max(k_c - n_cap, 0)
+                limit[first : k_c + 1] = np.minimum(limit[first : k_c + 1], cap)
         self._vmax = np.minimum(cfg.v_max, np.interp(path.ss, path.knot_s, limit))
         self._crossing_s = path.knot_s[self._bender.crossings]
         self.plan_log.append(

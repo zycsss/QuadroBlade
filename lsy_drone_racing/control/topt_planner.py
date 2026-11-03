@@ -84,7 +84,8 @@ class PlannerConfig:
         z_min: Minimum height once the drone has left the climb cone [m].
         climb_slope: Over the first third of the first segment the height gain must be at least this
             times the horizontal distance from the start.
-        unseen_speed: Speed cap in front of a gate the drone has not seen yet [m/s]. 0 disables.
+        unseen_speed: Speed cap in front of a gate the drone has not seen yet [m/s], per pass.
+            0 disables it for that pass.
         unseen_length: Distance before such a gate over which the cap applies [m].
         approach_length: Distance before such a gate over which the arrival cone applies [m].
         approach_lateral: Half angle of the arrival cone sideways [rad].
@@ -106,7 +107,7 @@ class PlannerConfig:
     frame_clearance: float = DRONE_RADIUS
     z_min: float = 0.15
     climb_slope: float = 0.5
-    unseen_speed: float = 2.0
+    unseen_speed: tuple[float, ...] = (2.0, 3.0, 3.0, 2.5, 0.0)
     unseen_length: float = 0.7
     approach_length: float = 0.4
     approach_lateral: float = 0.5
@@ -343,8 +344,9 @@ def solve_time_optimal(
                 d = b - a
                 t = ca.fmin(ca.fmax(ca.dot(p - a, d) / float(d @ d), 0.0), 1.0)
                 opti.subject_to(ca.sumsqr(p - (a + t * d)) >= (r + config.frame_clearance) ** 2)
-            if track.unseen[i] and config.unseen_speed > 0 and remaining[k] < config.unseen_length:
-                opti.subject_to(ca.sumsqr(v) <= config.unseen_speed**2)
+            cap = config.unseen_speed[i] if i < len(config.unseen_speed) else 0.0
+            if track.unseen[i] and cap > 0 and remaining[k] < config.unseen_length:
+                opti.subject_to(ca.sumsqr(v) <= cap**2)
             if track.unseen[i] and remaining[k] < config.approach_length:
                 v_n = ca.dot(v, normal)
                 tan_lat, tan_up = np.tan(config.approach_lateral), np.tan(config.approach_vertical)
