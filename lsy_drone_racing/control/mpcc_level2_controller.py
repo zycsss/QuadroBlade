@@ -2,12 +2,11 @@
 
 Run without changing a provided configuration::
 
-    pixi run python -m tests.mpcc_evaluation --config config/level2.toml \
+    pixi run python scripts/sim.py --config level2.toml \
         --controller mpcc_level2_controller.py
 
-All control inputs come from observations and nominal configuration. Only the evaluator can inspect
-hidden track truth after a run. Level0/1 use the inherited baseline settings; fully randomized
-Level3 is rejected until separately validated. Existing Level0 fast/sprint entries remain intact.
+All control inputs come from observations and nominal configuration. Level0/1 use the inherited
+baseline settings; fully randomized Level3 is rejected until separately validated.
 """
 
 from __future__ import annotations
