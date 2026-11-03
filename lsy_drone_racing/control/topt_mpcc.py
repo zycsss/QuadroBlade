@@ -128,11 +128,11 @@ class MpccConfig:
 
     horizon: int = 40
     v_max: float = 7.0
-    # The final hairpin (gate 3 -> gate 1) is where the pace binds: faster than this the drone
-    # enters it with the thrust at its cap and past the tilt bound, and sinks into gate 1's bottom
-    # bar. Level 2, seeds 264-391: 0.80 116/128 at 5.14 s (2 bottom-bar hits), 0.85 98/128 at 5.02 s
-    # (11 of them).
-    speed_scale: float = 0.8
+    # The final hairpin (gate 3 -> gate 1) is where the pace binds: faster, the drone enters it with
+    # the thrust at its cap and past the tilt bound. Level 2, seeds 264-391, with the height terms
+    # below: 0.80 121/128 at 5.19 s, 0.85 110/128 at 5.06 s, 0.90 101/128 at 4.98 s. Ranking takes
+    # the mean time of the finishers, so 0.85 trades some of the spare success for lap time.
+    speed_scale: float = 0.85
     speed_add: float = 0.3
     progress_add: float = 0.3
     unseen_speed: float = 2.0
