@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>QuadroBlade · debug run replay</title>
+    <link rel="stylesheet" href="assets/style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <h1>debug run replay</h1>
+        <p id="subtitle">
+          Open a folder of <code>.npz</code> logs written by <code>scripts/debug_run.py</code>.
+        </p>
+      </div>
+      <div class="picker">
+        <select id="runs" title="Run logs: served logs/ first, then anything scanned from disk" hidden></select>
+        <label class="button" for="folder">Open folder</label>
+        <input id="folder" type="file" webkitdirectory multiple />
+        <label class="button" for="file">Open .npz</label>
+        <input id="file" type="file" accept=".npz,.json" multiple />
+        <a id="plotlink" class="button ghost" target="_blank" rel="noreferrer" hidden>debug figure</a>
+      </div>
+    </header>
+
+    <main>
+      <section class="panels">
+        <figure class="panel">
+          <figcaption>
+            <span>2D · track from above</span>
+            <span class="hint">colour = speed</span>
+          </figcaption>
+          <div class="canvas-box"><canvas id="view2d"></canvas></div>
+        </figure>
+        <figure class="panel">
+          <figcaption>
+            <span>3D · perspective</span>
+            <span class="hint">drag to orbit · wheel to zoom</span>
+          </figcaption>
+          <div class="canvas-box"><canvas id="view3d"></canvas></div>
+        </figure>
+      </section>
+
+      <section class="panel chart-panel">
+        <figcaption>
+          <span>altitude and speed over time</span>
+          <span class="hint">click to seek</span>
+        </figcaption>
+        <div class="canvas-box"><canvas id="chart"></canvas></div>
+      </section>
+
+      <section class="controls">
+        <button id="play" class="button primary">Play</button>
+        <button id="back" class="button icon" title="Step back (←)">◀</button>
+        <button id="forward" class="button icon" title="Step forward (→)">▶</button>
+        <input id="slider" type="range" min="0" max="0" value="0" step="1" aria-label="Time" />
+        <span id="readout" class="readout"></span>
+        <label class="check"><input id="reveal" type="checkbox" /> reveal all</label>
+        <label class="rate">
+          rate
+          <select id="rate">
+            <option value="0.25">0.25×</option>
+            <option value="0.5">0.5×</option>
+            <option value="1" selected>1×</option>
+            <option value="2">2×</option>
+          </select>
+        </label>
+      </section>
+
+      <section class="legend">
+        <div class="ramp">
+          <span id="rampMin" class="ramp-label">0.0</span>
+          <span class="ramp-bar" id="rampBar"></span>
+          <span id="rampMax" class="ramp-label">0.0</span>
+          <span class="muted">m/s</span>
+        </div>
+        <span class="key"><i class="swatch gate"></i>gate · solid = revealed, dashed = nominal</span>
+        <span class="key"><i class="swatch pole"></i>pole</span>
+        <span class="key"><i class="swatch contact"></i>contact radius</span>
+        <span class="key"><i class="swatch sensor"></i>sensor range</span>
+      </section>
+    </main>
+
+    <div id="drop" class="dropzone" hidden>
+      <p>Drop a folder of run logs here</p>
+      <p class="muted">
+        every <code>.npz</code> in the folder and its subfolders is listed, with its
+        <code>.json</code> summary if there is one
+      </p>
+    </div>
+    <div id="status" class="status" role="status"></div>
+
+    <script src="assets/util.js"></script>
+    <script src="assets/npz.js"></script>
+    <script src="assets/scan.js"></script>
+    <script src="assets/model.js"></script>
+    <script src="assets/view2d.js"></script>
+    <script src="assets/view3d.js"></script>
+    <script src="assets/chart.js"></script>
+    <script src="assets/app.js"></script>
+  </body>
+</html>

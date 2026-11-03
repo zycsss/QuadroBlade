@@ -1,0 +1,365 @@
+/* Dark, quiet chrome around the three canvases: the data is the bright thing on the page. */
+
+:root {
+  --bg: #0a0f15;
+  --panel: #0d131b;
+  --panel-border: #1e2938;
+  --text: #d7dde8;
+  --muted: #8b97a8;
+  --accent: #4ea1ff;
+  --gate: #f0ad4e;
+  --pole: #b388ff;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+code {
+  font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #b8c6d8;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+/* ---------------------------------------------------------------- header --- */
+
+.topbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 24px;
+  align-items: flex-end;
+  justify-content: space-between;
+  padding: 12px 18px 10px;
+  border-bottom: 1px solid var(--panel-border);
+}
+
+.brand h1 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.brand p {
+  margin: 2px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.picker {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.picker select {
+  min-width: 260px;
+  max-width: 46vw;
+  padding: 6px 8px;
+  color: var(--text);
+  background: #121a24;
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+  font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+#file,
+#folder {
+  display: none;
+}
+
+.button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  color: var(--text);
+  background: #16202c;
+  border: 1px solid #29374a;
+  border-radius: 6px;
+  font: inherit;
+  font-size: 12px;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.button:hover {
+  background: #1d2a39;
+}
+
+.button.primary {
+  min-width: 74px;
+  justify-content: center;
+  background: #1d3a5c;
+  border-color: #2d5a8a;
+}
+
+.button.icon {
+  padding: 6px 9px;
+}
+
+.button.ghost {
+  background: transparent;
+  color: var(--muted);
+}
+
+/* ------------------------------------------------------------------ main --- */
+
+main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+  padding: 12px 18px 8px;
+}
+
+.panels {
+  flex: 1 1 auto;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  min-height: 260px;
+}
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  margin: 0;
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.panel figcaption {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  justify-content: space-between;
+  padding: 7px 11px;
+  border-bottom: 1px solid var(--panel-border);
+  font-size: 11.5px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: #b9c6d6;
+}
+
+.panel figcaption .hint {
+  font-size: 10.5px;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--muted);
+}
+
+.canvas-box {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+
+.canvas-box canvas {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+#view3d {
+  cursor: grab;
+  touch-action: none;
+}
+
+#view3d.dragging {
+  cursor: grabbing;
+}
+
+.chart-panel {
+  flex: 0 0 auto;
+  height: 196px;
+}
+
+/* -------------------------------------------------------------- controls --- */
+
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+
+.controls input[type="range"] {
+  flex: 1 1 240px;
+  min-width: 160px;
+  accent-color: var(--accent);
+}
+
+.readout {
+  font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #c8d4e2;
+  white-space: nowrap;
+}
+
+.check,
+.rate {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.rate select {
+  padding: 4px 6px;
+  color: var(--text);
+  background: #121a24;
+  border: 1px solid var(--panel-border);
+  border-radius: 5px;
+  font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* ---------------------------------------------------------------- legend --- */
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 20px;
+  align-items: center;
+  padding-bottom: 8px;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.legend .ramp {
+  display: inline-flex;
+  gap: 7px;
+  align-items: center;
+}
+
+.ramp-bar {
+  display: inline-block;
+  width: 180px;
+  height: 9px;
+  border-radius: 5px;
+  background: linear-gradient(90deg, #30123b, #3e42b0, #2278d6, #1cb0cd, #35ce84, #a0dc3c, #f2cd26, #fa7820, #b01414);
+}
+
+.ramp-label {
+  font: 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #b9c6d6;
+}
+
+.key {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.swatch {
+  display: inline-block;
+  width: 15px;
+  height: 3px;
+  border-radius: 2px;
+  background: currentColor;
+}
+
+.swatch.gate {
+  height: 4px;
+  color: var(--gate);
+}
+
+.swatch.pole {
+  height: 4px;
+  color: var(--pole);
+}
+
+.swatch.contact {
+  height: 0;
+  border-top: 2px dashed #ff6969;
+  background: none;
+}
+
+.swatch.sensor {
+  height: 0;
+  border-top: 2px dashed #50c8ff;
+  background: none;
+}
+
+/* ----------------------------------------------------------------- misc --- */
+
+.status {
+  padding: 0 18px 8px;
+  font: 11.5px ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--muted);
+  min-height: 16px;
+}
+
+.status.warn {
+  color: #f0ad4e;
+}
+
+.status.error {
+  color: #ff6b6b;
+}
+
+.dropzone {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: center;
+  justify-content: center;
+  background: rgba(8, 13, 20, 0.88);
+  border: 2px dashed #3d5a7d;
+  border-radius: 10px;
+  margin: 14px;
+  font-size: 16px;
+  color: #cfe0f5;
+  z-index: 20;
+}
+
+.dropzone[hidden] {
+  display: none;
+}
+
+.dropzone p {
+  margin: 0;
+}
+
+@media (max-width: 900px) {
+  .panels {
+    grid-template-columns: 1fr;
+    grid-template-rows: 1fr 1fr;
+  }
+
+  .chart-panel {
+    height: 150px;
+  }
+
+  .picker select {
+    min-width: 180px;
+  }
+}
