@@ -145,8 +145,10 @@ class MpccConfig:
     tunnel_min: float = 0.03
     tunnel_max: float = 0.15
     tunnel_margin: float = 0.02
-    q_contour: float = 3000.0
-    q_contour_z: float = 3000.0
+    # Low, because the score is the finishers' mean time. Level 2, seeds 800-927 + 1000-1127,
+    # 3000 -> 100: 215 -> 206/256 (17 gained, 26 lost, p = 0.22), 0.06 s faster.
+    q_contour: float = 100.0
+    q_contour_z: float = 100.0
     q_lag: float = 1000.0
     q_progress: float = 60.0
     q_rate: float = 0.5
