@@ -113,6 +113,8 @@ class MpccConfig:
         dds_max: Bound on the path acceleration of the model [m/s^2].
         k_dist: Gain of the disturbance observer per step.
         k_thrust: Gain of the thrust-factor estimate per step.
+        thrust_factor_min_thrust: The thrust factor only learns above this thrust [N].
+        thrust_factor_range: Bounds of the thrust factor; the randomized mass is 43.4 g +- 5 g.
         dist_share: Share of the error along the thrust axis left to the additive disturbance.
         dist_max: Bound on the additive disturbance [m/s^2].
         takeoff_dz: Climb under fixed thrust before the MPCC takes over [m].
@@ -123,7 +125,11 @@ class MpccConfig:
 
     horizon: int = 40
     v_max: float = 7.0
-    speed_scale: float = 0.9
+    # The final hairpin (gate 3 -> gate 1) is where the pace binds: faster than this the drone
+    # enters it with the thrust at its cap and past the tilt bound, and sinks into gate 1's bottom
+    # bar. Level 2, seeds 264-391: 0.80 116/128 at 5.14 s (2 bottom-bar hits), 0.85 98/128 at 5.02 s
+    # (11 of them).
+    speed_scale: float = 0.8
     speed_add: float = 0.3
     progress_add: float = 0.3
     unseen_speed: float = 2.0
@@ -147,6 +153,8 @@ class MpccConfig:
     dds_max: float = 30.0
     k_dist: float = 0.15
     k_thrust: float = 0.1
+    thrust_factor_min_thrust: float = 0.3
+    thrust_factor_range: tuple[float, float] = (0.88, 1.13)
     dist_share: float = 0.3
     dist_max: tuple[float, float, float] = (1.5, 1.5, 2.0)
     takeoff_dz: float = 0.04
@@ -604,11 +612,18 @@ class ToptMPCC(Controller):
         error = (v - self._v_pred) * self._freq
         z_body = R.from_quat(quat).apply([0.0, 0.0, 1.0])
         along = float(error @ z_body)
-        thrust_acc = self._f_est / MASS
-        self._thrust_factor = float(
-            np.clip(self._thrust_factor + cfg.k_thrust * along / max(thrust_acc, 3.0), 0.85, 1.2)
-        )
-        error = error - (1.0 - cfg.dist_share) * along * z_body
+        # A thrust factor is a mass, and a mass does not change in flight. At low thrust the error
+        # along the body axis is dominated by what the model does not capture (the motors' floor,
+        # the thrust lag), and attributing it to the factor ran it into its clip within 0.2 s and
+        # then starved the next hard turn of thrust. So it only learns while the thrust is high
+        # enough to say something about the mass, and only within the randomized range.
+        if self._f_est >= cfg.thrust_factor_min_thrust:
+            thrust_acc = self._f_est / MASS
+            low, high = cfg.thrust_factor_range
+            self._thrust_factor = float(
+                np.clip(self._thrust_factor + cfg.k_thrust * along / thrust_acc, low, high)
+            )
+            error = error - (1.0 - cfg.dist_share) * along * z_body
         bound = np.asarray(cfg.dist_max)
         self._dist = np.clip(self._dist + cfg.k_dist * error, -bound, bound)
 
