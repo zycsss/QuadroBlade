@@ -136,6 +136,11 @@ class MpccConfig:
             on the plan at the next gate, so it can be flown together with ``branch_pass``.
         first_start_node: Node of the plan its stem starts from.
         first_reaction: Its reaction time [s].
+        south_cap: Speed limit in front of the ``branch_pass`` gate after leaving for the plan
+            [m/s]; 0 keeps the plan's.
+        north_cap: Speed limit in front of that gate on the library's route [m/s]; 0 for none.
+        limit_last_leg: Fly the last leg no faster than the plan's. A library's last leg ends free,
+            and came out at over 5 m/s against the plan's 3.9.
     """
 
     horizon: int = 40
@@ -204,6 +209,12 @@ class MpccConfig:
     first_pass: int = 0
     first_start_node: int = 10
     first_reaction: float = 0.15
+    # Level 2, seeds 2100-2355, tuned on them: 191/256 at 4.41 s with neither cap, the pole
+    # clearance or the last-leg limit, 209/256 at 4.46 s with all of them. Fresh seeds 2400-2655,
+    # against no libraries at all: 181 -> 225/256, 4.35 -> 4.43 s (55 gained, 11 lost).
+    south_cap: float = 2.0
+    north_cap: float = 2.2
+    limit_last_leg: bool = True
 
 
 #: Fields baked into the generated solver; a change triggers a rebuild.
@@ -482,7 +493,7 @@ class ToptMPCC(Controller):
         if self._library is not None:
             # The branches already limit the speed in front of this gate.
             caps = list(self.cfg.unseen_speed)
-            caps[self.cfg.branch_pass] = 0.0
+            caps[self.cfg.branch_pass] = self.cfg.north_cap
             self.cfg = replace(self.cfg, unseen_speed=tuple(caps))
             trajectory = self._library.trajectories[0]
         self._first_library = None
@@ -583,6 +594,11 @@ class ToptMPCC(Controller):
             if self._unseen_pass[i] and cap > 0 and not visited[g]:
                 first = max(k_c - n_cap, 0)
                 limit[first : k_c + 1] = np.minimum(limit[first : k_c + 1], cap)
+        if cfg.limit_last_leg and len(self._bender.crossings) > 1:
+            last = self._plan_trajectory
+            top = np.max(np.linalg.norm(last.vel[int(last.crossings[-2]) :], axis=1))
+            first = int(self._bender.crossings[-2])
+            limit[first:] = np.minimum(limit[first:], cfg.speed_scale * top + cfg.speed_add)
         self._vmax = np.minimum(cfg.v_max, np.interp(path.ss, path.knot_s, limit))
         self._crossing_s = path.knot_s[self._bender.crossings]
         self.plan_log.append(
@@ -612,7 +628,9 @@ class ToptMPCC(Controller):
             sideways = moved @ self._nominal_rot[gate][:, 1]
             if int(obs["n_gates_passed"]) < p and sideways >= self.cfg.branch_pole_shift:
                 self._library = None
-                self.cfg = replace(self.cfg, unseen_speed=self._plan_caps)
+                caps = list(self.cfg.unseen_speed)
+                caps[p] = self.cfg.south_cap if self.cfg.south_cap > 0 else self._plan_caps[p]
+                self.cfg = replace(self.cfg, unseen_speed=tuple(caps))
                 self._last_piece = self._plan_trajectory
                 self._install_pieces()
                 return

@@ -134,7 +134,8 @@ class BendConfig:
     gate_window: float = 0.10
     gate_tolerance: float = 0.04
     crossing_height: float = 0.01
-    pole_clearance: float = 0.17
+    # Level 2, seeds 2100-2355, with the libraries: 0.17 -> 0.20 failures before gate 1 from 9 to 4.
+    pole_clearance: float = 0.2
     frame_clearance: float = 0.11
     iterations: int = 8
 
