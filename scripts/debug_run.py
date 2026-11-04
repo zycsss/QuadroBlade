@@ -6,7 +6,7 @@ SSH and on machines without a display.
 
 Run as:
 
-    $ python scripts/debug_run.py --config level0.toml --controller state_controller.py
+    $ python scripts/debug_run.py --config level0.toml --controller my_controller.py
 
 inside the repository's pixi environment, or from outside of it with
 
@@ -21,8 +21,11 @@ run on CPU:
 Output:
 
 * A one-line verdict per episode printed to stdout.
-* ``plots/<config>_<controller>_seed<seed>.png`` with three panels: top-down track, altitude
-  and gate progress over time, and speed over time.
+* ``plots/<config>_<controller>_seed<seed>.png`` with the track from above coloured by the speed it
+  was flown at, and below it the altitude over time on the same speed colour scale. A run that did
+  not finish also gets a zoom on the pole or gate it failed against.
+* ``logs/<config>_<controller>_seed<seed>.npz`` (the arrays) and ``.json`` (the summary) that both
+  the figure and the replay website in ``replay_site/`` are drawn from.
 
 Note:
     When an episode terminates because the drone was disabled, the environment warps the drone
@@ -226,6 +229,14 @@ def run_episode(
         "des": [],
         "n": [],
         "speed": [],
+        # What the controller was allowed to know about the track at that step. An object reports
+        # its nominal position until the drone comes within the sensor range, after which the true
+        # one is revealed and stays revealed. Logged so the replay can show both, and when one
+        # became the other, without re-deriving the environment's rule from the trajectory.
+        "gates_seen": [],
+        "poles_seen": [],
+        "gates_visited": [],
+        "poles_visited": [],
     }
     diag: list[dict[str, float]] = []
     n_steps = 0
@@ -241,6 +252,10 @@ def run_episode(
             rec["ang_vel"].append(np.asarray(obs["ang_vel"], dtype=float))
             rec["n"].append(int(obs["n_gates_passed"]))
             rec["speed"].append(float(np.linalg.norm(vel)))
+            rec["gates_seen"].append(np.asarray(obs["gates_pos"], dtype=float))
+            rec["poles_seen"].append(np.asarray(obs["obstacles_pos"], dtype=float))
+            rec["gates_visited"].append(np.asarray(obs["gates_visited"], dtype=bool))
+            rec["poles_visited"].append(np.asarray(obs["obstacles_visited"], dtype=bool))
 
             action = np.asarray(controller.compute_control(obs, info), dtype=float)
             rec["des"].append(action[:3].copy())
@@ -271,6 +286,12 @@ def run_episode(
     rec["n"] = np.array(rec["n"])
     rec["speed"] = np.array(rec["speed"])
     rec["t"] = np.array(rec["t"])
+    rec["gates_seen"] = np.array(rec["gates_seen"], dtype=float)
+    rec["poles_seen"] = np.array(rec["poles_seen"], dtype=float)
+    rec["gates_visited"] = np.array(rec["gates_visited"], dtype=bool)
+    rec["poles_visited"] = np.array(rec["poles_visited"], dtype=bool)
+    # The range at which the environment reveals a true position, needed to read the two above.
+    rec["sensor_range"] = np.array(float(config.env.sensor_range))
     # The environment only reports position and velocity, so the acceleration is a finite difference
     # of the recorded velocity at the control rate.
     rec["acc"] = (
@@ -333,6 +354,7 @@ def run_episode(
         # The poses the drone actually faced, which differ from the nominal ones above on a
         # randomized track. The controller only learns them within the sensor range.
         "true_gates_pos": np.asarray(env.unwrapped.data.gates_pos[0], dtype=float),
+        "true_gates_quat": np.asarray(env.unwrapped.data.gates_quat[0], dtype=float),
         "true_obstacles_pos": np.asarray(env.unwrapped.data.obstacles_pos[0], dtype=float),
         # Every path the controller committed to, with when, where and why.
         "plan_log": list(getattr(controller, "plan_log", [])),
@@ -343,6 +365,9 @@ def run_episode(
         "gate_sequence": gate_sequence,
         "bounds_low": bounds_low,
         "bounds_high": bounds_high,
+        # Which action space the controller drove, so a reader can tell whether ``des`` is a
+        # position command (state mode) or a roll/pitch/yaw command (attitude mode).
+        "control_mode": config.env.control_mode,
     }
 
 
@@ -351,11 +376,15 @@ def episode_arrays(ep: dict[str, Any]) -> dict[str, Any]:
 
     The arrays hold per control step: time, position, velocity, acceleration (a finite difference of
     the recorded velocity, since acceleration is not observed), attitude, angular rate, the applied
-    attitude command, the achieved speed, the number of gates passed, and whatever the controller
-    reports through its ``diagnostics``. Every path the controller committed to is stored separately
-    as ``plan_*`` arrays, with the time, tick, reason, drone position, path progress and 200 samples
-    of the path itself, so a run can be replayed against the plan that was active at any step. The
-    controller's ``replans`` counter is the index of the active plan.
+    attitude command, the achieved speed, the number of gates passed, the gate and pole poses as the
+    controller saw them (nominal until revealed, true afterwards), the reveal flags and the sensor
+    range that decides when a reveal happens, and whatever the controller reports through its
+    ``diagnostics``. The action space is recorded as ``control_mode`` because it decides how ``des``
+    must be read: a position command in ``state`` mode, roll/pitch/yaw in ``attitude`` mode. Every
+    path the controller committed to is stored separately as ``plan_*`` arrays, with the time, tick,
+    reason, drone position, path progress and 200 samples of the path itself, so a run can be
+    replayed against the plan that was active at any step. The controller's ``replans`` counter is
+    the index of the active plan.
 
     Args:
         ep: The episode record returned by `run_episode`.
@@ -371,10 +400,12 @@ def episode_arrays(ep: dict[str, Any]) -> dict[str, Any]:
             "gates_quat": ep["gates_quat"],
             "obstacles_pos": ep["obstacles_pos"],
             "true_gates_pos": ep["true_gates_pos"],
+            "true_gates_quat": ep["true_gates_quat"],
             "true_obstacles_pos": ep["true_obstacles_pos"],
             "gate_sequence": ep["gate_sequence"],
             "bounds_low": ep["bounds_low"],
             "bounds_high": ep["bounds_high"],
+            "control_mode": np.array(ep["control_mode"]),
         }
     )
     plans = ep["plan_log"]
@@ -489,59 +520,52 @@ def resolve_device(device: str) -> str:
     return device
 
 
-def main(
-    config: str = "level0.toml",
-    controller: str | None = None,
-    n_runs: int = 1,
-    seed: int = 0,
-    plot: bool = True,
-    out_dir: str = "plots",
-    log: bool = True,
-    log_dir: str = "logs",
-    verbose: bool = True,
-    device: str = "cpu",
-    control_mode: str | None = None,
-):
-    """Run a controller headless and report why each episode ended.
+def run_and_save(
+    config: str,
+    controller_file: str,
+    control_mode: str | None,
+    ep_seed: int,
+    verbose: bool,
+    device: str,
+    plot: bool,
+    out_dir: str,
+    log: bool,
+    log_dir: str,
+) -> dict[str, Any]:
+    """Run one episode, write its log and figure, and return a short summary.
+
+    This is the unit of work for both the serial loop and the process pool, so a parallel run writes
+    exactly the files a serial one does. Everything printed along the way is captured and handed
+    back as ``text``, so episodes finishing in parallel do not interleave their output.
 
     Args:
         config: Race config file name in ``config/``.
-        controller: Controller file name in ``lsy_drone_racing/control/``. Defaults to the one set
-            in the config.
-        n_runs: Number of episodes to run.
-        seed: Base random seed. Episode ``i`` uses ``seed + i``.
-        plot: Whether to write a PNG per episode. The figure is drawn from the run log by
-            `lsy_drone_racing.utils.path_plot`, so the log is written even when `log` is False.
-        out_dir: Directory for plots (``plots/`` is gitignored).
-        log: Whether to report the ``.npz`` of the run and its ``.json`` summary per episode. The
-            files are written whenever this or `plot` is set, because the figure needs them.
-        log_dir: Directory for those logs (``logs/`` is gitignored).
+        controller_file: Controller file name in ``lsy_drone_racing/control/``.
+        control_mode: Override for ``env.control_mode``, or None to keep the config's.
+        ep_seed: Seed of this episode.
         verbose: Print per-gate-pass margins.
-        device: ``"cpu"`` or ``"gpu"``. The environment defaults to CPU and the TOML config cannot
-            change this, so it must be requested explicitly.
-        control_mode: Override the config's ``env.control_mode`` (``"state"`` or ``"attitude"``).
-            Needed when a config ships with a mode that does not match the controller's action
-            space, e.g. running the attitude-based MPCC on a ``"state"`` config.
+        device: ``"cpu"`` or ``"gpu"``.
+        plot: Whether to write the PNG.
+        out_dir: Directory for plots.
+        log: Whether to report the log path.
+        log_dir: Directory for logs.
+
+    Returns:
+        ``seed``, ``verdict``, ``n_final``, ``n_required``, ``sim_time``, ``detail`` and ``text``.
     """
-    logging.basicConfig(level=logging.WARNING)
-    device = resolve_device(device)
+    import contextlib
+    import io
+
     config_path = REPO_ROOT / "config" / config
     cfg = load_config(config_path)
     cfg.sim.render = False  # Never open a window in this harness
     if control_mode is not None:
         cfg.env.control_mode = control_mode
-    controller_file = controller or cfg.controller.file
     controller_cls = load_controller(REPO_ROOT / "lsy_drone_racing/control" / controller_file)
 
-    print(
-        f"config={config}  controller={controller_file}  runs={n_runs}  seed0={seed}  "
-        f"device={device}  control_mode={cfg.env.control_mode}"
-    )
-    results = []
-    for i in range(n_runs):
-        ep_seed = seed + i
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
         ep = run_episode(cfg, controller_cls, ep_seed, verbose=verbose, device=device)
-        results.append(ep)
         print(
             f"[seed {ep_seed}] {ep['verdict']:<13} {ep['n_final']}/{ep['n_required']} passes  "
             f"t={ep['sim_time']:.2f}s  | {ep['detail']}"
@@ -575,10 +599,146 @@ def main(
                     log_path, out, f"{config_path.stem} / {controller_file} / seed {ep_seed}"
                 )
                 print(f"          plot -> {out}  (from {log_path.name})")
+    return {
+        "seed": ep_seed,
+        "verdict": ep["verdict"],
+        "n_final": ep["n_final"],
+        "n_required": ep["n_required"],
+        "sim_time": ep["sim_time"],
+        "detail": ep["detail"],
+        "text": buffer.getvalue(),
+    }
 
-    n_ok = sum(ep["verdict"] == "FINISHED" for ep in results)
-    times = [ep["sim_time"] for ep in results if ep["verdict"] == "FINISHED"]
-    print(f"\nfinished {n_ok}/{n_runs}" + (f", mean time {np.mean(times):.2f}s" if times else ""))
+
+def wilson_interval(successes: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """Return the Wilson score interval of a success rate (95 % for the default ``z``)."""
+    if n == 0:
+        return 0.0, 1.0
+    p = successes / n
+    centre = (p + z**2 / (2 * n)) / (1 + z**2 / n)
+    half = z * np.sqrt(p * (1 - p) / n + z**2 / (4 * n**2)) / (1 + z**2 / n)
+    return max(0.0, centre - half), min(1.0, centre + half)
+
+
+def pass_probability(p: float, n: int = 20, threshold: float = 0.5) -> float:
+    """Return the chance that ``n`` runs at success rate ``p`` finish ``threshold`` of them.
+
+    This is the question the competition's ``scripts/evaluate.py`` asks: 20 random seeds, and the
+    submission only counts with at least half of them finished.
+    """
+    from math import ceil, comb
+
+    k_min = ceil(threshold * n)
+    return float(sum(comb(n, k) * p**k * (1 - p) ** (n - k) for k in range(k_min, n + 1)))
+
+
+def summarize(results: list[dict[str, Any]]) -> str:
+    """Return the closing summary: success rate with its interval, and the lap time spread."""
+    n = len(results)
+    n_ok = sum(r["verdict"] == "FINISHED" for r in results)
+    times = np.array([r["sim_time"] for r in results if r["verdict"] == "FINISHED"])
+    mean = f", mean time {np.mean(times):.2f}s" if len(times) else ""
+    lines = [f"\nfinished {n_ok}/{n}{mean}"]
+    if n > 1:
+        low, high = wilson_interval(n_ok, n)
+        lines.append(
+            f"  success {n_ok / n:.0%}  (95% CI {low:.0%}-{high:.0%}),  "
+            f"P(>=50% of 20 in evaluate.py) = {pass_probability(n_ok / n):.0%}"
+        )
+    if len(times) > 1:
+        sem = np.std(times, ddof=1) / np.sqrt(len(times))
+        lines.append(
+            f"  lap     mean {np.mean(times):.2f}s +- {1.96 * sem:.2f}s,  "
+            f"median {np.median(times):.2f}s,  min {np.min(times):.2f}s,  max {np.max(times):.2f}s"
+        )
+    failures: dict[str, list[int]] = {}
+    for r in results:
+        if r["verdict"] != "FINISHED":
+            failures.setdefault(r["verdict"], []).append(r["seed"])
+    for verdict, seeds in sorted(failures.items()):
+        lines.append(f"  {verdict:<13} seeds {sorted(seeds)}")
+    return "\n".join(lines)
+
+
+def main(
+    config: str = "level0.toml",
+    controller: str | None = None,
+    n_runs: int = 1,
+    seed: int = 0,
+    plot: bool = True,
+    out_dir: str = "plots",
+    log: bool = True,
+    log_dir: str = "logs",
+    verbose: bool = True,
+    device: str = "cpu",
+    control_mode: str | None = None,
+    jobs: int = 1,
+):
+    """Run a controller headless and report why each episode ended.
+
+    Args:
+        config: Race config file name in ``config/``.
+        controller: Controller file name in ``lsy_drone_racing/control/``. Defaults to the one set
+            in the config.
+        n_runs: Number of episodes to run.
+        seed: Base random seed. Episode ``i`` uses ``seed + i``.
+        plot: Whether to write a PNG per episode. The figure is drawn from the run log by
+            `lsy_drone_racing.utils.path_plot`, so the log is written even when `log` is False.
+        out_dir: Directory for plots (``plots/`` is gitignored).
+        log: Whether to report the ``.npz`` of the run and its ``.json`` summary per episode. The
+            files are written whenever this or `plot` is set, because the figure needs them.
+        log_dir: Directory for those logs (``logs/`` is gitignored).
+        verbose: Print per-gate-pass margins.
+        device: ``"cpu"`` or ``"gpu"``. The environment defaults to CPU and the TOML config cannot
+            change this, so it must be requested explicitly.
+        control_mode: Override the config's ``env.control_mode`` (``"state"`` or ``"attitude"``).
+            Needed when a config ships with a mode that does not match the controller's action
+            space, e.g. running the attitude-based MPCC on a ``"state"`` config.
+        jobs: Number of worker processes; 0 uses one per CPU core. Each episode is independent and
+            writes the same log and figure it would in a serial run. The first episode always runs
+            in this process, so an OCP change is compiled once before the workers load it.
+    """
+    logging.basicConfig(level=logging.WARNING)
+    device = resolve_device(device)
+    cfg = load_config(REPO_ROOT / "config" / config)
+    controller_file = controller or cfg.controller.file
+    if jobs <= 0:
+        jobs = os.cpu_count() or 1
+    jobs = max(1, min(jobs, n_runs))
+
+    print(
+        f"config={config}  controller={controller_file}  runs={n_runs}  seed0={seed}  "
+        f"device={device}  control_mode={control_mode or cfg.env.control_mode}  jobs={jobs}"
+    )
+    head = (config, controller_file, control_mode)
+    tail = (verbose, device, plot, out_dir, log, log_dir)
+    seeds = [seed + i for i in range(n_runs)]
+    results = []
+
+    def report(result: dict[str, Any]) -> None:
+        results.append(result)
+        print(result["text"], end="", flush=True)
+
+    # The first episode builds the acados solver if the OCP changed; the workers then only load it,
+    # so they cannot race each other on c_generated_code/.
+    report(run_and_save(*head, seeds[0], *tail))
+    if jobs == 1:
+        for ep_seed in seeds[1:]:
+            report(run_and_save(*head, ep_seed, *tail))
+    else:
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+
+        # One XLA/BLAS thread per worker: the pool is the parallelism, and N workers each starting
+        # a machine-wide thread pool only fight over the same cores. Workers inherit this at spawn.
+        os.environ.setdefault("XLA_FLAGS", "--xla_cpu_multi_thread_eigen=false")
+        for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+            os.environ.setdefault(var, "1")
+        with ProcessPoolExecutor(max_workers=jobs) as pool:
+            futures = [pool.submit(run_and_save, *head, s, *tail) for s in seeds[1:]]
+            for future in as_completed(futures):
+                report(future.result())
+    results.sort(key=lambda r: r["seed"])
+    print(summarize(results))
 
 
 if __name__ == "__main__":

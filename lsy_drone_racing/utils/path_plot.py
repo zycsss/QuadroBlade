@@ -11,9 +11,22 @@ One view from above, over the track the drone actually faced:
   rather than how it was supposed to go, with the finishing time in the title and beside the finish
   marker;
 * every pole with a circle at ``POLE_RADIUS + DRONE_RADIUS``: the distance at which the drone would
-  touch it. The planner's safety margin and the radius its A* search blocks are deliberately not
-  drawn, because they made a 3 cm pole look like a 42 cm one;
+  touch it. The planner's safety margin is deliberately not drawn, because it made a 3 cm pole look
+  like a 42 cm one;
 * optionally the last path the controller committed to, which the log stores as ``plan_points``.
+
+There is no occupancy overlay. It used to draw the blocked cells of the A* search, which is no
+longer what plans the route on this track - the point-mass planner searches no grid - and the
+overlay could not be reproduced from the log anyway, because the log does not record the planner's
+settings. What the drone actually faced is drawn: the poles, the frames, the openings, and the
+trajectory it flew.
+
+Under it, altitude over time: the one quantity the view from above cannot show, and the one that
+fails first on an aggressive line when the reference asks for 1.2 m and the drone flies 0.9 m. It
+carries the same speed colour scale as the track and marks every gate pass at the height of the gate
+that was crossed, so a pass above or below the opening is visible in a single glance.
+
+A failed run gains a third panel, the zoom on what it failed against.
 
 The legend sits outside the axes so it never covers the track.
 """
@@ -26,23 +39,15 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from lsy_drone_racing.control.astar import (
+from lsy_drone_racing.control.track_geometry import (
     DRONE_RADIUS,
     GATE_FRAME_HALF,
     GATE_OPENING_HALF,
     POLE_RADIUS,
-    ArenaGrid,
-    AstarConfig,
 )
 
 if TYPE_CHECKING:
     from matplotlib.axes import Axes
-
-#: Planner defaults used only to place the A* occupancy overlay. The log does not record the planner
-#: settings, and the overlay is a hint about what the search saw, not part of the measurement.
-_OVERLAY_CLEARANCE = 0.15
-_OVERLAY_OVERSHOOT = 1.4
-_OVERLAY_BOUNDS = ((-2.45, -1.45), (2.45, 1.45))
 
 
 def load_log(path: str | Path) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -149,6 +154,33 @@ def _draw_poles(ax: Axes, obstacles: np.ndarray) -> None:
             fontsize=8,
             zorder=6,
         )
+
+
+def position_command(arrays: dict[str, Any], control_mode: str | None = None) -> np.ndarray | None:
+    """Return the commanded positions of a run, or None when the log holds no position command.
+
+    The log stores the first three components of the action in ``des``. That is a position only in
+    ``state`` control mode; in ``attitude`` mode it is roll/pitch/yaw, and drawing its third
+    component as a height would be a plausible-looking lie. The mode is read from the log when it
+    records it and from the caller (the ``.json`` summary) otherwise, and an unknown mode yields
+    None.
+
+    Args:
+        arrays: The arrays of a run.
+        control_mode: The action space the controller drove (``"state"`` or ``"attitude"``), used
+            when the log does not record it itself.
+
+    Returns:
+        Commanded positions, shape ``(n, 3)``, or None.
+    """
+    mode = control_mode or (str(arrays["control_mode"]) if "control_mode" in arrays else "")
+    if mode != "state" or "des" not in arrays:
+        return None
+    commanded = np.asarray(arrays["des"], dtype=float)
+    times = np.asarray(arrays["t"], dtype=float)
+    if commanded.ndim != 2 or commanded.shape[1] < 3 or len(commanded) != len(times):
+        return None
+    return commanded
 
 
 def failure_of(arrays: dict[str, Any]) -> dict[str, Any] | None:
@@ -339,6 +371,151 @@ def _draw_failure_detail(
     ax.grid(alpha=0.20)
 
 
+def _draw_altitude(
+    ax: Axes,
+    arrays: dict[str, Any],
+    speed: np.ndarray,
+    norm: Any,
+    commanded: np.ndarray | None = None,
+    legend_outside: bool = True,
+) -> None:
+    """Draw the height of the drone over time, coloured by the speed it had at that moment.
+
+    The trace is coloured with the same speed scale as the track, so the two panels can be read
+    together. Every gate pass is a vertical line with a triangle at the height of the gate that was
+    crossed: a triangle the trace does not pass through means the drone went over or under the
+    opening rather than through it, which is exactly the failure the view from above cannot show.
+    When the controller commanded a position, that command is drawn dashed behind the flown height,
+    so a tracking error is visible as the gap between the two lines rather than only as a number.
+
+    Args:
+        ax: Axes to draw on.
+        arrays: The arrays of a run, as written by ``scripts/debug_run.py``.
+        speed: Achieved speed per step, used to colour the trace.
+        norm: Normalisation of the speed colour scale, shared with the track panel.
+        commanded: Commanded positions, shape ``(n, 3)``, or None when the log holds no position
+            command (a run in ``attitude`` control mode commands roll/pitch/yaw, not a position).
+        legend_outside: Place the legend in the right-hand margin, beside the track legend. Set this
+            to False when another panel occupies that margin.
+    """
+    from matplotlib.collections import LineCollection
+    from matplotlib.lines import Line2D
+
+    times = np.asarray(arrays["t"], dtype=float)
+    altitude = np.asarray(arrays["pos"], dtype=float)[:, 2]
+    ax.set_title("Altitude over time: colour = speed", fontsize=10)
+    ax.set_xlabel("time [s]", fontsize=9)
+    ax.set_ylabel("z [m]", fontsize=9)
+    ax.tick_params(labelsize=8)
+    ax.grid(alpha=0.25)
+    if len(times) < 2:
+        ax.text(
+            0.5,
+            0.5,
+            "not enough steps to plot",
+            transform=ax.transAxes,
+            ha="center",
+            va="center",
+            fontsize=9,
+            color="0.4",
+        )
+        return
+
+    points = np.column_stack([times, altitude])
+    segments = np.stack([points[:-1], points[1:]], axis=1)
+    trace = LineCollection(segments, cmap="turbo", linewidths=2.2, zorder=4)
+    trace.set_array(speed[: len(segments)])
+    trace.set_norm(norm)
+    ax.add_collection(trace)
+    handles = [Line2D([], [], color="tab:orange", lw=2.2, label="flown z (colour = speed)")]
+
+    # What has to fit inside the panel: the flown height, the commanded one and the gates.
+    limits = [float(np.min(altitude)), float(np.max(altitude))]
+
+    bounds_low = np.asarray(arrays.get("bounds_low", []), dtype=float)
+    bounds_high = np.asarray(arrays.get("bounds_high", []), dtype=float)
+    floor = float(bounds_low[2]) if bounds_low.size >= 3 else 0.0
+    limits.append(floor)
+    ax.axhline(floor, color="0.45", lw=1.0, zorder=1)
+    handles.append(Line2D([], [], color="0.45", lw=1.0, label=f"floor (z = {floor:.2f} m)"))
+
+    if commanded is not None and commanded.ndim == 2 and len(commanded) == len(times):
+        ax.plot(times, commanded[:, 2], color="0.35", lw=1.0, ls="--", zorder=3)
+        handles.append(Line2D([], [], color="0.35", lw=1.0, ls="--", label="commanded z"))
+        limits.extend([float(np.min(commanded[:, 2])), float(np.max(commanded[:, 2]))])
+
+    # Gate passes, reconstructed from the step at which n_gates_passed incremented.
+    passed = np.asarray(arrays.get("n", []), dtype=int)
+    sequence = np.asarray(arrays.get("gate_sequence", []), dtype=int)
+    gates_z = np.asarray(arrays.get("true_gates_pos", []), dtype=float)
+    has_gate_height = gates_z.ndim == 2 and gates_z.shape[1] >= 3
+    n_crossings = 0
+    if len(passed) == len(times):
+        for i in range(len(passed) - 1):
+            for k in range(int(passed[i]), int(passed[i + 1])):
+                if k >= len(sequence):
+                    continue
+                gate = int(sequence[k])
+                t_cross = float(times[i + 1])
+                ax.axvline(t_cross, color="tab:orange", lw=0.8, alpha=0.45, zorder=2)
+                if has_gate_height and gate < len(gates_z):
+                    limits.append(float(gates_z[gate, 2]))
+                    ax.plot(
+                        t_cross,
+                        float(gates_z[gate, 2]),
+                        "^",
+                        ms=5.5,
+                        color="tab:orange",
+                        mec="k",
+                        mew=0.4,
+                        zorder=6,
+                    )
+                ax.annotate(
+                    f"g{gate}",
+                    xy=(t_cross, 1.0),
+                    xycoords=("data", "axes fraction"),
+                    xytext=(2, -2),
+                    textcoords="offset points",
+                    rotation=90,
+                    ha="left",
+                    va="top",
+                    fontsize=7.5,
+                    color="tab:orange",
+                    zorder=7,
+                )
+                n_crossings += 1
+    if n_crossings:
+        handles.append(
+            Line2D([], [], color="tab:orange", lw=0.8, marker="^", ms=5, label="gate passed")
+        )
+
+    ax.set_xlim(float(times[0]), float(times[-1]))
+    low = min(limits) - 0.10
+    high = max(limits) + 0.14
+    ax.set_ylim(low, high)
+    # The ceiling is usually far above the flight and would flatten the panel, so it is only drawn
+    # when the run got anywhere near it.
+    if bounds_high.size >= 3 and float(bounds_high[2]) <= high:
+        ceiling = float(bounds_high[2])
+        ax.axhline(ceiling, color="0.75", lw=1.0, ls="--", zorder=1)
+        handles.append(
+            Line2D([], [], color="0.75", lw=1.0, ls="--", label=f"ceiling ({ceiling:.2f} m)")
+        )
+
+    # Outside the axes, in the same right-hand column as the track legend, so nothing is covered.
+    if legend_outside:
+        ax.legend(
+            handles=handles,
+            loc="upper left",
+            bbox_to_anchor=(1.20, 1.0),
+            fontsize=8,
+            framealpha=1.0,
+            borderaxespad=0.0,
+        )
+    else:
+        ax.legend(handles=handles, loc="best", fontsize=7.5, framealpha=0.92)
+
+
 def _plot_arrays(
     arrays: dict[str, Any],
     out_path: str | Path,
@@ -347,10 +524,9 @@ def _plot_arrays(
     subtitle: str | None = None,
     heading: str | None = None,
     planned: bool = False,
-    grid: bool = True,
-    resolution: float = 0.10,
     dpi: int = 140,
     finish: float | None = None,
+    control_mode: str | None = None,
 ) -> Path:
     """Draw a run from its logged arrays and save the figure.
 
@@ -361,10 +537,11 @@ def _plot_arrays(
         subtitle: Optional second title line, e.g. the verdict.
         heading: Heading of the plot. Defaults to "Track from above".
         planned: Whether to draw the last path the controller committed to, from ``plan_points``.
-        grid: Whether to draw the occupancy overlay of the A* search.
-        resolution: Edge length [m] of the A* grid cell used for the occupancy overlay.
         dpi: Resolution of the saved figure.
         finish: Finishing time in seconds. Taken from the ``t`` array when omitted.
+        control_mode: The action space the controller drove (``"state"`` or ``"attitude"``). Taken
+            from the log when it records it. It decides how ``des`` may be read: only in ``state``
+            mode is it a position command, so only then is the commanded height drawn.
 
     Returns:
         The path of the written image.
@@ -374,63 +551,42 @@ def _plot_arrays(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.collections import LineCollection
+    from matplotlib.colors import Normalize
     from matplotlib.lines import Line2D
-    from matplotlib.patches import Patch
 
     obstacles = np.asarray(arrays["true_obstacles_pos"], dtype=float)
     gates_pos = np.asarray(arrays["true_gates_pos"], dtype=float)
     gates_quat = np.asarray(arrays["gates_quat"], dtype=float)
     flown = np.asarray(arrays["pos"], dtype=float)
     speed = np.asarray(arrays["speed"], dtype=float)
-    elapsed = float(finish) if finish is not None else float(np.asarray(arrays["t"])[-1])
+    times = np.asarray(arrays["t"], dtype=float)
+    elapsed = float(finish) if finish is not None else float(times[-1]) if len(times) else 0.0
 
-    overlay = None
-    if grid:
-        from scipy.spatial.transform import Rotation as R
-
-        y_axes = R.from_quat(gates_quat).as_matrix()[:, :, 1]
-        overlay = ArenaGrid(
-            obstacles,
-            gates_pos,
-            y_axes,
-            AstarConfig(
-                resolution=resolution,
-                pole_clearance=_OVERLAY_CLEARANCE,
-                overshoot=_OVERLAY_OVERSHOOT,
-                bounds_low=_OVERLAY_BOUNDS[0],
-                bounds_high=_OVERLAY_BOUNDS[1],
-            ),
-        )
-
-    # A failed run gets a second panel below the track, zoomed on what it failed against. It is a
-    # subplot rather than an absolutely placed axes because the saved figure is cropped to its
-    # content, which moves anything positioned in figure coordinates.
+    # Track on top, altitude below it, and the shared speed scale under both. The scale is a
+    # horizontal bar: a vertical one beside the track would steal width from a single panel, leaving
+    # the two panels different widths and putting the legend on top of the bar. A failed run gains
+    # a third panel, the zoom on what it failed against, placed beside the altitude panel so the
+    # figure does not grow to three full-width rows.
+    # These are subplots rather than absolutely placed axes because the saved figure is cropped to
+    # its content, which moves anything positioned in figure coordinates.
     failure = failure_of(arrays)
     if failure is None:
-        figure, top = plt.subplots(figsize=(13.0, 6.4))
+        figure = plt.figure(figsize=(13.0, 10.0))
+        layout = figure.add_gridspec(3, 1, height_ratios=[2.45, 1.1, 0.05], hspace=0.42)
+        top = figure.add_subplot(layout[0])
+        altitude_ax = figure.add_subplot(layout[1])
+        colorbar_ax = figure.add_subplot(layout[2])
         detail_ax = None
     else:
-        figure = plt.figure(figsize=(13.0, 8.6))
-        layout = figure.add_gridspec(2, 1, height_ratios=[2.2, 1.0], hspace=0.28)
-        top = figure.add_subplot(layout[0])
-        detail_ax = figure.add_subplot(layout[1])
+        figure = plt.figure(figsize=(14.5, 10.6))
+        layout = figure.add_gridspec(
+            3, 2, height_ratios=[2.3, 1.1, 0.05], width_ratios=[1.65, 1.0], hspace=0.38, wspace=0.18
+        )
+        top = figure.add_subplot(layout[0, :])
+        altitude_ax = figure.add_subplot(layout[1, 0])
+        detail_ax = figure.add_subplot(layout[1, 1])
+        colorbar_ax = figure.add_subplot(layout[2, :])
     handles: list = []
-
-    if overlay is not None:
-        low = np.asarray(overlay.config.bounds_low, dtype=float)
-        high = np.asarray(overlay.config.bounds_high, dtype=float)
-        top.imshow(
-            overlay.occupied.T,
-            origin="lower",
-            extent=(low[0], high[0], low[1], high[1]),
-            cmap="Greys",
-            alpha=0.30,
-            zorder=0,
-            interpolation="nearest",
-        )
-        handles.append(
-            Patch(facecolor="0.55", alpha=0.45, label=f"A* occupancy ({resolution:.2f} m cells)")
-        )
 
     _draw_poles(top, obstacles)
     _draw_gates(top, gates_pos, gates_quat)
@@ -463,28 +619,48 @@ def _plot_arrays(
             0, Line2D([], [], color="k", lw=1.8, label="last plan, from where it was committed")
         )
 
+    speed_norm = Normalize(
+        vmin=float(np.min(speed)) if len(speed) else 0.0,
+        vmax=float(np.max(speed)) if len(speed) else 1.0,
+    )
     if len(flown) > 1:
         segments = np.stack([flown[:-1, :2], flown[1:, :2]], axis=1)
         collection = LineCollection(segments, cmap="turbo", zorder=7, linewidths=2.8)
         collection.set_array(speed[: len(segments)])
+        collection.set_norm(speed_norm)
         top.add_collection(collection)
-        bar = figure.colorbar(collection, ax=top, fraction=0.030, pad=0.015)
-        bar.set_label("flown speed [m/s]", fontsize=9)
-        bar.ax.tick_params(labelsize=8)
+        bar = figure.colorbar(collection, cax=colorbar_ax, orientation="horizontal")
+        bar.set_label("flown speed [m/s]", fontsize=9, labelpad=2)
+        bar.ax.tick_params(labelsize=8, pad=1)
         handles.insert(
             int(planned), Line2D([], [], color="tab:orange", lw=2.8, label="flown (colour = speed)")
         )
 
-    top.plot(flown[0, 0], flown[0, 1], "*", ms=18, color="tab:green", mec="k", mew=0.6, zorder=8)
-    top.plot(flown[-1, 0], flown[-1, 1], "s", ms=8, color="tab:green", mec="k", mew=0.6, zorder=8)
-    top.annotate(
-        f"{'finish' if failure is None else 'ended'} {elapsed:.2f} s",
-        xy=(flown[-1, 0], flown[-1, 1]),
-        xytext=(flown[-1, 0] + 0.12, flown[-1, 1] - 0.04),
-        color="tab:green" if failure is None else "tab:red",
-        fontsize=9.5,
-        zorder=9,
+    # Below the track: the height it flew, on the same speed colour scale, from the same arrays.
+    _draw_altitude(
+        altitude_ax,
+        arrays,
+        speed,
+        speed_norm,
+        position_command(arrays, control_mode),
+        legend_outside=failure is None,
     )
+
+    if len(flown):
+        top.plot(
+            flown[0, 0], flown[0, 1], "*", ms=18, color="tab:green", mec="k", mew=0.6, zorder=8
+        )
+        top.plot(
+            flown[-1, 0], flown[-1, 1], "s", ms=8, color="tab:green", mec="k", mew=0.6, zorder=8
+        )
+        top.annotate(
+            f"{'finish' if failure is None else 'ended'} {elapsed:.2f} s",
+            xy=(flown[-1, 0], flown[-1, 1]),
+            xytext=(flown[-1, 0] + 0.12, flown[-1, 1] - 0.04),
+            color="tab:green" if failure is None else "tab:red",
+            fontsize=9.5,
+            zorder=9,
+        )
     handles.extend(
         [
             Line2D([], [], marker="*", color="tab:green", ls="none", ms=14, label="start"),
@@ -548,8 +724,7 @@ def plot_run(
         out_path: Where to write the image.
         title: Figure title. Defaults to the log file name.
         description: Optional second title line. Defaults to the verdict from the summary.
-        **kwargs: Passed on to [_plot_arrays][..._plot_arrays], e.g. ``planned``, ``grid``,
-            ``resolution`` or ``dpi``.
+        **kwargs: Passed on to [_plot_arrays][..._plot_arrays], e.g. ``planned`` or ``dpi``.
 
     Returns:
         The path of the written image.
@@ -563,5 +738,6 @@ def plot_run(
         title=title or Path(log_path).stem,
         subtitle=description,
         finish=finish_time(arrays, summary),
+        control_mode=summary.get("control_mode"),
         **kwargs,
     )
