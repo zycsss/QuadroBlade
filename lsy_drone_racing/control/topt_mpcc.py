@@ -124,6 +124,8 @@ class MpccConfig:
         takeoff_dz: Climb under fixed thrust before the MPCC takes over [m].
         takeoff_vz: Vertical speed assumed for the plan's first node [m/s].
         takeoff_thrust: Thrust of the fixed take-off climb [N].
+        takeoff_lean: Tilt toward the path during the climb [rad].
+        takeoff_lean_vz: The lean starts once the drone rises faster than this [m/s].
         rebuild_iterations: Extra SQP iterations after the path changed.
     """
 
@@ -134,14 +136,14 @@ class MpccConfig:
     # below: 0.80 121/128 at 5.19 s, 0.85 110/128 at 5.06 s, 0.90 101/128 at 4.98 s. Ranking takes
     # the mean time of the finishers, so 0.85 trades some of the spare success for lap time.
     speed_scale: float = 0.85
-    speed_add: float = 0.3
+    speed_add: float = 0.5
     progress_add: float = 0.3
     # What each first pass tolerates differs: gates 0 and 3 are the ones a reveal costs most, and a
     # single 2.5 m/s cap only trades finishes for time (88/128 at 4.75 s). Level 2, seeds 400-527,
     # unused while tuning: (2, 2, 2, 2) 107/128 at 5.07 s, this 96/128 at 4.85 s, with gate 3 at 3.0
     # 80/128 at 4.74 s. Gate 1 gains nothing above 2.5: the plan's own speed limit binds there.
-    unseen_speed: tuple[float, ...] = (2.0, 3.0, 3.0, 2.5, 0.0)
-    unseen_length: float = 0.7
+    unseen_speed: tuple[float, ...] = (2.4, 3.0, 3.0, 2.5, 0.0)
+    unseen_length: float = 0.5
     tunnel_min: float = 0.03
     tunnel_max: float = 0.15
     tunnel_margin: float = 0.02
@@ -149,7 +151,8 @@ class MpccConfig:
     # 3000 -> 100: 215 -> 206/256 (17 gained, 26 lost, p = 0.22), 0.06 s faster.
     q_contour: float = 100.0
     q_contour_z: float = 100.0
-    q_lag: float = 1000.0
+    # Level 2, seeds 1500-1627: 400 -> 200 97 -> 104/128 for 0.02 s.
+    q_lag: float = 200.0
     q_progress: float = 60.0
     q_rate: float = 0.5
     q_torque: float = 0.0005
@@ -175,9 +178,13 @@ class MpccConfig:
     thrust_factor_range: tuple[float, float] = (0.88, 1.13)
     dist_share: float = 0.3
     dist_max: tuple[float, float, float] = (1.5, 1.5, 2.0)
-    takeoff_dz: float = 0.04
-    takeoff_vz: float = 1.0
+    takeoff_dz: float = 0.02
+    takeoff_vz: float = 0.7
     takeoff_thrust: float = 0.7
+    # The climb alone leaves the drone without forward speed until the MPCC has tilted it. Level 2,
+    # seeds 1200-1263: 0 -> 0.7 44 -> 43/64, 4.54 -> 4.42 s.
+    takeoff_lean: float = 0.7
+    takeoff_lean_vz: float = 0.1
     rebuild_iterations: int = 2
 
 
@@ -467,6 +474,9 @@ class ToptMPCC(Controller):
         self.plan_log: list[dict[str, Any]] = []
         self._path: ArcPath | None = None
         self._build_path(obs, "episode start")
+        heading = (self._path(np.array([0.4])) - self._path(np.array([0.0])))[0, :2]
+        heading /= max(float(np.linalg.norm(heading)), 1e-6)
+        self._takeoff_lean = self.cfg.takeoff_lean * np.array([-heading[1], heading[0]])
 
     # region path
 
@@ -676,7 +686,8 @@ class ToptMPCC(Controller):
         if not self._airborne:
             self._v_pred = None
             self._track_thrust(cfg.takeoff_thrust)
-            return self._send(np.zeros(2), cfg.takeoff_thrust)
+            lean = self._takeoff_lean if v[2] > cfg.takeoff_lean_vz else np.zeros(2)
+            return self._send(lean, cfg.takeoff_thrust)
 
         z_up = float(R.from_quat(quat).apply([0.0, 0.0, 1.0])[2])
         if z_up < np.cos(cfg.rescue_tilt):  # outside the model: level out first

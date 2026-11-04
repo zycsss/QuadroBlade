@@ -87,7 +87,8 @@ class PlannerConfig:
         unseen_speed: Speed cap in front of a gate the drone has not seen yet [m/s], per pass.
             0 disables it for that pass.
         unseen_length: Distance before such a gate over which the cap applies [m].
-        approach_length: Distance before such a gate over which the arrival cone applies [m].
+        approach_length: Distance before such a gate over which the arrival cone applies [m], per
+            pass.
         approach_lateral: Half angle of the arrival cone sideways [rad].
         approach_vertical: Half angle of the arrival cone vertically [rad].
         guesses: Initial guesses as ``(gate offset, pole detour radius, frame detour radius)``.
@@ -96,7 +97,7 @@ class PlannerConfig:
 
     nodes: int = 25
     thrust_acc_max: float = 15.0
-    tilt_max: float = 1.0
+    tilt_max: float = 1.1
     jerk_max: float = 150.0
     drag: tuple[float, float, float] = (0.50, 0.50, 0.57)
     crossing_angle_max: float = 0.9
@@ -107,9 +108,11 @@ class PlannerConfig:
     frame_clearance: float = DRONE_RADIUS
     z_min: float = 0.15
     climb_slope: float = 0.5
-    unseen_speed: tuple[float, ...] = (2.0, 3.0, 3.0, 2.5, 0.0)
-    unseen_length: float = 0.7
-    approach_length: float = 0.4
+    unseen_speed: tuple[float, ...] = (2.4, 3.0, 3.0, 2.5, 0.0)
+    unseen_length: float = 0.5
+    # Gate 0 is entered from the side and revealed late, so its cone starts earlier. Level 2,
+    # seeds 1200-1263: 0.4 -> 0.7 43 -> 52/64 for 0.02 s. Gates 2 and 3 do not gain from this.
+    approach_length: tuple[float, ...] = (0.7, 0.4, 0.4, 0.4, 0.4)
     # A reveal adds its correction on top of this angle. At 0.5 rad the plan entered gate 2 at the
     # limit, the correction took it to 45 deg, and the drone clipped the near corner of the bar.
     # Level 2, seeds 600-727 + 800-927: 207 -> 222/256 for 0.07 s, left-bar hits at gates 2 and 3
@@ -351,7 +354,7 @@ def solve_time_optimal(
             cap = config.unseen_speed[i] if i < len(config.unseen_speed) else 0.0
             if track.unseen[i] and cap > 0 and remaining[k] < config.unseen_length:
                 opti.subject_to(ca.sumsqr(v) <= cap**2)
-            if track.unseen[i] and remaining[k] < config.approach_length:
+            if track.unseen[i] and remaining[k] < config.approach_length[i]:
                 v_n = ca.dot(v, normal)
                 tan_lat, tan_up = np.tan(config.approach_lateral), np.tan(config.approach_vertical)
                 opti.subject_to(opti.bounded(-tan_lat * v_n, ca.dot(v, lateral), tan_lat * v_n))
