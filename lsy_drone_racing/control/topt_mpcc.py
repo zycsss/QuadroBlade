@@ -45,7 +45,8 @@ from scipy.spatial.transform import Rotation as R
 
 from lsy_drone_racing.control import Controller
 from lsy_drone_racing.control.path_bend import ArcPath, BendConfig, PathBender
-from lsy_drone_racing.control.topt_planner import PlannerConfig, Track, plan
+from lsy_drone_racing.control.topt_branches import BranchConfig, plan_branches, splice
+from lsy_drone_racing.control.topt_planner import PlannerConfig, Track, Trajectory, plan
 from lsy_drone_racing.control.track_geometry import DRONE_RADIUS, frame_clearance, pole_clearance
 
 if TYPE_CHECKING:
@@ -127,6 +128,14 @@ class MpccConfig:
         takeoff_lean: Tilt toward the path during the climb [rad].
         takeoff_lean_vz: The lean starts once the drone rises faster than this [m/s].
         rebuild_iterations: Extra SQP iterations after the path changed.
+        branch_pass: Pass flown from a `topt_branches` library, or -1 for none.
+        branch_pole: Pole whose reveal can send the drone back to the plan, or -1 for none.
+        branch_pole_shift: It does if the pole is revealed before the previous gate is crossed and
+            moved at least this far along the gate's sideways axis [m].
+        first_pass: An earlier pass flown from a library of its own, or -1 for none. Its legs end
+            on the plan at the next gate, so it can be flown together with ``branch_pass``.
+        first_start_node: Node of the plan its stem starts from.
+        first_reaction: Its reaction time [s].
     """
 
     horizon: int = 40
@@ -186,6 +195,15 @@ class MpccConfig:
     takeoff_lean: float = 0.7
     takeoff_lean_vz: float = 0.1
     rebuild_iterations: int = 2
+    # A gate is revealed about 0.27 s before the drone gets there, and the two routes past pole 3
+    # fail on opposite sides: the north one when the pole moved north, the south one when it moved
+    # south. A pole that moved north is revealed in time to leave the north route.
+    branch_pass: int = 3
+    branch_pole: int = 3
+    branch_pole_shift: float = -0.05
+    first_pass: int = 0
+    first_start_node: int = 10
+    first_reaction: float = 0.15
 
 
 #: Fields baked into the generated solver; a change triggers a rebuild.
@@ -448,7 +466,55 @@ class ToptMPCC(Controller):
         trajectory = plan(track, nominal_start, np.array([0.0, 0.0, self.cfg.takeoff_vz]), plan_cfg)
         self.plan_time = time.perf_counter() - t0
         self.plan_duration = trajectory.duration
-        self._bender = PathBender(trajectory, nominal_gates, nominal_rot, self._sequence, bend_cfg)
+        self._nominal_gates, self._nominal_rot = nominal_gates, nominal_rot
+        self._nominal_poles = nominal_poles
+        self._library = None
+        if self.cfg.branch_pass >= 0 and self._randomized:
+            branch_cfg = replace(
+                BranchConfig(),
+                pass_index=self.cfg.branch_pass,
+                **_overrides(BranchConfig, section, "branch_"),
+            )
+            self._library = plan_branches(track, trajectory, plan_cfg, branch_cfg)
+        self._plan_trajectory = trajectory
+        self._plan_caps = self.cfg.unseen_speed
+        self._route_open = self.cfg.branch_pole >= 0
+        if self._library is not None:
+            # The branches already limit the speed in front of this gate.
+            caps = list(self.cfg.unseen_speed)
+            caps[self.cfg.branch_pass] = 0.0
+            self.cfg = replace(self.cfg, unseen_speed=tuple(caps))
+            trajectory = self._library.trajectories[0]
+        self._first_library = None
+        if self.cfg.first_pass >= 0 and self._randomized:
+            self._first_library = plan_branches(
+                track,
+                self._plan_trajectory,
+                plan_cfg,
+                replace(
+                    BranchConfig(),
+                    pass_index=self.cfg.first_pass,
+                    start_node=self.cfg.first_start_node,
+                    reaction=self.cfg.first_reaction,
+                    rest_legs=1,
+                ),
+            )
+        self._first_piece = None
+        self._last_piece = trajectory
+        self._plan_gates = nominal_gates.copy()
+        if self._first_library is not None:
+            self._first_piece = self._first_library.trajectories[0]
+            caps = list(self.cfg.unseen_speed)
+            caps[self.cfg.first_pass] = 0.0
+            self.cfg = replace(self.cfg, unseen_speed=tuple(caps))
+        self._bender = PathBender(
+            self._flown_trajectory(),
+            nominal_gates,
+            nominal_rot,
+            self._sequence,
+            bend_cfg,
+            exact_spacing=self._library is not None or self._first_library is not None,
+        )
 
         self._solver = get_solver(self.cfg, self._dt)
         self._solver.reset()
@@ -490,12 +556,15 @@ class ToptMPCC(Controller):
         gates_pos = np.asarray(obs["gates_pos"], dtype=float)
         gates_rot = R.from_quat(obs["gates_quat"]).as_matrix()
         poles = np.asarray(obs["obstacles_pos"], dtype=float)
+        self._take_branch(obs)
+        self._take_first_branch(obs)
         start = self._start + np.array([0.0, 0.0, self.cfg.takeoff_dz])
         beads = self._bender.bend(gates_pos, gates_rot, poles, start, drone_bead)
         self._path = ArcPath(beads)
         if old is not None:
             # Bead k of the old path is bead k of the new one: carry the progress across.
-            self._s_remap = (old.knot_s.copy(), self._path.knot_s.copy())
+            common = min(len(old.knot_s), len(self._path.knot_s))
+            self._s_remap = (old.knot_s[:common].copy(), self._path.knot_s[:common].copy())
             self._s = float(np.interp(self._s, *self._s_remap))
             self._extra_iterations = self.cfg.rebuild_iterations
 
@@ -529,6 +598,72 @@ class ToptMPCC(Controller):
                 "points": path(np.linspace(0.0, path.length, 200)),
             }
         )
+
+    def _take_branch(self, obs: dict[str, NDArray[np.floating]]):
+        """Switch to the library's trajectory for the revealed gate, once, when it is revealed."""
+        if self._library is None:
+            return
+        p = self.cfg.branch_pass
+        gate = int(self._sequence[p])
+        k = self.cfg.branch_pole
+        if self._route_open and np.asarray(obs["obstacles_visited"], dtype=bool)[k]:
+            self._route_open = False
+            moved = np.asarray(obs["obstacles_pos"], dtype=float)[k] - self._nominal_poles[k]
+            sideways = moved @ self._nominal_rot[gate][:, 1]
+            if int(obs["n_gates_passed"]) < p and sideways >= self.cfg.branch_pole_shift:
+                self._library = None
+                self.cfg = replace(self.cfg, unseen_speed=self._plan_caps)
+                self._last_piece = self._plan_trajectory
+                self._install_pieces()
+                return
+        if not np.asarray(obs["gates_visited"], dtype=bool)[gate]:
+            return
+        library, self._library = self._library, None
+        if int(obs["n_gates_passed"]) > p:
+            return
+        rot = self._nominal_rot[gate]
+        revealed = np.asarray(obs["gates_pos"], dtype=float)[gate]
+        offset = rot.T @ (revealed - self._nominal_gates[gate])
+        trajectory, made_for = library.blend(offset)
+        self._last_piece = trajectory
+        self._plan_gates[gate] = self._nominal_gates[gate] + rot @ made_for
+        self._install_pieces()
+
+    def _take_first_branch(self, obs: dict[str, NDArray[np.floating]]):
+        """Switch to the earlier pass's trajectory for its gate, once, when it is revealed."""
+        if self._first_library is None:
+            return
+        p = self.cfg.first_pass
+        gate = int(self._sequence[p])
+        if not np.asarray(obs["gates_visited"], dtype=bool)[gate]:
+            return
+        library, self._first_library = self._first_library, None
+        if int(obs["n_gates_passed"]) > p:
+            return
+        rot = self._nominal_rot[gate]
+        revealed = np.asarray(obs["gates_pos"], dtype=float)[gate]
+        offset = rot.T @ (revealed - self._nominal_gates[gate])
+        self._first_piece, made_for = library.blend(offset)
+        self._plan_gates[gate] = self._nominal_gates[gate] + rot @ made_for
+        self._install_pieces()
+
+    def _flown_trajectory(self) -> Trajectory:
+        if self._first_piece is None:
+            return self._last_piece
+        node = int(self._plan_trajectory.crossings[self.cfg.branch_pass - 1])
+        return splice(self._first_piece, self._last_piece, self._plan_trajectory, node)
+
+    def _install_pieces(self):
+        self._switch_bender(self._flown_trajectory(), self._plan_gates)
+
+    def _switch_bender(self, trajectory: Trajectory, gates: NDArray[np.floating]):
+        old = self._bender
+        self._bender = PathBender(
+            trajectory, gates, self._nominal_rot, self._sequence, old.config, exact_spacing=True
+        )
+        # The beads the drone has flown are the same on both; keep what they were bent by.
+        common = min(len(old.displacement), len(self._bender.displacement))
+        self._bender.displacement[:common] = old.displacement[:common]
 
     # endregion
 

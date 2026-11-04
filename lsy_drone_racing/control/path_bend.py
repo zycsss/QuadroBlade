@@ -152,6 +152,7 @@ class PathBender:
         gates_rot: NDArray[np.floating],
         sequence: NDArray[np.integer],
         config: BendConfig | None = None,
+        exact_spacing: bool = False,
     ):
         """Resample the plan into beads.
 
@@ -161,6 +162,8 @@ class PathBender:
             gates_rot: The gate rotations the plan was made against.
             sequence: Gate index of every pass.
             config: Bending options.
+            exact_spacing: Space the beads exactly ``config.spacing`` apart rather than fitting a
+                whole number of them, so plans that start alike have the same beads there.
         """
         self.config = config or BendConfig()
         cfg = self.config
@@ -171,7 +174,10 @@ class PathBender:
         pos, vel, arc = pos[keep], vel[keep], arc[keep]
         crossing_s = arc[index[trajectory.crossings]]
         spline = CubicSpline(arc, pos)
-        s_nom = np.linspace(0.0, arc[-1], int(np.ceil(arc[-1] / cfg.spacing)) + 1)
+        if exact_spacing:
+            s_nom = np.arange(0.0, arc[-1], cfg.spacing)
+        else:
+            s_nom = np.linspace(0.0, arc[-1], int(np.ceil(arc[-1] / cfg.spacing)) + 1)
         beads = spline(s_nom)
         speed = np.interp(s_nom, arc, np.linalg.norm(vel, axis=1))
         tangent = spline(arc[-1], 1)
