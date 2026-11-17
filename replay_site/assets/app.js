@@ -21,6 +21,8 @@
     carry: 0,
     lastTimestamp: 0,
     chartHit: null,
+    hover2d: null,
+    hoverChart: null,
     runs: [],
     localRuns: [],
   };
@@ -52,10 +54,24 @@
    * Draw the three canvases from the current state.
    */
   function render() {
-    if (!state.model) return;
-    NS.view2d.draw(el.view2d, state.model, state);
-    NS.view3d.draw(el.view3d, state.model, state);
-    state.chartHit = NS.chart.draw(el.chart, state.model, state);
+    render2d();
+    render3d();
+    renderChart();
+  }
+
+  /** Draw the top view only, for pointer moves that do not change anything else. */
+  function render2d() {
+    if (state.model) NS.view2d.draw(el.view2d, state.model, state);
+  }
+
+  /** Draw the 3D view only, for camera moves. */
+  function render3d() {
+    if (state.model) NS.view3d.draw(el.view3d, state.model, state);
+  }
+
+  /** Draw the charts only; they hand back the mapping a click needs to seek. */
+  function renderChart() {
+    if (state.model) state.chartHit = NS.chart.draw(el.chart, state.model, state);
   }
 
   /**
@@ -113,6 +129,8 @@
     state.lastTimestamp = 0;
     state.step = model.n - 1;
     state.camera = NS.view3d.defaultCamera(model);
+    state.hover2d = null;
+    state.hoverChart = null;
 
     el.play.textContent = "Play";
     el.slider.min = "0";
@@ -398,7 +416,7 @@
     el.folder.addEventListener("change", () => scanInput(el.folder));
     el.runs.addEventListener("change", () => selectRun(el.runs.value));
 
-    NS.view3d.attachControls(el.view3d, state, render);
+    NS.view3d.attachControls(el.view3d, state, render3d);
 
     el.chart.addEventListener("click", (event) => {
       if (!state.model || !state.chartHit) return;
@@ -406,6 +424,29 @@
       pause();
       setStep(state.chartHit.stepAt(event.clientX - rect.left));
     });
+
+    /**
+     * Track the pointer over a canvas, so the view can show what is under the cursor's vertical line.
+     *
+     * @param {HTMLCanvasElement} canvas Canvas to watch.
+     * @param {string} key State key holding `{x, y}`, or null when the pointer leaves.
+     * @param {Function} redraw Redraw for that canvas only.
+     */
+    const trackPointer = (canvas, key, redraw) => {
+      canvas.addEventListener("pointermove", (event) => {
+        if (!state.model) return;
+        const rect = canvas.getBoundingClientRect();
+        state[key] = { x: event.clientX - rect.left, y: event.clientY - rect.top };
+        redraw();
+      });
+      canvas.addEventListener("pointerleave", () => {
+        if (!state[key]) return;
+        state[key] = null;
+        redraw();
+      });
+    };
+    trackPointer(el.view2d, "hover2d", render2d);
+    trackPointer(el.chart, "hoverChart", renderChart);
 
     root.addEventListener("resize", render);
 

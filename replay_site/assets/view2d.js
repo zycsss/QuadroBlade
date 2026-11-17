@@ -88,8 +88,9 @@
     const position = model.pos[step];
     drawSensorRange(ctx, model, step, screenX, screenY, scale);
     drawDrone(ctx, model, step, screenX, screenY);
+    drawVelocity(ctx, model, step, screenX, screenY, scale);
+    drawHover(ctx, model, step, state.hover2d, screenX, screenY, scale, width, height);
 
-    const axes = { x: screenX, y: screenY, scale };
     ctx.save();
     label(ctx, "x [m]", width - 12, height - 12, { align: "right", color: COLORS.tick });
     label(ctx, "y [m]", 12, 14, { color: COLORS.tick });
@@ -441,6 +442,151 @@
     ctx.fillStyle = color;
     ctx.fill();
     ctx.restore();
+  }
+
+  /**
+   * The velocity of the drone at the current step, as an arrow from the drone.
+   *
+   * The direction is the velocity vector itself; the length is a fixed look-ahead of a quarter of a
+   * second, clamped, so a slow drone still gets a readable arrow and a fast one does not cross the
+   * whole track. The number at the tip is the speed, so the magnitude is readable without a ruler.
+   *
+   * @param {CanvasRenderingContext2D} ctx Context.
+   * @param {Object} model Replay model.
+   * @param {number} step Step being shown.
+   * @param {Function} screenX World x to screen x.
+   * @param {Function} screenY World y to screen y.
+   * @param {number} scale Pixels per metre.
+   */
+  function drawVelocity(ctx, model, step, screenX, screenY, scale) {
+    const velocity = model.vel && model.vel[step];
+    if (!velocity) return;
+    const horizontal = Math.hypot(velocity[0], velocity[1]);
+    if (!(horizontal > 0.05)) return;
+    const position = model.pos[step];
+    // Length in world metres: a 0.25 s look-ahead, kept between 12 cm and 55 cm.
+    const length = Math.min(0.55, Math.max(0.12, horizontal * 0.25));
+    const ux = velocity[0] / horizontal;
+    const uy = velocity[1] / horizontal;
+    const tip = [position[0] + ux * length, position[1] + uy * length];
+    const x0 = screenX(position[0]);
+    const y0 = screenY(position[1]);
+    const x1 = screenX(tip[0]);
+    const y1 = screenY(tip[1]);
+    const color = speedColor(model.speedFraction(model.speed[step]));
+    const angle = Math.atan2(y1 - y0, x1 - x0);
+
+    ctx.save();
+    // A dark casing keeps the arrow readable where it runs along the coloured trail.
+    ctx.lineCap = "round";
+    ctx.strokeStyle = "rgba(8, 12, 18, 0.85)";
+    ctx.lineWidth = 5;
+    ctx.beginPath();
+    ctx.moveTo(x0, y0);
+    ctx.lineTo(x1, y1);
+    ctx.stroke();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2.6;
+    ctx.beginPath();
+    ctx.moveTo(x0, y0);
+    ctx.lineTo(x1, y1);
+    ctx.stroke();
+    const head = 9;
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x1 - head * Math.cos(angle - 0.38), y1 - head * Math.sin(angle - 0.38));
+    ctx.lineTo(x1 - head * Math.cos(angle + 0.38), y1 - head * Math.sin(angle + 0.38));
+    ctx.closePath();
+    ctx.fillStyle = color;
+    ctx.strokeStyle = "rgba(8, 12, 18, 0.85)";
+    ctx.lineWidth = 1.5;
+    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
+
+    // The speed at the tip, offset perpendicular to the arrow so it rarely sits on the trail.
+    const offsetX = -uy * 12;
+    const offsetY = ux * 12;
+    label(ctx, `${model.speed[step].toFixed(2)} m/s`, x1 + offsetX, y1 + offsetY, {
+      align: offsetX >= 0 ? "left" : "right",
+      baseline: "middle",
+      color: "#eef3fa",
+      font: "bold 11px ui-monospace, monospace",
+    });
+  }
+
+  /**
+   * The readings at the cursor's vertical line.
+   *
+   * A vertical line through the cursor is a line of constant x on the track, and the flown path
+   * crosses it once for every pass along that x. Each crossing is marked and labelled with the speed
+   * the drone had there, which is the number the colour of the trail only implies.
+   *
+   * @param {CanvasRenderingContext2D} ctx Context.
+   * @param {Object} model Replay model.
+   * @param {number} step Last flown step.
+   * @param {{x: number}|null} hover Cursor position in canvas pixels, or null.
+   * @param {Function} screenX World x to screen x.
+   * @param {Function} screenY World y to screen y.
+   * @param {number} scale Pixels per metre.
+   * @param {number} width Canvas width in CSS pixels.
+   * @param {number} height Canvas height in CSS pixels.
+   */
+  function drawHover(ctx, model, step, hover, screenX, screenY, scale, width, height) {
+    if (!hover || !Number.isFinite(hover.x)) return;
+    // Only segments whose two ends straddle the cursor's x can be crossed by the vertical line.
+    const crossings = [];
+    for (let i = 1; i <= step && crossings.length < 8; i++) {
+      const x0 = screenX(model.pos[i - 1][0]);
+      const x1 = screenX(model.pos[i][0]);
+      const span = x1 - x0;
+      if (span === 0) continue;
+      const fraction = (hover.x - x0) / span;
+      if (fraction < 0 || fraction > 1) continue;
+      const y0 = screenY(model.pos[i - 1][1]);
+      const y1 = screenY(model.pos[i][1]);
+      crossings.push({
+        y: y0 + fraction * (y1 - y0),
+        speed: model.speed[i - 1] + fraction * (model.speed[i] - model.speed[i - 1]),
+        time: model.t[i - 1] + fraction * (model.t[i] - model.t[i - 1]),
+      });
+    }
+    if (!crossings.length) return;
+
+    ctx.save();
+    ctx.strokeStyle = "rgba(215, 225, 240, 0.35)";
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 5]);
+    ctx.beginPath();
+    ctx.moveTo(hover.x, 0);
+    ctx.lineTo(hover.x, height);
+    ctx.stroke();
+    ctx.restore();
+
+    for (const crossing of crossings) {
+      const color = speedColor(model.speedFraction(crossing.speed));
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(hover.x, crossing.y, 4, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.fill();
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = 1.4;
+      ctx.stroke();
+      ctx.restore();
+      const right = hover.x < width - 96;
+      label(
+        ctx,
+        `${crossing.speed.toFixed(2)} m/s @ ${crossing.time.toFixed(2)} s`,
+        hover.x + (right ? 9 : -9),
+        crossing.y - 9,
+        {
+          align: right ? "left" : "right",
+          color: "#eef3fa",
+          font: "bold 10.5px ui-monospace, monospace",
+        }
+      );
+    }
   }
 
   NS.view2d = { draw };

@@ -1,75 +1,93 @@
-# Autonomous Drone Racing Challenge
+# QuadroBlade: Autonomous Drone Racing
 
-<div align="center">
-  <a href="https://github.com/learnsyslab/crazyflow">
-    <img width="800" height="450" src="docs/img/race.gif">
-  </a>
-  <br/>
-  <sub><sup style="font-size: 0.8em;"><a href="https://github.com/learnsyslab/crazyflow">Powered by Crazyflow</a></sup></sub>
-  </br>
-  </br>
-</div>
+Team QuadroBlade's solution to the TUM [Autonomous Drone Racing](https://github.com/learnsyslab/lsy_drone_racing)
+course, built on the [crazyflow](https://github.com/learnsyslab/crazyflow) simulator.
 
-[![Python Version]][Python Version URL] [![Ruff Check]][Ruff Check URL] [![Documentation Status]][Documentation Status URL] [![Tests]][Tests URL]
+## Final controller
 
-[Python Version]: https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-blue  
-[Python Version URL]: https://www.python.org  
+**`lsy_drone_racing/control/rl_scene.py` (`RLScene`)** is our final controller, and every
+`config/level*.toml` selects it. It is a reinforcement-learning policy trained only on randomly
+generated tracks, never on the track it flies:
 
-[Ruff Check]: https://github.com/learnsyslab/lsy_drone_racing/actions/workflows/ruff.yml/badge.svg?style=flat-square  
-[Ruff Check URL]: https://github.com/learnsyslab/lsy_drone_racing/actions/workflows/ruff.yml  
+1. From the first observation it plans a time-optimal guide through the gates
+   (`control/topt_planner.py`, IPOPT, cached on disk).
+2. At 50 Hz a small NumPy network (2 x 64) turns the drone state, the guide ahead and the nearby
+   gates and poles into an attitude and thrust command. The trained weights are in
+   `control/rl_scene.npz`.
 
-[Documentation Status]: https://github.com/learnsyslab/lsy_drone_racing/actions/workflows/docs.yml/badge.svg  
-[Documentation Status URL]: https://learnsyslab.github.io/lsy_drone_racing/  
+Because the policy never sees anything that identifies a track, the same network flies level 0 and
+generated level 3 tracks. How it is built and trained is described in
+[docs/Architecture.md](docs/Architecture.md).
 
-[Tests]: https://github.com/learnsyslab/lsy_drone_racing/actions/workflows/testing.yml/badge.svg  
-[Tests URL]: https://github.com/learnsyslab/lsy_drone_racing/actions/workflows/testing.yml  
+| Scenario | Result |
+|---|---|
+| Level 0 | 64/64 finished, 4.03 s |
+| Random tracks (level 3 generator, level 1 conditions) | 243/256 finished, about 4.67 s |
+| Level 2 (moved gates and poles) | 0/64 finished: the guide is not yet re-planned after a reveal |
 
----
+## Quickstart
 
-## Introduction
+Install [pixi](https://pixi.sh), then from the repository root:
 
-**LSY Autonomous Drone Racing** is a course project designed to help you develop and evaluate autonomous drone racing algorithms — both in simulation and on real Crazyflie hardware.  
-Whether you’re new to drones or an experienced developer, this project provides a structured and practical way to explore high-speed autonomy, control, and perception in dynamic environments.
+```bash
+pixi run python scripts/sim.py
+```
 
----
+This flies the final controller on `config/level0.toml` with the viewer. Choose a level with `--config`:
 
-## Documentation
+```bash
+pixi run python scripts/sim.py --config level3.toml
+```
 
-To get started, visit our [official documentation](https://learnsyslab.github.io/lsy_drone_racing/getting_started/general/).
+On a Linux machine with a GPU, use the `gpu` environment (`pixi run -e gpu ...`). Activating an
+environment builds [acados](https://github.com/acados/acados) the first time, which the MPCC needs.
 
----
+Run the tests:
 
-## Dependencies
+```bash
+pixi run -e tests tests
+```
 
-This project builds upon [**crazyflow**](https://github.com/learnsyslab/crazyflow), an open-source, high-speed, high-fidelity drone simulator with strong sim-to-real performance developed by the [Learning Systems Lab (LSY)](https://www.ce.cit.tum.de/lsy/home/) at TUM.
+The integration test that flies the final controller is opt-in:
 
----
+```bash
+RUN_FINAL_CONTROLLER=1 pixi run -e tests pytest tests/integration/test_final_controller.py
+```
 
-## Difficulty Levels
+## Difficulty levels
 
-Each task setup — from track design to dynamics configuration — is defined by a TOML file (e.g., [`level0.toml`](config/level0.toml)).  
-The configuration files specify progressive difficulty levels from easy (0) to hard (3):
+| Level | Randomized inertia | Moved gates and poles | Random tracks |
+|---|---|---|---|
+| [0](config/level0.toml) | No | No | No |
+| [1](config/level1.toml) | Yes | No | No |
+| [2](config/level2.toml) | Yes | Yes | No |
+| [3](config/level3.toml) | Yes | Yes | Yes |
 
-|      Evaluation Scenario      | Rand. Inertial Properties | Randomized Obstacles, Gates | Random Tracks |             Notes              |
-| :---------------------------: | :-----------------------: | :-------------------------: | :-----------: | :----------------------------: |
-| [Level 0](config/level0.toml) |           *No*            |            *No*             |     *No*      |       Perfect knowledge        |
-| [Level 1](config/level1.toml) |          **Yes**          |            *No*             |     *No*      |        Adaptive control        |
-| [Level 2](config/level2.toml) |          **Yes**          |           **Yes**           |     *No*      |          Re-planning           |
-| [Level 3](config/level3.toml) |          **Yes**          |           **Yes**           |    **Yes**    |        Online planning         |
-|         **sim2real**          |     **Real hardware**     |           **Yes**           |    **Yes**    | Simulation-to-reality transfer |
+## Repository layout
 
----
+| Path | Contents |
+|---|---|
+| `lsy_drone_racing/control/` | Controllers: `rl_scene.py` (final), `rl_race.py` and `topt_mpcc.py` (alternatives we compared), the time-optimal planner, and the course's base class and examples |
+| `lsy_drone_racing/envs/` | The race environments (from the course) |
+| `lsy_drone_racing/utils/` | Policy features, track generation, the fast guide planner and plotting |
+| `scripts/` | Simulation, evaluation, training and analysis scripts |
+| `tests/` | Unit and integration tests |
+| `config/` | Level definitions |
+| `docs/` | [Architecture](docs/Architecture.md), [experiment log](docs/PLAN_path_rl.md), [training scenarios](docs/training_scenarios.md) |
+| `replay_site/` | Browser replay of the logs that `scripts/debug_run.py` writes |
+| `ros_ws/`, `scripts/deploy.py` | Flying a real Crazyflie |
 
-## Online Competition
+## Other controllers
 
-Throughout the semester, teams in the course will compete to achieve the fastest autonomous race completion times. 
-Competition results visible in the [competition branch](https://github.com/learnsyslab/lsy_drone_racing/tree/competition).
+| Controller | Use |
+|---|---|
+| `rl_race.py` | RL policy trained on the track it flies: 64/64 at 3.33 s on level 0 and 64/64 at 4.66 s on level 2. Its guide is planned for the nominal track, so it cannot fly level 3 |
+| `topt_mpcc.py` | Contouring MPC that flies the time-optimal plan, bent to the revealed gates: 54/64 at 4.40 s on level 2 |
 
-> **Note:** Competition results **do not** directly affect your course grade.  
-> However, they provide valuable feedback on the performance and robustness of your approach compared to others.
+Fly one with `--controller`, for example
+`pixi run python scripts/sim.py --config level2.toml --controller rl_race.py`.
 
-The competition environment always uses **difficulty level 2**.  
-If your code fails the automated tests, it is likely to encounter the same issues in our evaluation environment.  
-For full details, refer to the [documentation](https://learnsyslab.github.io/lsy_drone_racing/).
+## License
 
----
+MIT, see [LICENSE](LICENSE). The environments, simulator interface and example controllers come from
+the course's [lsy_drone_racing](https://github.com/learnsyslab/lsy_drone_racing) repository.

@@ -307,6 +307,16 @@ main {
   background: none;
 }
 
+.swatch.velocity {
+  width: 0;
+  height: 0;
+  border-left: 11px solid #9fe6c0;
+  border-top: 5px solid transparent;
+  border-bottom: 5px solid transparent;
+  border-radius: 0;
+  background: none;
+}
+
 /* ----------------------------------------------------------------- misc --- */
 
 .status {

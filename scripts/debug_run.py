@@ -6,11 +6,11 @@ SSH and on machines without a display.
 
 Run as:
 
-    $ python scripts/debug_run.py --config level0.toml --controller my_controller.py
+    $ python scripts/debug_run.py --config level0.toml --controller rl_scene.py
 
 inside the repository's pixi environment, or from outside of it with
 
-    $ pixi run python scripts/debug_run.py --config level0.toml --controller my_controller.py
+    $ pixi run python scripts/debug_run.py --config level0.toml --controller rl_scene.py
 
 For GPU execution use the ``gpu`` environment and pass ``--device gpu`` explicitly. The environment
 defaults to CPU and the TOML config cannot change that, so the ``gpu`` environment alone would still

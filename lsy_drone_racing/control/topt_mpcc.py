@@ -106,8 +106,16 @@ class MpccConfig:
         q_progress: Weight of the progress term.
         q_rate: Weight of the tilt rates.
         q_torque: Weight of the torque input.
+        q_dthrust: Weight of the rate of the thrust command.
+        q_dds: Weight of the path acceleration of the model.
         q_vz: Weight of the vertical velocity error against the rate the path asks for.
         az_max: Soft bound on the vertical acceleration [m/s^2].
+        w_tunnel: Scale of the penalty for leaving the tunnel.
+        w_speed: Scale of the penalty for exceeding the speed limit.
+        w_tilt: Scale of the penalty for exceeding the tilt bound.
+        w_az: Scale of the penalty for exceeding the vertical acceleration bound.
+        w_motor: Scale of the penalty for leaving the motors' range.
+        motor_share: Scale of the torque each motor is assumed to have to keep in reserve.
         tilt_max: Bound on the total tilt [rad].
         tilt_lead: The tilt bound applies to ``tilt + tilt_lead * rate`` [s].
         cmd_max: Bound on the attitude command sent [rad].
@@ -170,6 +178,8 @@ class MpccConfig:
     q_progress: float = 60.0
     q_rate: float = 0.5
     q_torque: float = 0.0005
+    q_dthrust: float = 0.1
+    q_dds: float = 0.01
     # Keep the height steady: without these the MPCC gives up height in a hard turn, because it
     # prices it like lateral error and only reacts once it is lost. Level 2,
     # seeds 264-391, off -> on:
@@ -178,6 +188,12 @@ class MpccConfig:
     # does not do this.
     q_vz: float = 600.0
     az_max: float = 4.0
+    w_tunnel: float = 1.0
+    w_speed: float = 1.0
+    w_tilt: float = 1.0
+    w_az: float = 1.0
+    w_motor: float = 1.0
+    motor_share: float = 1.0
     tilt_max: float = 1.0
     tilt_lead: float = 0.08
     cmd_max: float = 1.3
@@ -226,8 +242,16 @@ _OCP_FIELDS = (
     "q_progress",
     "q_rate",
     "q_torque",
+    "q_dthrust",
+    "q_dds",
     "q_vz",
     "az_max",
+    "w_tunnel",
+    "w_speed",
+    "w_tilt",
+    "w_az",
+    "w_motor",
+    "motor_share",
     "tilt_max",
     "tilt_lead",
     "cmd_max",
@@ -295,7 +319,7 @@ def _model(name: str, cfg: MpccConfig) -> AcadosModel:
     )
     # Each motor carries a quarter of the thrust plus the torque share of both tilt axes, and must
     # stay inside its range or the torque is lost and the drone keeps tipping. Normalized to 0.05 N.
-    share = MOTOR_PER_ACC * (ca.sqrt(u[0] ** 2 + 1.0) + ca.sqrt(u[1] ** 2 + 1.0))
+    share = cfg.motor_share * MOTOR_PER_ACC * (ca.sqrt(u[0] ** 2 + 1.0) + ca.sqrt(u[1] ** 2 + 1.0))
     # The angle that makes the onboard law produce the planned torque must fit the command range.
     command = tilt + (u[0:2] + K2 * rate + KD * acc) / K1
     model.con_h_expr = ca.vertcat(
@@ -319,7 +343,8 @@ def _ocp(name: str, cfg: MpccConfig, dt: float, export_dir: Path) -> AcadosOcp:
     contour = [cfg.q_contour, cfg.q_contour, cfg.q_contour_z, cfg.q_lag]
     ocp.cost.W = np.diag(
         contour
-        + [cfg.q_progress, cfg.q_rate, cfg.q_rate, cfg.q_torque, cfg.q_torque, 0.1, 0.01, cfg.q_vz]
+        + [cfg.q_progress, cfg.q_rate, cfg.q_rate, cfg.q_torque, cfg.q_torque]
+        + [cfg.q_dthrust, cfg.q_dds, cfg.q_vz]
     )
     ocp.cost.W_e = np.diag(contour + [cfg.q_vz])
     ocp.cost.yref = np.zeros(NY)
@@ -343,9 +368,10 @@ def _ocp(name: str, cfg: MpccConfig, dt: float, export_dir: Path) -> AcadosOcp:
     # + [motor high, motor low, command roll, command pitch].
     lin_x = np.array([2000.0, 100.0, 100.0, 100.0])
     quad_x = np.array([2e5, 1000.0, 1000.0, 1000.0])
-    lin_h = np.array([2000.0, 1000.0, 3000.0, 300.0])
-    quad_h = np.array([1e5, 1e4, 3e5, 3000.0])
-    lin_in = np.array([300.0, 300.0, 300.0, 300.0])
+    scale_h = np.array([cfg.w_tunnel, cfg.w_speed, cfg.w_tilt, cfg.w_az])
+    lin_h = scale_h * np.array([2000.0, 1000.0, 3000.0, 300.0])
+    quad_h = scale_h * np.array([1e5, 1e4, 3e5, 3000.0])
+    lin_in = np.array([cfg.w_motor, cfg.w_motor, 1.0, 1.0]) * 300.0
     quad_in = 10.0 * lin_in
     ocp.cost.zl = ocp.cost.zu = np.r_[lin_x, lin_h, lin_in]
     ocp.cost.Zl = ocp.cost.Zu = np.r_[quad_x, quad_h, quad_in]

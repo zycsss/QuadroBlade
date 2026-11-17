@@ -6,7 +6,7 @@ between runs, and never disagrees with the numbers it came from. See
 
 Run it from the repository root, e.g.
 
-    pixi run python scripts/plot_path.py --log logs/level2_my_controller_seed0.npz
+    pixi run python scripts/plot_path.py --log logs/level2_rl_scene_seed0.npz
 """
 
 from __future__ import annotations

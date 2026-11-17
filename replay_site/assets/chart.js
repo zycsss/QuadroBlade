@@ -13,7 +13,7 @@
   "use strict";
 
   const NS = (root.Replay = root.Replay || {});
-  const { speedColor, prepareCanvas, label } = NS.util;
+  const { GEOMETRY, speedColor, prepareCanvas, label } = NS.util;
 
   const COLORS = {
     background: "#0d131b",
@@ -97,10 +97,12 @@
       });
     }
 
-    // Gate passes, on both panels, so a dive or a speed spike lines up with the gate it happened at.
+    // Gate passes: a faint time guide across both panels, and the height of the gate's opening drawn
+    // as an interval at the top. The interval is what the drone had to be inside; its centre alone
+    // said nothing about whether a pass through the opening was even possible.
     for (const pass of model.passes) {
       const x = xOfTime(pass.t);
-      ctx.strokeStyle = COLORS.gate;
+      ctx.strokeStyle = "rgba(240, 173, 78, 0.28)";
       ctx.setLineDash([3, 4]);
       ctx.lineWidth = 1;
       ctx.beginPath();
@@ -110,9 +112,35 @@
       ctx.lineTo(x, speedTop + speedHeight);
       ctx.stroke();
       ctx.setLineDash([]);
-      label(ctx, `g${pass.gate}`, x + 3, altitudeTop + 8, {
+
+      const gate = model.gates[pass.gate];
+      if (!gate) continue;
+      const centre = gate.truth[2];
+      const low = yOfAltitude(centre - GEOMETRY.gateOpeningHalf);
+      const high = yOfAltitude(centre + GEOMETRY.gateOpeningHalf);
+      // The frame, thin, then the opening it leaves, as a bar with caps at both ends.
+      ctx.strokeStyle = "rgba(240, 173, 78, 0.45)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(x, yOfAltitude(centre - GEOMETRY.gateFrameHalf));
+      ctx.lineTo(x, yOfAltitude(centre + GEOMETRY.gateFrameHalf));
+      ctx.stroke();
+      ctx.strokeStyle = COLORS.gate;
+      ctx.lineWidth = 5;
+      ctx.beginPath();
+      ctx.moveTo(x, low);
+      ctx.lineTo(x, high);
+      ctx.stroke();
+      ctx.lineWidth = 1.4;
+      for (const y of [low, high]) {
+        ctx.beginPath();
+        ctx.moveTo(x - 5, y);
+        ctx.lineTo(x + 5, y);
+        ctx.stroke();
+      }
+      label(ctx, `g${pass.gate}`, x + 6, Math.max(altitudeTop + 8, high - 10), {
         color: COLORS.gate,
-        font: "9px ui-monospace, monospace",
+        font: "bold 9.5px ui-monospace, monospace",
       });
     }
 
@@ -183,6 +211,49 @@
       });
     }
     label(ctx, "time [s]", width - paddingRight, height - 8, { align: "right", color: COLORS.tick, font: "9px ui-monospace, monospace" });
+
+    // The readings at the cursor: the vertical line the mouse is on, the two traces it crosses, and
+    // the numbers there. Hovering only previews; clicking still seeks the playback.
+    if (state.hoverChart && Number.isFinite(state.hoverChart.x) && plotWidth > 0 && timeSpan > 0) {
+      const hoverX = Math.min(paddingLeft + plotWidth, Math.max(paddingLeft, state.hoverChart.x));
+      const time = timeStart + ((hoverX - paddingLeft) / plotWidth) * timeSpan;
+      const index = nearestStep(model, time);
+      const z = model.pos[index][2];
+      const speed = model.speed[index];
+
+      ctx.save();
+      ctx.strokeStyle = "rgba(230, 240, 255, 0.55)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(hoverX, altitudeTop);
+      ctx.lineTo(hoverX, speedTop + speedHeight);
+      ctx.stroke();
+      for (const [y, color] of [
+        [yOfAltitude(z), speedColor(model.speedFraction(speed))],
+        [yOfSpeed(speed), speedColor(model.speedFraction(speed))],
+      ]) {
+        ctx.beginPath();
+        ctx.arc(hoverX, y, 3.6, 0, Math.PI * 2);
+        ctx.fillStyle = color;
+        ctx.fill();
+        ctx.strokeStyle = "#ffffff";
+        ctx.lineWidth = 1.3;
+        ctx.stroke();
+      }
+      ctx.restore();
+
+      drawTooltip(
+        ctx,
+        hoverX,
+        Math.min(speedTop + speedHeight, Math.max(altitudeTop, state.hoverChart.y)),
+        [
+          { text: `t ${model.t[index].toFixed(2)} s`, color: "#e9eef7" },
+          { text: `z ${z.toFixed(2)} m`, color: "#e9eef7" },
+          { text: `speed ${speed.toFixed(2)} m/s`, color: speedColor(model.speedFraction(speed)) },
+        ],
+        width
+      );
+    }
     ctx.restore();
 
     return {
@@ -191,6 +262,60 @@
         return Math.round(Math.min(1, Math.max(0, fraction)) * (model.n - 1));
       },
     };
+  }
+
+  /**
+   * Index of the logged step closest to a time. The times are sorted, so this is a binary search.
+   *
+   * @param {Object} model Replay model.
+   * @param {number} time Time in seconds.
+   * @returns {number} Step index.
+   */
+  function nearestStep(model, time) {
+    let low = 0;
+    let high = model.n - 1;
+    while (low < high) {
+      const middle = (low + high) >> 1;
+      if (model.t[middle] < time) low = middle + 1;
+      else high = middle;
+    }
+    const after = low;
+    const before = Math.max(0, after - 1);
+    return Math.abs(model.t[before] - time) <= Math.abs(model.t[after] - time) ? before : after;
+  }
+
+  /**
+   * A small dark box with a few lines of text, kept inside the canvas and flipped away from the edge.
+   *
+   * @param {CanvasRenderingContext2D} ctx Context.
+   * @param {number} x Anchor x in CSS pixels.
+   * @param {number} y Anchor y in CSS pixels.
+   * @param {Array<{text: string, color: string}>} lines Lines to draw.
+   * @param {number} width Canvas width in CSS pixels.
+   */
+  function drawTooltip(ctx, x, y, lines, width) {
+    ctx.save();
+    ctx.font = "11px ui-monospace, SFMono-Regular, Menlo, monospace";
+    const textWidth = Math.max(...lines.map((line) => ctx.measureText(line.text).width));
+    const boxWidth = textWidth + 16;
+    const boxHeight = lines.length * 15 + 8;
+    const left = x + 14 + boxWidth > width - 4 ? x - 14 - boxWidth : x + 14;
+    const top = y - boxHeight - 10 < 4 ? y + 14 : y - boxHeight - 10;
+    ctx.beginPath();
+    if (typeof ctx.roundRect === "function") ctx.roundRect(left, top, boxWidth, boxHeight, 5);
+    else ctx.rect(left, top, boxWidth, boxHeight);
+    ctx.fillStyle = "rgba(10, 15, 22, 0.94)";
+    ctx.fill();
+    ctx.strokeStyle = "rgba(140, 170, 210, 0.4)";
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+    lines.forEach((line, index) => {
+      ctx.fillStyle = line.color;
+      ctx.fillText(line.text, left + 8, top + 5 + index * 15);
+    });
+    ctx.restore();
   }
 
   /**
@@ -208,7 +333,11 @@
     };
     for (const point of model.pos) extend(point[2]);
     if (model.commandedHeight) for (const point of model.commandedHeight) extend(point[2]);
-    for (const gate of model.gates) extend(gate.truth[2]);
+    // The gate's whole frame has to fit, not just its centre: the pass is drawn as an interval.
+    for (const gate of model.gates) {
+      extend(gate.truth[2] - GEOMETRY.gateFrameHalf);
+      extend(gate.truth[2] + GEOMETRY.gateFrameHalf);
+    }
     low -= 0.08;
     high += 0.08;
     if (high - low < 0.25) high = low + 0.25;

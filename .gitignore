@@ -12,6 +12,7 @@ saves
 **/*.csv
 plots/
 logs/
+log/
 c_generated_code/
 /build
 
@@ -33,3 +34,9 @@ ros_ws/log
 acados/
 
 .tmp/
+# Local tool caches and scratch folders
+.ruff_cache/
+.pip_tmp/
+.pipt/
+# On-disk cache of solved time-optimal plans (topt_planner falls back to the working directory)
+lsy_topt_cache/

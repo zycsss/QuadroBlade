@@ -18,7 +18,8 @@ The constraints, per node:
   asks for an attitude or a thrust the controller cannot deliver with some left in reserve;
 * jerk: ``|u_i| <= jerk_max`` per axis, which bounds how fast the thrust vector turns;
 * clearance: horizontal distance to every nearby pole axis, and distance to the centre line of every
-  nearby gate capsule, each at least the part's radius plus the drone's reach;
+  nearby gate capsule, each at least the part's radius plus the drone's reach. With
+  `RANDOM_TRACK_CONFIG` this holds for every object and also between nodes;
 * floor: a climb cone off the start, then a minimum height;
 * unseen gates: over the last ``unseen_length`` metres before a gate the drone has not seen yet the
   speed is capped, and over the last ``approach_length`` metres the velocity is held inside a cone
@@ -41,7 +42,7 @@ import logging
 import os
 import tempfile
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -93,6 +94,9 @@ class PlannerConfig:
         approach_vertical: Half angle of the arrival cone vertically [rad].
         guesses: Initial guesses as ``(gate offset, pole detour radius, frame detour radius)``.
         max_iter: IPOPT iteration limit.
+        clear_everything: Keep clear of every object, not only those the initial guess passes near.
+        between_nodes: Points checked for clearance between neighbouring nodes.
+        node_spacing_max: Largest distance between neighbouring nodes [m]; 0 leaves it free.
     """
 
     nodes: int = 25
@@ -123,6 +127,25 @@ class PlannerConfig:
         default=((0.3, 0.25, 0.5), (0.5, 0.3, 0.5), (0.2, 0.35, 0.6))
     )
     max_iter: int = 1500
+    clear_everything: bool = False
+    between_nodes: int = 0
+    node_spacing_max: float = 0.0
+
+
+#: For tracks nobody has looked at: clear of every object, also between nodes that may not lie far
+#: apart. The fixed levels keep the defaults, because their plans are already clear and their
+#: policies were trained on them.
+RANDOM_TRACK_CONFIG = PlannerConfig(
+    frame_clearance=0.12,  # The drone's 8.6 cm sphere and the 3 cm that training counts as a hit.
+    clear_everything=True,
+    between_nodes=1,
+    node_spacing_max=0.25,
+)
+
+#: The same with more of the drone's reach. The policy follows its guide closely, so a faster guide
+#: may make a faster policy. The heaviest randomized drone reaches 16.5 m/s^2, and the policy's own
+#: limit on tilt is 1.4 rad.
+FAST_GUIDE_CONFIG = replace(RANDOM_TRACK_CONFIG, tilt_max=1.3, thrust_acc_max=16.0)
 
 
 @dataclass
@@ -283,6 +306,16 @@ def _rk4(drag: NDArray[np.floating]) -> ca.Function:
     return ca.Function("rk4", [x, u, h], [x + h / 6 * (k1 + 2 * k2 + 2 * k3 + k4)])
 
 
+def _between_nodes(p0: ca.MX, v0: ca.MX, p1: ca.MX, v1: ca.MX, h: ca.MX, s: float) -> ca.MX:
+    """Return the position a share ``s`` along an interval, from its ends' positions and speeds."""
+    return (
+        (2 * s**3 - 3 * s**2 + 1) * p0
+        + (s**3 - 2 * s**2 + s) * h * v0
+        + (-2 * s**3 + 3 * s**2) * p1
+        + (s**3 - s**2) * h * v1
+    )
+
+
 def solve_time_optimal(
     track: Track,
     start: NDArray[np.floating],
@@ -322,15 +355,20 @@ def solve_time_optimal(
             cost += 1e-6 * ca.sumsqr(u[:, k]) * h
         g = guess[i]
         remaining = np.r_[np.cumsum(np.linalg.norm(np.diff(g, axis=0), axis=1)[::-1])[::-1], 0.0]
-        # Only the objects the guess passes near are constrained; the rest cannot become active.
-        near_poles = [
-            p for p in track.poles_pos if np.min(np.linalg.norm(g[:, :2] - p[:2], axis=1)) < 0.9
-        ]
-        near_caps = [
-            (a, b, r)
-            for gate, a, b, r in capsules
-            if np.min(np.linalg.norm(g - track.gates_pos[gate], axis=1)) < 0.9
-        ]
+        if config.clear_everything:
+            near_poles = list(track.poles_pos)
+            near_caps = [(a, b, r) for _, a, b, r in capsules]
+        else:
+            # Only the objects the guess passes near; the solution may still leave the guess, which
+            # the plans of the fixed levels do not.
+            near_poles = [
+                p for p in track.poles_pos if np.min(np.linalg.norm(g[:, :2] - p[:2], axis=1)) < 0.9
+            ]
+            near_caps = [
+                (a, b, r)
+                for gate, a, b, r in capsules
+                if np.min(np.linalg.norm(g - track.gates_pos[gate], axis=1)) < 0.9
+            ]
         rot = track.gates_rot[track.sequence[i]]
         normal, lateral, up = track.normal(i), rot[:, 1], rot[:, 2]
         for k in range(n + 1):
@@ -345,12 +383,26 @@ def solve_time_optimal(
                 )
             else:
                 opti.subject_to(p[2] >= config.z_min)
-            for pole in near_poles:
-                opti.subject_to(ca.sumsqr(p[0:2] - pole[0:2]) >= config.pole_clearance**2)
-            for a, b, r in near_caps:
-                d = b - a
-                t = ca.fmin(ca.fmax(ca.dot(p - a, d) / float(d @ d), 0.0), 1.0)
-                opti.subject_to(ca.sumsqr(p - (a + t * d)) >= (r + config.frame_clearance) ** 2)
+            # Clearance only holds where it is checked. Left free, the solver spreads the nodes
+            # until it can step over a pole or a bar between two of them, which gave plans 46 m long
+            # with nodes 1.7 m apart. So the stride is limited and points between nodes are checked.
+            if config.node_spacing_max > 0.0 and k < n:
+                opti.subject_to(ca.sumsqr(x[0:3, k + 1] - p) <= config.node_spacing_max**2)
+            points = [p]
+            if k < n:
+                ends = (p, v, x[0:3, k + 1], x[3:6, k + 1], h)
+                count = config.between_nodes + 1
+                points += [_between_nodes(*ends, j / count) for j in range(1, count)]
+            for point in points:
+                for pole in near_poles:
+                    gap = ca.sumsqr(point[0:2] - pole[0:2])
+                    opti.subject_to(gap >= config.pole_clearance**2)
+                for a, b, r in near_caps:
+                    d = b - a
+                    t = ca.fmin(ca.fmax(ca.dot(point - a, d) / float(d @ d), 0.0), 1.0)
+                    opti.subject_to(
+                        ca.sumsqr(point - (a + t * d)) >= (r + config.frame_clearance) ** 2
+                    )
             cap = config.unseen_speed[i] if i < len(config.unseen_speed) else 0.0
             if track.unseen[i] and cap > 0 and remaining[k] < config.unseen_length:
                 opti.subject_to(ca.sumsqr(v) <= cap**2)

@@ -36,12 +36,13 @@ the page. The served list and the scanned files share one picker, grouped by whe
 
 | | |
 | --- | --- |
-| **2D** | the track from above, same geometry and same speed ramp as the debug figure |
+| **2D** | the track from above, same geometry and same speed ramp as the debug figure; the drone carries an arrow along its velocity, with the speed in m/s at the tip |
 | **3D** | the same run in perspective, orbitable — gate openings are squares in space, poles are vertical capsules, and a drop line under the drone shows its height |
 | **trajectory** | the flown path, every segment coloured by the speed at that moment (legend under the views) |
 | **gates and poles** | both positions: the *nominal* one from the config the controller started with, and the *revealed* true one. Until the drone comes within the sensor range the object is drawn dashed and labelled `g0 ?`; after that the true pose is solid and the nominal one stays as a faint ghost with a line to where it really was |
 | **sensor range** | the circle around the drone that decides when a reveal happens |
-| **chart** | altitude and speed against time for the whole run, with every gate pass marked and the controlled height dashed where the controller commanded a position |
+| **chart** | altitude and speed against time for the whole run. Every gate pass is drawn with the height of the gate's **opening** as an interval (thick bar, with the frame around it thinner), so a trace that leaves the bar is a pass over or under the opening. The controlled height is dashed where the controller commanded a position |
+| **hover** | the vertical line through the cursor, with the numbers where it crosses the data: on the 2D view the speed and time of every point where the flown path crosses that line; on the chart the time, height and speed on that line |
 
 The reveal is read from the logged `gates_visited`/`poles_visited` flags — the same flags the
 controller was given. A log written before those were recorded falls back to the environment's rule
@@ -56,6 +57,8 @@ controller was given. A log written before those were recorded falls back to the
 | `Home` `End` | first / last step |
 | slider, `◀` `▶` buttons | scrub and step |
 | `rate` | playback speed, 0.25× to 2× of real time |
+| hover the 2D view | a vertical line through the cursor, with the speed and time at every point where the flown path crosses it |
+| hover the chart | a vertical line through the cursor, with the time, height and speed on it |
 | click the chart | seek to that moment |
 | drag the 3D view | orbit |
 | wheel | zoom |
@@ -66,7 +69,8 @@ controller was given. A log written before those were recorded falls back to the
 
 Anything `scripts/debug_run.py` writes. The replay uses:
 
-* `t`, `pos`, `quat`, `speed` — the flight;
+* `t`, `pos`, `vel`, `quat`, `speed` — the flight; `vel` feeds the 2D velocity arrow and is derived
+  from `pos` when a log predates it;
 * `gates_pos`/`gates_quat` and `obstacles_pos` — the nominal track;
 * `true_gates_pos`/`true_gates_quat` and `true_obstacles_pos` — the randomized track;
 * `gates_visited`, `poles_visited`, `sensor_range` — when a true pose became known;

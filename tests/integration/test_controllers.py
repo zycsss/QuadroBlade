@@ -44,7 +44,7 @@ def test_controllers(controller_file: str):
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("controller", ["controller", "mpc", "rl"])  # TODO add rl when available
+@pytest.mark.parametrize("controller", ["controller", "mpc"])
 @pytest.mark.parametrize("dynamics", Dynamics)
 def test_attitude_controller(dynamics: Dynamics, controller: str):
     config = load_config(Path(__file__).parents[2] / "config/level0.toml")

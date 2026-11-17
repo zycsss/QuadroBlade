@@ -32,18 +32,17 @@
   }
 
   /**
-   * Speed per step, for a log that does not store it.
+   * Velocity per step, for a log that does not store it: a backward difference at the control rate.
    *
    * @param {number[][]} pos Positions, shape (n, 3).
    * @param {number[]} t Times, shape (n,).
-   * @returns {number[]} Speed per step.
+   * @returns {number[][]} Velocity per step, shape (n, 3).
    */
-  function deriveSpeed(pos, t) {
+  function deriveVelocity(pos, t) {
     return pos.map((p, i) => {
-      if (i === 0) return 0;
+      if (i === 0) return [0, 0, 0];
       const dt = t[i] - t[i - 1] || 1;
-      const d = [p[0] - pos[i - 1][0], p[1] - pos[i - 1][1], p[2] - pos[i - 1][2]];
-      return Math.hypot(d[0], d[1], d[2]) / dt;
+      return [(p[0] - pos[i - 1][0]) / dt, (p[1] - pos[i - 1][1]) / dt, (p[2] - pos[i - 1][2]) / dt];
     });
   }
 
@@ -180,8 +179,13 @@
     ).toLowerCase();
     const commandedHeight = controlMode === "state" && des ? des : null;
     const passed = arrays.n && arrays.n.length === steps ? arrays.n : new Array(steps).fill(0);
+    // Both the speed and the 2D view's velocity arrow need a velocity vector per step. The log
+    // records one; without it, the same difference that the speed would be derived from is used.
+    const vel = arrays.vel && arrays.vel.length === steps ? arrays.vel : deriveVelocity(pos, t);
     const speed =
-      arrays.speed && arrays.speed.length === steps ? arrays.speed : deriveSpeed(pos, t);
+      arrays.speed && arrays.speed.length === steps
+        ? arrays.speed
+        : vel.map((v) => Math.hypot(v[0], v[1], v[2]));
     const sequence = Array.isArray(arrays.gate_sequence) ? arrays.gate_sequence : [];
     const sensorRange = scalar(arrays.sensor_range, scalar(summary && summary.sensor_range, 0.5));
 
@@ -272,6 +276,7 @@
       n: steps,
       t,
       pos,
+      vel,
       des,
       commandedHeight,
       controlMode,
