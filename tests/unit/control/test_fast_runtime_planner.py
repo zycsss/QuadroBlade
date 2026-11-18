@@ -12,7 +12,7 @@ import pytest
 from scipy.spatial.transform import Rotation
 
 from lsy_drone_racing.control.topt_planner import Track
-from lsy_drone_racing.utils.fast_planner import (
+from lsy_drone_racing.utils.fast_runtime_planner import (
     FastPlannerConfig,
     _trajectory,
     _violations,
@@ -138,7 +138,7 @@ def test_hinge_measures_the_same_distance_as_the_check():
     n = len(centers)
     from types import SimpleNamespace
 
-    from lsy_drone_racing.utils.fast_planner import _BOXES_CENTER, _BOXES_HALF
+    from lsy_drone_racing.utils.fast_runtime_planner import _BOXES_CENTER, _BOXES_HALF
 
     layout = SimpleNamespace(
         gates_pos=np.tile(track.gates_pos, (n, 1, 1)),

@@ -15,6 +15,16 @@ generated tracks, never on the track it flies:
    gates and poles into an attitude and thrust command. The trained weights are in
    `control/rl_scene.npz`.
 
+On levels 2 and 3, where gates and poles are moved from where they are reported, it flies
+differently by default:
+
+1. The guide comes from a 30 ms planner (`utils/fast_runtime_planner.py`) and is planned again
+   whenever the sensor reveals a gate or pole.
+2. Three policies trained in different styles, `speed_first`, `middle_ground` and `safety_first`,
+   are flown by turns: every 0.2 s a selector network picks the style that flies next. The weights
+   are `control/rl_scene_{speed_first,middle_ground,safety_first}.npz` and
+   `control/rl_scene_style_selector.npz`.
+
 Because the policy never sees anything that identifies a track, the same network flies level 0 and
 generated level 3 tracks. How it is built and trained is described in
 [docs/Architecture.md](docs/Architecture.md).
@@ -67,7 +77,7 @@ RUN_FINAL_CONTROLLER=1 pixi run -e tests pytest tests/integration/test_final_con
 
 | Path | Contents |
 |---|---|
-| `lsy_drone_racing/control/` | Controllers: `rl_scene.py` (final), `rl_race.py` and `topt_mpcc.py` (alternatives we compared), the time-optimal planner, and the course's base class and examples |
+| `lsy_drone_racing/control/` | Controllers: `rl_scene.py` (final), `topt_mpcc.py` (the alternative we compared), the time-optimal planner, the course's base class and its state-mode example |
 | `lsy_drone_racing/envs/` | The race environments (from the course) |
 | `lsy_drone_racing/utils/` | Policy features, track generation, the fast guide planner and plotting |
 | `scripts/` | Simulation, evaluation, training and analysis scripts |
@@ -81,11 +91,13 @@ RUN_FINAL_CONTROLLER=1 pixi run -e tests pytest tests/integration/test_final_con
 
 | Controller | Use |
 |---|---|
-| `rl_race.py` | RL policy trained on the track it flies: 64/64 at 3.33 s on level 0 and 64/64 at 4.66 s on level 2. Its guide is planned for the nominal track, so it cannot fly level 3 |
 | `topt_mpcc.py` | Contouring MPC that flies the time-optimal plan, bent to the revealed gates: 54/64 at 4.40 s on level 2 |
 
-Fly one with `--controller`, for example
-`pixi run python scripts/sim.py --config level2.toml --controller rl_race.py`.
+Fly it with `--controller`:
+`pixi run python scripts/sim.py --config level2.toml --controller topt_mpcc.py`.
+
+`RLRace`, an RL policy trained on the one track it flies (64/64 at 4.66 s on level 2), was removed in
+favour of `RLScene`. It is in git history, up to commit a6ecd62.
 
 ## License
 

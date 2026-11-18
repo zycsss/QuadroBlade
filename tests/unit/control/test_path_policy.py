@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation
 
+if TYPE_CHECKING:
+    from pathlib import Path
+
 from lsy_drone_racing.utils.path_policy import (
     ACT_DIM,
     OBS_DIM,
     TILT_MAX,
+    PathPolicy,
     features,
     nearest,
     rotation_matrix,
@@ -111,3 +117,25 @@ def test_action_keeps_angles_inside_the_limits():
     assert np.all(np.isfinite(action))
     assert np.all(np.abs(action[:, :2]) <= TILT_MAX)
     assert np.all(np.abs(action[:, 2]) <= np.pi / 2)
+
+
+def test_an_input_that_never_varied_in_training_is_ignored(tmp_path: Path):
+    rng = np.random.default_rng(0)
+    w0, w1 = rng.normal(size=(3, 4)), rng.normal(size=(4, 2))
+    file = tmp_path / "policy.npz"
+    np.savez(
+        file,
+        obs_mean=np.zeros(3),
+        obs_std=np.array([1.0, 1.24e-6, 0.5]),
+        n_layers=2,
+        W0=w0,
+        b0=np.zeros(4),
+        W1=w1,
+        b1=np.zeros(2),
+    )
+    policy = PathPolicy(file)
+    flat = policy(np.array([[0.3, 0.0, -0.2]]))
+    # A gate tilted by 0.1 rad: the input had no spread in training and must not change the action.
+    tilted = policy(np.array([[0.3, 0.1, -0.2]]))
+    assert np.allclose(flat, tilted)
+    assert not np.allclose(flat, policy(np.array([[0.3, 0.0, 0.2]])))

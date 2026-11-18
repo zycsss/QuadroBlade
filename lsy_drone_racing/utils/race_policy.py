@@ -29,6 +29,8 @@ from lsy_drone_racing.utils.path_policy import _xp, nearest, resample
 from lsy_drone_racing.utils.path_policy import features as path_features
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from numpy.typing import NDArray
 
 #: Collision sphere of the drone, in its body frame [m].
@@ -88,13 +90,22 @@ class RaceTrack(NamedTuple):
     start: NDArray
 
 
-def build_track(track_cfg: dict, spacing: float = 0.05, config: object | None = None) -> RaceTrack:
+def build_track(
+    track_cfg: dict,
+    spacing: float = 0.05,
+    config: object | None = None,
+    plan_fn: Callable | None = None,
+    smooth: bool | None = None,
+) -> RaceTrack:
     """Return a track with its guide path, from the planner's cache when it was solved before.
 
     Args:
         track_cfg: The ``env.track`` section of a race configuration.
         spacing: Distance between the beads of the guide path; `path_policy` assumes 0.05 m.
         config: The planner's `PlannerConfig`; its defaults if None.
+        plan_fn: Plans instead of `topt_planner.plan`, called as
+            ``plan_fn(track, start, start_vel, config)``.
+        smooth: Build the guide along the curve the plan flies; by default only with a `config`.
 
     Returns:
         The track.
@@ -113,14 +124,16 @@ def build_track(track_cfg: dict, spacing: float = 0.05, config: object | None = 
     planner_track = Track(
         gates_pos, gates_rot, poles, sequence, directions, tuple(False for _ in sequence)
     )
-    trajectory = plan(
+    trajectory = (plan_fn or plan)(
         planner_track,
         start + np.array([0.0, 0.0, TAKEOFF_LIFT]),
         np.array([0.0, 0.0, TAKEOFF_SPEED]),
         config,
     )
     # The policies of the fixed levels were trained on straight lines between nodes.
-    guide = guide_arrays(trajectory, spacing, smooth=config is not None)
+    guide = guide_arrays(
+        trajectory, spacing, smooth=config is not None if smooth is None else smooth
+    )
     limits = track_cfg["safety_limits"]
     return RaceTrack(
         gates_pos=gates_pos,

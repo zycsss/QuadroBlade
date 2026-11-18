@@ -174,6 +174,11 @@ def to_action(u: NDArray[np.floating], yaw_max: float = YAW_MAX) -> NDArray[np.f
     )
 
 
+#: An input whose spread in training stayed below this never varied, e.g. the vertical part of a
+#: gate's axis when every training gate stood upright.
+CONSTANT_INPUT_STD = 1e-3
+
+
 class PathPolicy:
     """The trained network, in plain NumPy."""
 
@@ -181,6 +186,9 @@ class PathPolicy:
         """Load a policy written by `scripts/train_path_policy.py`."""
         data = np.load(file)
         self.mean, self.std = data["obs_mean"], data["obs_std"]
+        #: Inputs that never varied in training. Their weights were never trained, and scaled by a
+        #: spread of about 1e-6 any change saturates them, so they keep their training value.
+        self.constant = self.std < CONSTANT_INPUT_STD
         count = int(data["n_layers"])
         self.layers = [(data[f"W{i}"], data[f"b{i}"]) for i in range(count)]
         self.yaw_max = float(data["yaw_max"]) if "yaw_max" in data.files else YAW_MAX
@@ -188,6 +196,7 @@ class PathPolicy:
     def __call__(self, x: NDArray[np.floating]) -> NDArray[np.floating]:
         """Return the mean action for a batch of features."""
         x = np.clip((x - self.mean) / self.std, -10.0, 10.0)
+        x = np.where(self.constant, 0.0, x)
         for i, (w, b) in enumerate(self.layers):
             x = x @ w + b
             if i < len(self.layers) - 1:

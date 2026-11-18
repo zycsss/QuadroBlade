@@ -758,3 +758,41 @@ def plan_fast(
             "check": (t4 - t3) * 1e3,
         },
     )
+
+
+# region runtime guides
+#: Settings of the guides `RLScene` plans in flight, and of the libraries its runtime policy was
+#: trained on (`scripts/solve_fast_library.py` defaults). Policy and guide belong together.
+RUNTIME_GUIDE_CONFIG = FastPlannerConfig(steps=60, thrust=15.0)
+#: Width of the smoothing of a runtime guide's velocities [s], against attitude jumps.
+RUNTIME_VELOCITY_WINDOW = 0.15
+
+
+def runtime_plan(
+    track: Track,
+    start: NDArray,
+    start_vel: NDArray,
+    config: FastPlannerConfig = RUNTIME_GUIDE_CONFIG,
+    velocity_window: float = RUNTIME_VELOCITY_WINDOW,
+) -> tuple[SimpleNamespace, FastPlan, int]:
+    """Plan a guide as `RLScene` flies it: `plan_guide`, with its velocities smoothed.
+
+    Args:
+        track: The track as currently known.
+        start: Position of the first waypoint.
+        start_vel: Velocity at the first waypoint.
+        config: Limits and budget.
+        velocity_window: Width of the smoothing of the velocities [s].
+
+    Returns:
+        The trajectory for `race_policy.guide_arrays`, the plan with its check, and its tries.
+    """
+    plan, tries = plan_guide(track, start, start_vel, config)
+    t = plan.trajectory
+    trajectory = SimpleNamespace(
+        pos=t.pos,
+        vel=smooth_velocities(t.vel, t.time, velocity_window),
+        time=t.time,
+        crossings=t.crossings,
+    )
+    return trajectory, plan, tries

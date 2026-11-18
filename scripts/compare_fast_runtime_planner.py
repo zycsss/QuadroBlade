@@ -1,4 +1,4 @@
-"""Compare `utils/fast_planner.py` against the `topt_planner` guides of a solved library.
+"""Compare `utils/fast_runtime_planner.py` against the `topt_planner` guides of a solved library.
 
 Every seed of a library's range is planned, not only those `topt_planner` kept, because measuring on
 its survivors alone would favour it. Timing is one process on one core, as in a race; pin it with
@@ -6,7 +6,7 @@ its survivors alone would favour it. Timing is one process on one core, as in a 
 
 Example::
 
-    $ taskset -c 15 pixi run -e gpu python scripts/compare_fast_planner.py \
+    $ taskset -c 15 pixi run -e gpu python scripts/compare_fast_runtime_planner.py \
         --library .tmp/topt/rl2/scenes/fixed_level3_validation.npz --source level3 \
         --first_seed 300000 --count 200 --out level3_validation.json
 """
@@ -33,7 +33,11 @@ from scipy.spatial.transform import Rotation
 from lsy_drone_racing.control.topt_planner import Track
 from lsy_drone_racing.envs.randomize import build_random_track_fn
 from lsy_drone_racing.utils import load_config
-from lsy_drone_racing.utils.fast_planner import FastPlannerConfig, plan_guide, required_thrust
+from lsy_drone_racing.utils.fast_runtime_planner import (
+    FastPlannerConfig,
+    plan_guide,
+    required_thrust,
+)
 from lsy_drone_racing.utils.race_policy import TAKEOFF_LIFT, TAKEOFF_SPEED, guide_arrays
 from lsy_drone_racing.utils.scene_generator import sample_layout
 

@@ -1,7 +1,7 @@
-"""Integration test for the final controller, `RLScene`, on level 0.
+"""Integration tests for the final controller, `RLScene`, flown as the level configurations set it.
 
 On a new track the controller first solves a time-optimal guide, which takes several seconds, so
-this test is opt-in:
+these tests are opt-in:
 
     RUN_FINAL_CONTROLLER=1 pytest tests/integration/test_final_controller.py
 """
@@ -23,11 +23,16 @@ pytestmark = pytest.mark.skipif(
 REPO_ROOT = Path(__file__).parents[2]
 
 
-@pytest.mark.integration
-def test_final_controller_finishes_level0():
-    """The controller that the level configurations select has to complete the level-0 track."""
-    config = load_config(REPO_ROOT / "config/level0.toml")
+def _fly(level: str, seed: int, controller: dict | None = None) -> tuple[dict, float, object]:
+    """Fly one race of a level with the configured controller.
+
+    Returns:
+        The last observation, the time flown and the controller.
+    """
+    config = load_config(REPO_ROOT / f"config/{level}.toml")
     config.sim.render = False
+    for key, value in (controller or {}).items():
+        config.controller[key] = value
     ctrl_cls = load_controller(REPO_ROOT / "lsy_drone_racing/control" / config.controller.file)
     env = gymnasium.make(
         config.env.id,
@@ -38,10 +43,10 @@ def test_final_controller_finishes_level0():
         track=config.env.track,
         disturbances=config.env.get("disturbances"),
         randomizations=config.env.get("randomizations"),
-        seed=0,
+        seed=seed,
     )
     env = JaxToNumpy(env)
-    obs, info = env.reset(seed=0)
+    obs, info = env.reset(seed=seed)
     ctrl = ctrl_cls(obs, info, config)
     steps = 0
     while True:
@@ -52,6 +57,34 @@ def test_final_controller_finishes_level0():
         if terminated or truncated:
             break
     env.close()
+    return obs, steps / config.env.freq, ctrl
+
+
+@pytest.mark.integration
+def test_final_controller_finishes_level0():
+    """The controller that the level configurations select has to complete the level-0 track."""
+    obs, seconds, _ = _fly("level0", seed=0)
     n_passes = int(obs["gate_sequence"].shape[0])
     assert int(obs["n_gates_passed"]) == n_passes, "The final controller did not finish level 0"
-    assert steps / config.env.freq < 20.0
+    assert seconds < 20.0
+
+
+@pytest.mark.integration
+def test_final_controller_flies_level3_as_configured():
+    """Level 3, as its configuration sets it, runs to the end of a race with the final controller.
+
+    It flies the style selector by default; seed 0 is not checked for a finish.
+    """
+    obs, seconds, _ = _fly("level3", seed=0)
+    assert seconds > 0.0
+    assert int(obs["n_gates_passed"]) >= 0
+
+
+@pytest.mark.integration
+def test_the_style_selector_finishes_a_level3_race():
+    """With replanning at every reveal, the selector picks between the three styles and finishes."""
+    section = {"guide_planner": "fast_runtime", "replan_on_reveal": True, "style_selector": True}
+    obs, seconds, ctrl = _fly("level3", seed=9000, controller=section)
+    assert int(obs["n_gates_passed"]) == int(obs["gate_sequence"].shape[0])
+    assert seconds < 10.0
+    assert ctrl.style_ticks.sum() > 0

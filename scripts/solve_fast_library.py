@@ -30,7 +30,11 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from lsy_drone_racing.control.topt_planner import Track
-from lsy_drone_racing.utils.fast_planner import FastPlannerConfig, plan_guide, smooth_velocities
+from lsy_drone_racing.utils.fast_runtime_planner import (
+    FastPlannerConfig,
+    plan_guide,
+    smooth_velocities,
+)
 from lsy_drone_racing.utils.race_policy import TAKEOFF_LIFT, TAKEOFF_SPEED
 
 SEQUENCE = np.array([0, 1, 2, 3, 1])

@@ -34,7 +34,7 @@ from train_scene_policy import SceneEnv, make_lap_check
 from lsy_drone_racing.control.topt_planner import Track
 from lsy_drone_racing.envs.race_core import build_dynamics_disturbance_fn
 from lsy_drone_racing.utils import load_config
-from lsy_drone_racing.utils.fast_planner import FastPlannerConfig, plan_guide
+from lsy_drone_racing.utils.fast_runtime_planner import FastPlannerConfig, plan_guide
 from lsy_drone_racing.utils.race_policy import TAKEOFF_LIFT, TAKEOFF_SPEED, build_track
 from lsy_drone_racing.utils.scene_policy import load_library
 

@@ -14,11 +14,8 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from crazyflow.control import load_params as load_control_params
-from crazyflow.dynamics import load_params as load_dynamics_params
 from scipy.spatial.transform import Rotation as R
 
-from lsy_drone_racing.control.attitude_controller import AttitudeController
 from lsy_drone_racing.utils import load_config
 
 logger = logging.getLogger(__name__)
@@ -102,84 +99,6 @@ def state_circle(drone: Any, center: np.ndarray, height: float, radius: float, f
     logger.info("Finished state-command circle.")
 
 
-def override_attitude_reference(
-    controller: Any,
-    start: np.ndarray,
-    height: float,
-    radius: float,
-    takeoff_duration: float,
-    circle_duration: float,
-) -> None:
-    """Overwrite the attitude controller reference with the smoke-test circle."""
-    target = start.copy()
-    target[2] = height
-    omega = 2 * np.pi / circle_duration
-
-    def des_pos(t: float) -> np.ndarray:
-        if t < takeoff_duration:
-            alpha = np.clip(t / takeoff_duration, 0.0, 1.0)
-            return (1 - alpha) * start + alpha * target
-
-        theta = omega * (t - takeoff_duration)
-        return target + np.array([radius * np.cos(theta), radius * np.sin(theta), 0.0])
-
-    def des_vel(t: float) -> np.ndarray:
-        if t < takeoff_duration:
-            return (target - start) / takeoff_duration
-
-        theta = omega * (t - takeoff_duration)
-        return np.array([-radius * omega * np.sin(theta), radius * omega * np.cos(theta), 0.0])
-
-    controller._des_pos_spline = des_pos
-    controller._des_vel_spline = des_vel
-    controller._t_total = takeoff_duration + circle_duration
-    controller._tick = 0
-    controller._finished = False
-
-
-def attitude_circle(
-    drone: Any,
-    obs_connector: Any,
-    drone_name: str,
-    drone_params: dict[str, float],
-    controller: Any,
-    height: float,
-    radius: float,
-    freq: float,
-) -> None:
-    """Take off and fly one small circle with the attitude controller."""
-    takeoff_duration = 2.0
-    circle_duration = 4.0
-    start = obs_connector.est_pos[drone_name].copy()
-    override_attitude_reference(
-        controller, start, height, radius, takeoff_duration, circle_duration
-    )
-    controller._freq = freq
-
-    logger.info("Taking off with attitude controller to %.2f m.", height)
-    steps = int(takeoff_duration * freq)
-    t_start = time.perf_counter()
-    for step in range(steps):
-        obs = current_obs(obs_connector, drone_name)
-        action = controller.compute_control(obs).astype(np.float32)
-        drone.send_action_attitude(action[:3], action[3], drone_params)
-        drone.send_external_pose()
-        controller.step_callback(action, obs, 0.0, False, False, {})
-        sleep_step(t_start, step, freq)
-
-    logger.info("Flying attitude-controller circle with %.2f m radius.", radius)
-    steps = int(circle_duration * freq)
-    t_start = time.perf_counter()
-    for step in range(steps):
-        obs = current_obs(obs_connector, drone_name)
-        action = controller.compute_control(obs).astype(np.float32)
-        drone.send_action_attitude(action[:3], action[3], drone_params)
-        drone.send_external_pose()
-        controller.step_callback(action, obs, 0.0, False, False, {})
-        sleep_step(t_start, step, freq)
-    logger.info("Finished attitude-controller circle.")
-
-
 def stream_external_pose(drone: Any, duration: float, freq: float) -> None:
     """Stream external pose while high-level commands are running."""
     steps = int(duration * freq)
@@ -201,10 +120,6 @@ def main() -> None:
     drone_name = f"cf{drone_config['id']}"
     radio_id = args.rank if args.radio_id is None else args.radio_id
     home_pos = np.array(config.env.track.drones[args.rank]["pos"], dtype=np.float32)
-    drone_params = load_dynamics_params(config.sim.dynamics, drone_config["drone"])
-    control_params = load_control_params("mellinger", drone_config["drone"])["core"]
-    drone_params.update(pwm_min=control_params["pwm_min"])
-    drone_params.update(pwm_max=control_params["pwm_max"])
 
     logger.info("Initializing ROS for %s.", drone_name)
     rclpy.init()
@@ -231,23 +146,6 @@ def main() -> None:
         logger.info("Returning to start after state-command test.")
         drone.return_to_start(home_pos, current_obs(obs_connector, drone_name), check_ok=rclpy.ok)
         logger.info("Finished state-command test.")
-
-        logger.info("Connecting and resetting for attitude-command test.")
-        drone.reset(arm=True)
-        attitude_controller = AttitudeController(current_obs(obs_connector, drone_name), {}, config)
-        attitude_circle(
-            drone,
-            obs_connector,
-            drone_name,
-            drone_params,
-            attitude_controller,
-            args.height,
-            args.radius,
-            args.freq,
-        )
-        logger.info("Returning to start after attitude-command test.")
-        drone.return_to_start(home_pos, current_obs(obs_connector, drone_name), check_ok=rclpy.ok)
-        logger.info("Finished attitude-command test.")
 
         logger.info("Connecting and resetting for high-level goto test.")
         drone.reset(arm=True)

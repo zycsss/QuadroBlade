@@ -36,7 +36,11 @@ from scipy.spatial.transform import Rotation
 from lsy_drone_racing.control import topt_planner
 from lsy_drone_racing.control.rl_scene import RLScene
 from lsy_drone_racing.utils import load_config
-from lsy_drone_racing.utils.fast_planner import FastPlannerConfig, plan_guide, smooth_velocities
+from lsy_drone_racing.utils.fast_runtime_planner import (
+    FastPlannerConfig,
+    plan_guide,
+    smooth_velocities,
+)
 from lsy_drone_racing.utils.race_policy import body_center
 from lsy_drone_racing.utils.scene_policy import scene_clearances
 

@@ -567,9 +567,582 @@ seeds 7100-7227 and 8000-8127. Fast-planner libraries use the same tracks as `fi
   88.8% at 4.54 s. On the shared validation guides it finished 88.0% against 85.8% for the earlier policy.
 - `control/rl_scene.npz` stays as it was, and these policies are in `.tmp/topt/rl2/`.
 
+## Redesign: a policy that bends its own guide, in three styles
+
+**Status: proposed, nothing built.** Asked for: the policy sees more of the guide, decides itself
+whether to bend it around obstacles or to go faster, and always comes as three policies: speed first,
+middle ground and safety first.
+
+### Why the current policy can't do this
+
+It already may leave the guide, since its reward has no guide term, but it doesn't: it stays a median
+4.8 cm from the guide, never beats the plan, and freeing the reward or hiding the near guide didn't
+change that ("Can the policy find a better line" above). Leaving the guide is a decision made
+implicitly, one attitude command at a time, so it never gets learned. A bend made explicit is one small
+decision with a visible effect: "move this stretch 6 cm left" or "fly this stretch 10% faster".
+
+### Recommended: two levels, a bender on top of a tracker
+
+```
+guide (20 ms planner)  -->  bender policy, 10 Hz  -->  bent guide  -->  tracker policy, 50 Hz  -->  attitude, thrust
+                            sees more beads,           offsets and      sees the bent guide as
+                            gates, poles, flags        speed scale      today's policy sees its guide
+```
+
+**The bend.** At 4 control points ahead (0.5, 1, 2 and 3 m along the guide), a sideways and a vertical
+offset of up to 0.3 m in the frame that turns with the guide, plus one speed scale of 0.7-1.3 on the
+guide's speeds. Offsets blend smoothly between control points. They are tied to places on the track,
+not to the drone, so a bend stays put as the drone flies into it.
+
+**Every bend starts from the drone's current state,** in three ways:
+
+- **Where it starts:** the bent guide begins at the drone's position, not at the old guide, so it never
+  asks the tracker to first fly back to a line it has already left.
+- **Which way it leaves:** its first stretch leaves along the drone's velocity and blends into the
+  control points, so it is a path the drone can follow from the way it is moving.
+- **What it can reach:** each control point's offset is clipped to what the drone can still reach,
+  given its speed and the time until it gets there: about `a_side * t^2 / 2` beyond the straight line
+  its velocity points along, with `a_side` from the thrust left after gravity and the turn. A bend the
+  drone can't fly is never handed to the tracker.
+
+**The bender** decides every 5 control steps. Its inputs always start with the drone's current state:
+its position relative to the guide (offset from the nearest bead), its velocity, its attitude and
+angular velocity, its height, and the distances to the walls. All are in the frame that turns with the
+guide, as the tracker's are, with no absolute x and y, so that no track can be recognized. Then more of
+the guide: 24 beads up to 4 m ahead instead of 8, the speed at 8 places, and the current offsets. Then
+the next two gates and the four nearest poles, each relative to the drone, with flags for whether each
+has been revealed. It is trained with PPO on the race reward, with the tracker frozen. On level 3 this is what replanning would do, learned:
+when a gate is revealed elsewhere, the bender bends towards it.
+
+**The tracker** is today's scene policy, fine-tuned first on randomly bent guides with a reward for
+progress along the guide it is shown. That reward matters: today's policy follows its guide only
+because the guides were good. Shown random bends without such a reward, it would learn to ignore them,
+and the bender would have no say. It keeps its crash penalty, so it still won't fly into a pole that
+a bad bend points at.
+
+**Three styles share one tracker,** and differ only in the bender's reward and in how the kept policy is
+chosen:
+
+| Style | Crash | Hit margin | Obstacle term | Time cost per step | Kept policy chosen by |
+|---|---|---|---|---|---|
+| `speed_first` | -20 | 2 cm | 0 | 0.2 | Lap time, from 70% finished |
+| `middle_ground` | -20 | 3 cm | 0.02 | 0.05 | Today's score: finishing, then time |
+| `safety_first` | -60 | 5 cm | 0.05, falling off faster | 0.05 | Finishing, then the smallest clearance |
+
+The weights are a starting point. The three must end up ordered in the race: `speed_first` quickest,
+`safety_first` finishing most. If two land on the same result, their weights move further apart.
+`RLScene` picks one with `controller.style`, and `middle_ground` is the default.
+
+### The alternative: one policy with both outputs
+
+The scene policy gets the bend as extra outputs alongside the attitude and thrust, and sees its own bent
+guide at the next step. It is a single network and a single training run per style. But nothing then
+makes it follow its own bend, so it can learn to treat the bend as noise, and the bend loses its meaning.
+A guide-progress reward fixes that and brings back the two-level design inside one network. I
+recommend the two levels because the tracker is already proven, 249/256 on unshifted random tracks, and
+each bender then has a small, clear job.
+
+### Steps
+
+1. **Bend and features** (about 2 hours): the bend in `scene_policy.py`, in JAX and NumPy, with tests that
+   flight and training agree, that a bend starts at the drone's position along its velocity, that no
+   control point exceeds what the drone can reach, and that a zero bend from a drone on the guide leaves
+   the guide as it is. The bender's features in the same file.
+2. **Tracker on bent guides** (about 1.5 hours): fine-tune `level1_random_tracks_fast_guides_60steps` on
+   20 ms planner guides with random bends and a progress reward. Measure how closely it follows bends
+   of each size. If it can't follow 15 cm reliably, the bender's range shrinks to what it can.
+3. **Three benders** (about 2 hours, side by side): `speed_first_bender`, `middle_ground_bender`,
+   `safety_first_bender`, first on unshifted random tracks, then with level 2's shifts and reveals.
+4. **Real race** (about 1 hour): each style on real level 3, level 2 and unshifted random tracks, on
+   fresh seeds, against the unbent tracker. A style replaces the default only if it beats it, and the
+   three must be ordered as above.
+
+### Risks
+
+- **The tracker may not follow bends closely enough.** Gates leave about 8 cm of room, and the tracker
+  stays a median 4.8 cm from guides it was trained on. Step 2 measures this before any bender is
+  trained.
+- **The bender learns slowly.** Its decisions act through a frozen tracker, 0.1 s apart. If PPO doesn't
+  move it from a zero bend, it can start by copying the bend that the true layout's guide would need, on
+  shifted tracks.
+- **Starting each bend at the drone accepts its drift.** With a new bend every 0.1 s, the guide follows
+  wherever the drone has drifted, and only the control points ahead pull it back. If drift builds up,
+  the start blends from the drone's position back towards the previous bend over the first 0.5 m.
+- **Three styles triple the training time.** They run side by side, at about 0.4M steps/s each.
+
+### How it fits the level 3 plan
+
+Step 0 and Step 1 of "Plan: real level 3" below don't depend on this and come first: they say how much a
+correct guide is worth. The bender then takes the place of that plan's Step 2, the guides planned in
+advance for every stage of reveals. If Step 1 shows that replanning alone almost closes the gap, the
+two combine: replan at reveals and let the bender refine.
+
+## Plan: an RL bender trained together with the tracker
+
+**Status: built and tried on `safety_first` (2026-11-18): no gain, so the other two styles and the
+selector over pairs were not trained. Results at the end of this section.** Asked for: a bender that is trained together with
+the controller, not on top of a frozen one. It builds on "Redesign" above, which trained the tracker
+first and the bender after. What carries over: the bend itself (offsets at control points ahead,
+a speed scale) and the rule that every bend starts from the drone's position and velocity.
+
+### Why train them together
+
+- **Neither half is right alone.** A tracker trained on random bends learns to follow bends that no
+  bender would make, and a bender over a frozen tracker can only ask for what that tracker already
+  does. Trained together, the tracker learns to fly the bends that pay off, and the bender learns
+  which bends the tracker can fly.
+- **It replaces planning in training.** Flight now replans from the drone's state at every reveal and
+  pass (`replan_from_state`), but training can't run the planner: its guides are planned from the
+  start, in advance. A bend is computed inside the JAX step, from the drone's state, so in training
+  it plays the part of that replan. In flight it refines the replanned guide.
+
+### Structure
+
+```
+guide (training: staged, from the start; flight: replanned from the state)
+   --> bender, every 5 steps (0.1 s): 4 control points x (side, up) offsets + 1 speed scale
+   --> bent guide: starts at the drone, leaves along its velocity, offsets clipped to what it can reach
+   --> tracker, every step: today's 86 scene features, computed on the bent guide --> attitude, thrust
+```
+
+- **Bender inputs:** the tracker's 86 features, plus 24 beads up to 4 m ahead, the next two gates and the
+  four nearest poles with revealed flags, and the current bend. About 160 inputs, 2 x 128.
+- **Tracker:** the same network shape as today, so a trained style can start it.
+
+### One PPO run trains both
+
+The two networks share one rollout and one update. Each has its own critic, its own advantage and its
+own reward:
+
+| | Acts | Reward |
+|---|---|---|
+| Bender | Every 5 steps, one semi-Markov transition, as the selector's | The style's race reward: gates, finish, crash, time cost, obstacle term |
+| Tracker | Every step | The same race reward, plus progress along the **bent** guide and a small cost for leaving it |
+
+The tracker's guide term is what keeps the bend meaningful. Without it the tracker learns to ignore
+the bend, and the bender loses its say. Its weight falls over training (from 1 to 0.2), so that by the
+end the tracker may cut a bend where the race rewards it.
+
+**Keeping two learners stable:**
+
+1. **Warm start.** The tracker starts from the style trained in Step 2, and the bender from zero
+   output, a bend of zero. At the start the pair flies exactly as today.
+2. **Bender first.** For the first 500 iterations only the bender learns, with the tracker frozen.
+   Then both learn, the tracker at a third of the bender's learning rate.
+3. **Bend size grows.** Offsets are capped at 5 cm at first, rising to 30 cm over 2000 iterations, so
+   the tracker is never asked for a bend far from what it has learned.
+4. **A check per network.** Every lap check also flies the new tracker on the unbent guide. If that
+   gets worse by more than 5 finishes in 100, the tracker's learning rate halves.
+
+### Three styles and the selector
+
+Each style is one pair (bender and tracker), trained in one run with that style's reward from
+`STYLES`. That keeps a style's risk in both halves. The selector of Step 2b then picks between the
+three pairs, and is retrained on them (about 11 minutes).
+
+### Steps
+
+1. **Bend in JAX and NumPy** (about 2 hours), in `scene_policy.py`: control points, the start at the
+   drone along its velocity, the reach clip, the speed scale. Tests: flight and training agree, a zero
+   bend of a drone on the guide leaves the guide as it is, and no control point exceeds the reach.
+2. **Joint trainer** (about 3 hours): `scripts/train_bender.py`, reusing `SceneEnv`, the staged
+   scenarios and the semi-Markov PPO of `train_style_selector.py`. Smoke-test that a zero bender with
+   a frozen tracker reproduces the Step 2 style's validation numbers.
+3. **Three pairs** (about 1.5 hours, one at a time, since a staged run takes 12 GB of GPU memory):
+   `joint_bender_tracker_speed_first`, `..._middle_ground`, `..._safety_first`.
+4. **Selector over the pairs** (about 15 minutes).
+5. **Real race** (about 1 hour): real levels 3 and 2 on the usual seeds, against today's default. In
+   flight `RLScene` gets `controller.bender = true`. The bend runs after each replan from the state,
+   and costs about 0.1 ms per step.
+
+### Risks
+
+- **The two learners chase each other.** The warm start, the bender-first phase and the slower tracker
+  are there for this. If it still oscillates, alternate: 200 iterations of one, then of the other.
+- **Bends in training and flight start from different guides.** Training guides were planned from the
+  start, while flight's start at the drone. Near the drone the bend is the same either way, since it
+  starts at the drone in both. Further ahead the replanned guide is already closer to right, so the
+  bends flight needs are smaller than those training learns.
+- **The bend may only learn to slow down.** The speed scale is the easiest output to use. If the pairs
+  end up slower than today's styles with no more finishes, the speed scale gets a floor of 0.9.
+
+### Results: built, tried on `safety_first`, no gain (2026-11-18)
+
+**Built:**
+- `Bend`, `make_bend`, `bend_offset`, `bender_features` and a ``bend`` argument of `scene_features` in
+  `utils/scene_policy.py`, with tests that NumPy and JAX agree.
+- `scripts/train_bender.py`, the joint trainer.
+- `controller.bender` in `RLScene`: each policy as a pilot with its own bender, also under the selector.
+- `--benders` in `scripts/train_style_selector.py` and `scripts/evaluate_reveals.py`.
+
+The tracker always sees its offset from the guide as planned. A bend moves the points ahead and
+scales the speeds.
+
+**Two runs of 4000 iterations each (13 minutes), started from `rl_scene_safety_first.npz`:**
+
+| Run | Validation, started tracker with no bend | Best validation | Real level 3 | Real level 2 |
+|---|---|---|---|---|
+| `safety_first` alone (Step 2) | | 43.7% at 7.19 s | 107/128 at 7.45 s | 54/64 at 6.43 s |
+| Bend starts at the drone (`from_drone`) | 33.7% at 7.11 s | 43.8% at 7.72 s | 104/128 at 8.01 s | 50/64 at 7.23 s |
+| Bend starts on the guide (the default) | 44.1% at 7.18 s | 44.6% at 7.19 s, iteration 0 | Not flown: the kept pair is the started tracker | |
+
+- **Starting the bend at the drone breaks the warm start.** With no bend at all, the points ahead are
+  pulled towards the drone, so the tracker reads a guide that it never trained on, and validation drops
+  by 10 points. Joint training won that back, but the pair stayed slower and finished fewer real races
+  than the style alone. With the offset from the planned guide also hidden, the started tracker fell
+  to 28%. This run was stopped.
+- **Starting the bend on the guide keeps the warm start exact,** but the bender found no bend that
+  helps. Validation fell slowly as the bends grew to about 6 cm, from 44.6% to around 40-42%. The kept
+  pair is iteration 0, which is the style unchanged.
+- **Why the bender has nothing to add here:** in these scenarios the guide is already replanned at
+  every stage of reveals. The bender knows no more than the planner did, so a better line has to come
+  from flying, not from new information. Its PPO signal is also weak: 9 noisy outputs, each acting
+  through the tracker for 0.1 s.
+- **Not done, because the bender doesn't beat the style alone:** pairs for `speed_first` and
+  `middle_ground`, and the selector over pairs. The code for both is in place.
+- **Lost:** the weights of the run that started at the drone were deleted by a cleanup pattern that
+  matched them. Its logs and race results are kept.
+
+**What could still work:**
+- Give the bender information that the guide lacks. For example, train on guides planned once from
+  the start without staging, so that bending towards a revealed object is the bender's job.
+- Use fewer outputs, such as one sideways offset at the next gate and a speed scale.
+- Train it on the race reward alone, with no follow term for the tracker.
+
+## Plan: real level 3, with a guide that follows what has been revealed
+
+**Status: Steps 0, 1 and 2 done, with replanning in flight from Step 3 in a first form, and a selector that picks the style in flight (Step 2b). Results below.** Supersedes "Plan: perturbed arenas" below, which was written
+before the 20 ms planner existed and left replanning in flight out for that reason.
+
+**Goal:** the final controller, trained only on generated tracks, finishes real level 3 reliably: gates
+and poles at random places, then moved by up to 15 cm and revealed only within 0.7 m. Level 2 is the
+same problem on one fixed layout and is graded too, so it is tested alongside. Lap time comes second.
+
+### What the race does on level 3
+
+- The first observation reports a generated layout, which is all the controller knows at the start.
+- The true poses differ by level 2's ranges: gates +-0.15 m in x and y, +-0.1 m in z, +-0.2 rad of yaw;
+  poles +-0.15 m in x and y. An object's true pose is reported once the drone is within 0.7 m of it in
+  x and y, and `gates_visited` and `obstacles_visited` say which ones those are.
+- At 3-4 m/s, that is about 0.2-0.27 s before reaching a gate. A 15 cm sideways correction in 0.23 s
+  needs about 5.7 m/s^2 on its own, before any turn.
+- From the course's rules: grading uses levels 2 and 3 and real hardware. `env.control_mode` is one of
+  the two settings a level file may change. `scripts/evaluate.py` scores level 2 and needs at least 50%
+  of 20 runs. `scripts/sim.py` doesn't time the controller's constructor and only warns when a control
+  step exceeds 20 ms. Real level 3 tracks are built from gates placed by hand, so their layouts may not
+  match the race's generator.
+
+### Where things stand
+
+| Controller | Unshifted random tracks | Real level 2 | Real level 3 |
+|---|---|---|---|
+| `RLScene` with `rl_scene.npz`, the committed default | 243/256 at about 4.67 s | 0/64 | Never flown |
+| `level1_random_tracks_fast_limit_guides`, solved guides with faster limits | 249/256 at about 4.46 s | Not flown | Never flown |
+| `level1_random_tracks_fast_guides_60steps`, 20 ms planner | 248/256 at about 4.92 s | Not flown | Never flown |
+| `clear_guides_level2_shifts`, trained with shifts | | 8/32 | Never flown |
+| `RLRace`, trained on level 2's own track | | 64/64 at 4.66 s | Can't: one track |
+
+**Blocker found while rescanning:** `config/level3.toml` still sets `control_mode = "state"`, while
+`RLScene` returns an attitude command. Every result above overrode it to attitude, so the configured
+final controller probably fails on level 3 as committed. Levels 0-2 already use attitude. Not run yet.
+
+### Why the guide is the place to fix it
+
+Every policy so far was trained on guides planned once, through the reported layout. After a reveal,
+the guide still leads to where the gate was reported, and the only correction is what the policy does
+on its own in about 0.2 s. `RLRace` manages that on one track it has learned by heart. A policy that
+has never seen the track can't, which fits 0/64 on level 2.
+
+The 20 ms planner can replan within a control step, or close to it: 17 ms median at 60 steps, 34-67 ms
+at the 95th percentile. Training can't call it per step, but it can call it in advance for every layout
+the drone could know about. So the guide can always be the plan through the layout as known so far,
+in training and in flight alike. The policy then only has to handle the step when the guide jumps,
+which is an offset from the guide, and it already learns those from noisy starts.
+
+The 20 ms planner's policy is also the right one to build on. It finished as often as the solved-guide
+policies and needs no 15 s solve at the start. A policy trained on one planner's guides loses finishes
+on the other's, so training and flight must use the same planner.
+
+### Step 0: make level 3 run as committed (minutes)
+
+- Set `control_mode = "attitude"` in `config/level3.toml`, which the rules allow.
+- Fly `pixi run python scripts/sim.py --config level3.toml` once, and add level 3 to
+  `tests/integration/test_final_controller.py`, opt-in like level 0.
+
+### Step 1: baselines and upper bounds, no training (about 1 hour)
+
+All on fresh seeds: 128 of real level 3 from 9000, and 64 of real level 2 from 1000. Each row only
+swaps how the guide is made, using hooks in the evaluation scripts:
+
+| Flight | Guide | What it tells |
+|---|---|---|
+| Default `rl_scene.npz` | Solved once, at start | The baseline, never measured on level 3 |
+| `fast_limit_guides` policy | Solved once, faster limits | Whether the faster policy holds up under shifts |
+| `fast_guides_60steps` policy | 20 ms planner, once at start | Baseline for the 20 ms planner |
+| `fast_guides_60steps` policy | 20 ms planner, again at every reveal | What replanning gives without retraining |
+| `fast_guides_60steps` policy | 20 ms planner on the true layout, from the start | Upper bound: the right guide all along |
+
+The last row cheats and is for evaluation only. If it isn't far above the first, the guide isn't the
+main cause, and Step 2 changes to the inputs and the speed at unrevealed gates (Step 4) instead.
+
+For every crash, record the object, how far it moved from its reported pose, and the time from its
+reveal to the crash. That shows whether failures are reveals too late to react to, or wrong guides.
+Also time each replan inside the race.
+
+### Results of Steps 0 and 1 (2026-11-17)
+
+**Step 0.** In state mode, `config/level3.toml` failed on its first step: `RLScene` returns 4 numbers
+and state mode expects 13. It is now in attitude mode, and `test_final_controller.py` flies level 3
+as configured. `RLScene` gained `guide_planner = "fast_runtime"` and `replan_on_reveal = true`, and
+`scripts/evaluate_reveals.py` flies each guide mode.
+
+**A bug that hid everything else.** Every policy trained on upright gates crashed whenever a gate was
+tilted. Level 2 and 3 tilt gates by up to 0.05 rad of roll and 0.1 rad of pitch, and with them even a
+flight given the true layout and every true pose from the start finished 0/64. The vertical part of a
+gate's axis (inputs 58, 64 and 77) was always 0 in training, so its saved spread was 1.2e-6 and its
+weights were never trained. A tilt of 0.1 rad became an input clipped to 10, through untrained
+weights. `PathPolicy` now keeps any input whose training spread is below 1e-3 at its training value,
+so the policy ignores the tilt, as it learned to. Found by removing one kind of shift at a time: with
+yaw shifts alone, 61/64 finished; with roll and pitch alone, 0/64.
+
+**Step 1, after that fix.** Seeds 9000-9127 of real level 3 and 1000-1063 of real level 2. The topt rows
+fly `rl_scene.npz` and `level1_random_tracks_fast_limit_guides`, the runtime rows
+`rl_scene_runtime_guides.npz`. "Hit after reveal" is the median time from the reveal of what was hit
+to the crash.
+
+| Guide | Level 3 | Level 2 | Hit after reveal, level 3 |
+|---|---|---|---|
+| `topt_planner`, once (the committed default) | 2/128 at 4.50 s | 1/64 at 4.08 s | 0.22 s |
+| `topt_planner` with faster limits, once | 4/128 at 4.57 s | 0/64 | 0.21 s |
+| Runtime planner, once | 5/128 at 5.23 s | 6/64 at 4.48 s | 0.26 s |
+| **Runtime planner, replanned at every reveal** | **55/128 at 5.39 s** | **29/64 at 4.61 s** | 0.20 s |
+| Runtime planner, true layout (cheat) | 120/128 at 5.11 s | 58/64 at 4.57 s | 0.21 s |
+| Runtime planner, once, but the policy sees every true pose (cheat) | 5/128 at 5.22 s | 4/64 at 4.46 s | 0.26 s |
+| Both cheats | 122/128 at 5.12 s | 59/64 at 4.57 s | 0.24 s |
+
+With no shifts at all, the same script finished 63/64 with runtime guides and 60/64 with solved ones,
+so the setup is sound.
+
+- **The guide is the cause.** A guide through the true layout lifts level 3 from 5 to 120 of 128. Showing
+  the policy every true pose without that guide changes nothing (5/128): it flies by its guide, not by
+  the gates it sees.
+- **Replanning at reveals recovers about half of that,** 55/128 and 29/64. What is left crashes about
+  0.2 s after the reveal of what it hits, on objects that moved a median 15 cm: the corrected guide
+  comes too late to follow. Poles cause 24 of the 73 level 3 crashes and next gates 38.
+- **Replanning takes 34 ms median and 48 ms at the 95th percentile** here, over the 20 ms step, with 14
+  races sharing the CPU. `scripts/sim.py` only warns, but Step 3's background thread is needed before
+  hardware. About 5 replans per race on level 3 and 6 on level 2, and none failed its check.
+- **Not yet in training:** the policy has never seen a guide jump, nor a gate revealed late. That is
+  Step 2, and the gap between 55 and 120 is what it has to close.
+
+### Results of Step 2: trained on guides that follow the reveals, in three styles (2026-11-17)
+
+Built: `scripts/solve_staged_library.py`, `--staged` and `--style` in `scripts/train_scene_policy.py`,
+and `replan_in_order` in `RLScene`. Revealed flags were left out for now, so the inputs stay at 86. Each
+style trained 8000 iterations from scratch, on 6092 shifted scenarios with gate tilt. A staged run uses
+about 12 GB of the GPU, so the three ran one after another, about 25 minutes each.
+
+| Style | Validation lap check | Real level 3, replanned at every reveal | Real level 3, replanned in order | Real level 2, at every reveal | Real level 2, in order |
+|---|---|---|---|---|---|
+| `speed_first` | 45.6% at 5.57 s | 88/128 at 5.72 s | 75/128 at 5.71 s | 31/64 at 4.97 s | 31/64 at 4.97 s |
+| `middle_ground` | 41.8% at 5.94 s | 93/128 at 6.20 s | 79/128 at 6.16 s | 34/64 at 5.15 s | 34/64 at 5.15 s |
+| `safety_first` | 43.7% at 7.19 s | **107/128 at 7.45 s** | 92/128 at 7.47 s | **54/64 at 6.43 s** | 56/64 at 6.43 s |
+| Untrained, for comparison | | 55/128 at 5.39 s | 47/128 at 5.33 s | 29/64 at 4.61 s | |
+| **Best of the three per race** | | **120/128 at 6.13 s** | 106/128 at 6.18 s | **61/64 at 5.65 s** | 62/64 at 5.66 s |
+
+Seeds 9000-9127 of level 3 and 1000-1063 of level 2, as in Step 1.
+
+- **Training on reveals works.** Every style beats the untrained policy on level 3, `safety_first` by
+  52 finishes.
+- **The styles came out ordered as intended:** `speed_first` fastest, `safety_first` finishing most. Lap
+  time costs about 1.7 s from one end to the other.
+- **A selector has room to gain.** Taking the best style per race would finish 120/128 at 6.13 s on level
+  3, against 107/128 at 7.45 s for the best single style. On level 2 it would be 61/64 at 5.65 s. This is
+  an upper bound that knows each race's outcome, for whole races, not a result.
+- **Replan at every reveal in flight, even though training replans in order:** level 3 gains 13-15
+  finishes for every style, and level 2 is within 2. In-order replanning makes the drone wait for an
+  object revealed out of order.
+- **Poles end most of the remaining flights** of `speed_first` and `middle_ground` on level 2 (24 of 33
+  and 30), about 0.25 s after their reveal. `safety_first` hits 8.
+- **Replans took 32-34 ms median and 42-52 ms at the 95th percentile,** with 14 races sharing the CPU.
+
+**Next: the agent chooses between the styles itself** (see "Redesign" above and the three-styles rule).
+A selector would pick a style at events such as a reveal or a pass, with the three policies frozen
+underneath, trained with PPO on one race objective. Its ceiling on these races is the best-of-three
+row.
+
+### Results of Step 2b: the agent chooses its style in flight (2026-11-18)
+
+Built: `scripts/train_style_selector.py`, `scene_policy.selector_features`, and
+`controller.style_selector` in `RLScene`, with the four files in `control/`.
+
+**How it chooses.** The three styles of Step 2 stay frozen. Every 10 control steps (0.2 s) a small
+network picks the style that flies the next 10. It sees:
+
+- the 86 scene features,
+- the style flying now, as one-hot,
+- what each of the three styles would command now (12 numbers).
+
+From the start until its first decision, `middle_ground` flies. In flight the first decision comes at the
+first step.
+
+**How it learns.** PPO with a categorical output, on the same staged scenarios as the styles. One
+decision and the 10 steps it holds form one transition. The reward is the race's own and the same for
+every style:
+
+| Term | Value |
+|---|---|
+| Gate passed | +1 |
+| Finish | +10 |
+| Crash, at a 2 cm hit margin | -5 |
+| Per control step | -0.02 (1 s costs as much as 1% of finishes) |
+
+The kept selector scores best on validation laps by `10 * finish - time + gates`. Each style alone is
+flown on the same validation laps for comparison. Training is 1500 iterations of 16 decisions in 8192
+worlds, about 11 minutes.
+
+**The discount sets the balance.** At 0.95 per decision (about 4 s ahead) a finish 7 s away hardly
+counts, and the selector chose `speed_first` half the time. At 0.99 (about 20 s) it ranks whole laps.
+
+| | Validation | Real level 3 | Real level 2 | Share of time per style on level 3 (speed / middle / safety) |
+|---|---|---|---|---|
+| `speed_first` alone | 45.0% at 5.58 s | 88/128 at 5.72 s | 31/64 at 4.97 s | |
+| `middle_ground` alone | 49.5% at 5.95 s | 93/128 at 6.20 s | 34/64 at 5.15 s | |
+| `safety_first` alone | 66.6% at 7.31 s | 107/128 at 7.45 s | 54/64 at 6.43 s | |
+| Selector, discount 0.95 | 54.3% at 6.05 s | 103/128 at 6.16 s | 48/64 at 5.67 s | 53 / 30 / 17% |
+| **Selector, discount 0.99 (installed)** | 62.9% at 6.55 s | **106/128 at 6.66 s** | **54/64 at 6.09 s** | 25 / 31 / 43% |
+| Best of three per race (ceiling) | | 120/128 at 6.13 s | 61/64 at 5.65 s | |
+
+The validation column uses a 2 cm hit margin, so it isn't comparable with Step 2's. Real races replan
+at every reveal.
+
+- **The installed selector matches `safety_first` on finishes and is faster:** 0.8 s on level 3 (106
+  against 107 finishes) and 0.34 s on level 2 (54 against 54). It flies `safety_first` 43% of the time
+  on level 3 and 71% on level 2, where the poles stand closer to the gates.
+- **The ceiling is still 14 finishes away on level 3.** Poles end 18 of the 22 failed flights, as for the
+  styles alone.
+- **Cost in flight:** three style networks and the selector per step, about 40 microseconds in all,
+  against 33 ms per replan.
+
+Selector runs and results are in `.tmp/topt/level3/selector/` and `.tmp/topt/level3/results/`.
+
+**Made the default on levels 2 and 3 (2026-11-18).** `RLScene` takes `SHIFTED_RACE_DEFAULTS` on any
+race whose randomizations move gates or poles. Levels 0 and 1 keep the solved guide with
+`rl_scene.npz`.
+
+### Replanning from the drone's state (2026-11-18)
+
+Built: `controller.replan_from_state` with `replan_gates` in `RLScene`, and `--replan_gates` in
+`scripts/evaluate_reveals.py`. A replan starts at the drone's position and velocity and goes through
+the next `replan_gates` gates (0 for the rest of the lap). It replans at every reveal, and at every pass
+when the plan ends before the lap does. Flown with the installed selector, on the usual seeds:
+
+| Replan | Real level 3 | Real level 2 | Failed plans (level 3 / level 2) | Replan time, median / 95th percentile |
+|---|---|---|---|---|
+| From the start, whole lap (the default) | **106/128 at 6.66 s** | **54/64 at 6.09 s** | 0 / 0 | 34 / 46 ms |
+| From the state, rest of the lap | 97/128 at 6.63 s | 52/64 at 6.26 s | 7 / 4 | 31 / 41 ms |
+| From the state, next 2 gates | 36/128 at 8.26 s | 6/64 at 8.09 s | 39 / 11 | 30 / 56 ms |
+| From the state, next gate only | 24/128 at 8.33 s | 11/64 at 8.66 s | 991 / 36 | 63 / 131 ms |
+
+Replan times are with 14 races sharing the CPU. Alone, a plan from the state took 13-16 ms on one
+level 3 race.
+
+- **Planning only to the next gate fails with today's policies**, for two reasons:
+  - **The guide ends at the gate.** The policy reads the guide 3 m ahead, and past the plan's last gate
+    it sees the straight run-out instead of the turn. Crashes into other gates dominate (38 and 61 on
+    level 3).
+  - **A plan from a drone near a gate often fails its check.** The plan is then retried at every step,
+    so with the next gate only, 991 plans failed and the median time doubled.
+- **From the state through the rest of the lap is close, but 9 finishes worse on level 3.** The styles
+  were trained on guides planned from the start, which the drone joins partway along. A guide that
+  starts at the drone is new to them.
+- **The default is unchanged.** Planning from the state needs a policy trained on such guides. The
+  joint bender plan below would provide one: its bend starts at the drone in training too. Without the
+  bender, it needs guides planned from mid-flight states in the training library.
+
+### Step 2: train with guides that follow the reveals (about 3 hours)
+
+**Library.** For each training track, draw 4 sets of shifts. Order the track's 8 objects by where the
+nominal guide enters their sensor range. Stage `k` is the layout with the first `k` objects at their
+true poses and the rest as reported. Plan stages 0-8 with the 20 ms planner from the start, 9 guides
+per track and draw. On 1,500 tracks that is about 54,000 plans, a few minutes on 14 cores, and
+around 1 GB of guide arrays on the GPU. A stage whose plan fails its check keeps the stage before it.
+
+**Training.** Shifts come from the 4 draws instead of a fresh draw per episode. A world flies the
+guide of the longest stage whose objects have all been revealed. Its place on the new guide is found
+with the usual nearest bead, within the current pair of gates. An object revealed out of order shows
+in the inputs at once, and joins the guide when the stage before it completes. Flight uses exactly this
+rule, so it never sees a guide training didn't.
+
+**Inputs.** Flags for whether the next two gates and the two nearest poles have been revealed. Without
+them a reported gate and a confirmed one look the same.
+
+Three runs side by side, 6000 iterations, `--randomize 1` from the start, with matching names:
+
+| Run | Guides by stage | Revealed flags |
+|---|---|---|
+| `staged_guides_with_seen_flags` | Yes | Yes |
+| `staged_guides_only` | Yes | No |
+| `seen_flags_only` | No, stage 0 throughout | Yes |
+
+Choose the kept policy by a lap check on validation tracks with shifts and staged guides, as in flight.
+
+### Step 3: replan in flight (about 1 hour)
+
+- `RLScene` compiles the 20 ms planner in its constructor, plans stage 0 there, and plans the next stage
+  when one completes. The guide's crossings stay in the full race order, so `passed` still indexes them.
+- A replan over budget at the 95th percentile can run in a background thread, with the old guide
+  flown until the new one is ready. Training then switches stages 0-3 ticks late, at random, to match.
+- A plan that fails its check keeps the previous guide, as in training.
+
+### Step 4: only if Step 3 is still short
+
+One at a time, in this order:
+
+1. **Caution at unrevealed gates:** give the 20 ms planner the speed cap before unrevealed gates that
+   `topt_planner` has (`unseen_speed`), so arrivals leave time to correct. This costs lap time.
+2. **Episodes around reveals:** start 1-1.5 m before an unrevealed gate and end after the next pass or
+   two, so reveals make up more of training.
+3. **Short memory:** the last few observations as input.
+4. **Curriculum:** continue from Step 2's policy at 25-50% of the shifts, then raise them.
+
+### Step 5: test, and only then change the default
+
+On seeds no step tuned on:
+
+| Test | Bar |
+|---|---|
+| Real level 3, 256 seeds from 9500 | At least 85% |
+| Real level 2, 128 seeds from 2000 | At least 90%, as the old plan's 58/64 |
+| Unshifted random tracks, 256 seeds | At least 240/256 |
+| Level 0 | 64/64 |
+| `scripts/evaluate.py` and `scripts/sim.py --config level3.toml` | Pass, as configured |
+
+The bars are a proposal and may move after Step 1's baselines. The new policy replaces `rl_scene.npz`
+only if it clears them all, and then README, `docs/Architecture.md` and the levels' configs follow.
+
+### Left out
+
+- **Lap time.** Faster limits didn't help the 20 ms planner, see "Faster guides" above. That comes
+  after finishing.
+- **Real hardware.** Hand-placed layouts may not match the generator, and on hardware a 20 ms control
+  step may be firmer than in simulation. Step 3's timing figures are the input to that.
+- **Separate agents for low and high curvature.**
+
+### Risks
+
+- **The jump when a guide switches** may unsettle the policy at the worst moment, just before a gate.
+  The delay in Step 3 and the offset inputs are meant for this. Step 1's replanning row shows how bad it
+  is without training.
+- **Too little time to react.** If most crashes come within 0.1 s of a reveal, no guide helps, and
+  Step 4.1 is the lever.
+- **The stage rule is an approximation.** Reveals out of order wait for their stage, so the guide can lag
+  what the inputs show.
+- **GPU memory and time:** 9 guides per track and draw multiply the library, which may force fewer draws.
+
 ## Plan: perturbed arenas (levels 2 and 3)
 
-**Status: proposed, not started.**
+**Status: superseded by "Plan: real level 3" above, before any step started.**
 
 **Goal:** on arenas where gates and poles move from their reported poses, a policy trained only on
 generated tracks finishes at least 58/64 on the real level 2, with no level 2 layout in training or
@@ -691,7 +1264,7 @@ Real race, in this order, with nothing tuned on the test seeds:
 ## Fast guide planner: a guide in one control step
 
 `topt_planner` needs about 8 s per initial guess on a random track. The question was whether a usable
-guide fits in a 20 ms control step. `utils/fast_planner.py` is our own: closed-form bang-bang segments
+guide fits in a 20 ms control step. `utils/fast_runtime_planner.py` is our own: closed-form bang-bang segments
 between waypoints, with gradient steps on `total time + w * sum(max(0, clearance - distance)^2)`.
 
 **Measured on 200 seeds per source, including layouts `topt_planner` dropped.** Thrust limit 15 m/s^2.
@@ -800,7 +1373,7 @@ inside the race, which is only known from the table above. No controller uses fa
 by 6-8 cm at the median and up to 48 cm at worst. `_is_clear` has its arena check back for future
 libraries, as recorded above, but `topt_planner` itself has no walls, so those tracks get dropped.
 
-Run outputs are in `.tmp/topt/rl2/fast_planner/`. Reproduce with `scripts/compare_fast_planner.py`,
+Run outputs are in `.tmp/topt/rl2/fast_planner/`. Reproduce with `scripts/compare_fast_runtime_planner.py`,
 `scripts/fly_fast_guides.py`, `scripts/solve_fast_library.py` and `scripts/race_fast_guides.py`.
 
 ## Step 5: race

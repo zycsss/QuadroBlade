@@ -166,6 +166,30 @@ At any other value the policy sees gates and poles as the race's sensor shows th
 until within 0.7 m in x and y, then at their true poses. Collisions and passes always use the true
 poses.
 
+## 6. Shifted scenarios with guides that follow the reveals
+
+For levels 2 and 3, `scripts/solve_staged_library.py` turns each track of a solved library into
+shifted scenarios:
+
+1. Plan the stage-0 guide with the runtime planner through the reported layout. A track whose plan
+   fails its check is dropped.
+2. Order its 4 gates and 4 poles by where that guide comes within 0.7 m of their reported poses in x
+   and y, as the race's sensor would reveal them. Objects never in range come last.
+3. Draw shifts as the race does, 4 draws per track: gates +-0.15 m in x and y, +-0.1 m in z, +-0.05,
+   +-0.1 and +-0.2 rad of roll, pitch and yaw; poles +-0.15 m in x and y and +-0.05 m in z. These
+   include gate tilt, which no earlier library had.
+4. Plan stages 1 to 8: stage `k` through the layout with the first `k` objects true and the rest as
+   reported. A plan that fails its check keeps the stage before.
+
+With `--staged`, an episode picks a scenario, places gates and poles at its true poses, and the drone
+flies the guide of the longest run of objects revealed in order. A start along the guide is drawn on
+the stage-0 guide and moved to the stage it has reached, with everything that stage knows counted as
+revealed.
+
+The current libraries: 3768 scenarios from 942 tracks of the race's generator and 2324 from 597
+generated ones for training, and 628 from 157 for validation. Of about 49,000 stage plans, 834 failed
+their check, 711 of them on generated tracks.
+
 ## How to reproduce it
 
 Solve the libraries:
@@ -186,4 +210,14 @@ Train at level 1 difficulty:
 
 ```bash
 pixi run -e gpu python scripts/train_scene_policy.py --train level3_train.npz,generated_train.npz --validation validation.npz --randomize 0 --out policy.npz
+```
+
+Shifted scenarios with staged guides, and the three styles:
+
+```bash
+pixi run -e gpu python scripts/solve_staged_library.py --library level3_train.npz --draws 4 --seed 1 --out staged_level3_train.npz
+```
+
+```bash
+pixi run -e gpu python scripts/train_scene_policy.py --train staged_level3_train.npz,staged_generated_train.npz --validation staged_validation.npz --staged --style middle_ground --out policy.npz
 ```

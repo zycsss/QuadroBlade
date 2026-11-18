@@ -71,8 +71,10 @@ from lsy_drone_racing.utils.race_policy import (  # noqa: E402
 from lsy_drone_racing.utils.scene_policy import (  # noqa: E402
     OBS_DIM,
     GuideLibrary,
+    StagedScenarios,
     advance_scene_guide,
     load_library,
+    load_staged_library,
     scene_action,
     scene_clearances,
     scene_features,
@@ -99,12 +101,31 @@ class SceneState(NamedTuple):
     poles: jax.Array
     seen_gates: jax.Array
     seen_poles: jax.Array
+    scenario: jax.Array
+
+
+class _Staged(NamedTuple):
+    """`StagedScenarios` on the device, with the rank of every object in its reveal order."""
+
+    gates_pos: jax.Array
+    gates_rot: jax.Array
+    poles: jax.Array
+    order: jax.Array
+    rank: jax.Array
+    entry: jax.Array
+    stages: int
 
 
 class SceneEnv:
-    """Many drones in one simulator, each on a track of a library, as pure functions."""
+    """Many drones in one simulator, each on a track of a library, as pure functions.
 
-    def __init__(self, sim: Sim, library: GuideLibrary, cfg: dict):
+    With ``staged`` scenarios, gates and poles take a scenario's true poses, and a drone flies the
+    guide of the stage its reveals have reached: the guide flight plans again at every reveal.
+    """
+
+    def __init__(
+        self, sim: Sim, library: GuideLibrary, cfg: dict, staged: StagedScenarios | None = None
+    ):
         """Keep the simulator's functions and put the library on its device."""
         self.sim = sim
         self.n = sim.n_worlds
@@ -116,6 +137,18 @@ class SceneEnv:
             }
         )
         self.nominal_rot = euler_matrix(self.lib.gates_rpy)
+        self.staged = None
+        if staged is not None:
+            order = jnp.asarray(staged.order, jnp.int32)
+            self.staged = _Staged(
+                gates_pos=jnp.asarray(staged.gates_pos, jnp.float32),
+                gates_rot=euler_matrix(jnp.asarray(staged.gates_rpy, jnp.float32)),
+                poles=jnp.asarray(staged.poles, jnp.float32),
+                order=order,
+                rank=jnp.argsort(order, axis=1).astype(jnp.int32),
+                entry=jnp.asarray(staged.entry, jnp.int32),
+                stages=int(staged.stages),
+            )
 
     def initial(
         self, key: jax.Array, ground: float | None = None, still: bool = False
@@ -143,6 +176,7 @@ class SceneEnv:
             jnp.zeros((n, poles, 3)),
             jnp.zeros((n, gates), dtype=bool),
             jnp.zeros((n, poles), dtype=bool),
+            zeros,
         )
         return self.reset(state, jnp.ones(n, dtype=bool), key, ground, still)
 
@@ -170,6 +204,53 @@ class SceneEnv:
         noise = self.cfg["start_noise"] * jax.random.normal(k_noise, (n, 3))
         return lib.beads[rows, index] + bend + noise, index, passed
 
+    def _start(
+        self, key: jax.Array, rows: jax.Array, gate_shift: jax.Array, scenario: jax.Array
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+        """Return a start along the guide, its bead and passes, and the row of the guide to fly.
+
+        With staged scenarios the place is drawn on the stage-0 guide, and the drone flies the guide
+        of the stage reached by then, at the same share of its length.
+        """
+        along, index, passed = self._start_along_guide(key, rows, gate_shift)
+        if self.staged is None:
+            return along, index, passed, rows
+        lib = self.lib
+        stage = (self.staged.entry[scenario] <= index[:, None]).sum(axis=1)
+        moved = rows + stage
+        last = lib.sequence.shape[0] - 1
+        share = lib.crossings[moved, last] / jnp.maximum(lib.crossings[rows, last], 1)
+        mapped = jnp.round(index * share).astype(jnp.int32)
+        passed = (lib.crossings[moved] <= mapped[:, None]).sum(axis=1)
+        along = along - lib.beads[rows, index] + lib.beads[moved, mapped]
+        return along, mapped, passed, moved
+
+    def _follow_reveals(
+        self,
+        scenario: jax.Array,
+        rows: jax.Array,
+        index: jax.Array,
+        passed: jax.Array,
+        pos: jax.Array,
+        seen: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        """Move drones whose reveals reached a new stage onto that stage's guide.
+
+        A stage counts the objects revealed in reveal order without a gap, as flight replans. The
+        drone joins the new guide at its nearest bead close to where it was, between its last and
+        its next pass.
+        """
+        st, lib, n = self.staged, self.lib, self.n
+        in_order = jnp.take_along_axis(seen, st.order[scenario], axis=1).astype(jnp.int32)
+        new_rows = scenario * st.stages + jnp.cumprod(in_order, axis=1).sum(axis=1)
+        count = lib.sequence.shape[0]
+        low = jnp.where(passed > 0, lib.crossings[new_rows, jnp.maximum(passed - 1, 0)], 0)
+        high = lib.crossings[new_rows, jnp.minimum(passed, count - 1)]
+        window = jnp.clip(index[:, None] + jnp.arange(-40, 81), low[:, None], high[:, None])
+        d = jnp.linalg.norm(lib.beads[new_rows[:, None], window] - pos[:, None], axis=2)
+        joined = window[jnp.arange(n), d.argmin(axis=1)]
+        return new_rows, jnp.where(new_rows != rows, joined, index)
+
     def reset(
         self,
         state: SceneState,
@@ -191,36 +272,53 @@ class SceneEnv:
         ground = cfg["ground"] if ground is None else ground
         keys = jax.random.split(key, 14 + START_TRIES)
         data = self.sim._reset(state.data, self.sim.default_data, mask)
-        rows = jax.random.randint(keys[0], (n,), 0, lib.beads.shape[0])
+        staged = self.staged
+        if staged is None:
+            rows = jax.random.randint(keys[0], (n,), 0, lib.beads.shape[0])
+            scenario = jnp.zeros(n, dtype=jnp.int32)
+        else:
+            scenario = jax.random.randint(keys[0], (n,), 0, staged.gates_pos.shape[0])
+            rows = scenario * staged.stages
 
         def spread(k: jax.Array, limit: tuple, shape: tuple) -> jax.Array:
             limit = cfg["randomize"] * jnp.asarray(limit)
             return jax.random.uniform(k, (*shape, len(limit)), minval=-limit, maxval=limit)
 
         gates, count = lib.gates_pos.shape[1], lib.poles.shape[1]
-        gate_shift = spread(keys[1], GATE_SHIFT, (n, gates))
-        gates_pos = lib.gates_pos[rows] + gate_shift
-        gates_rot = euler_matrix(lib.gates_rpy[rows] + spread(keys[2], GATE_TURN, (n, gates)))
-        poles = lib.poles[rows] + spread(keys[3], POLE_SHIFT, (n, count))
+        if staged is None:
+            gate_shift = spread(keys[1], GATE_SHIFT, (n, gates))
+            gates_pos = lib.gates_pos[rows] + gate_shift
+            gates_rot = euler_matrix(lib.gates_rpy[rows] + spread(keys[2], GATE_TURN, (n, gates)))
+            poles = lib.poles[rows] + spread(keys[3], POLE_SHIFT, (n, count))
+        else:
+            # The stage guides already lead through what is known, so the start isn't bent.
+            gates_pos, gates_rot = staged.gates_pos[scenario], staged.gates_rot[scenario]
+            poles = staged.poles[scenario]
+            gate_shift = jnp.zeros_like(gates_pos)
 
         # A start along the guide must touch nothing, or the episode is over before it begins. One
         # that keeps touching after every try starts on the ground.
-        along, index, passed = self._start_along_guide(keys[14], rows, gate_shift)
-        quat_along = lib.quats[rows, index]
+        along, index, passed, flown = self._start(keys[14], rows, gate_shift, scenario)
+        quat_along = lib.quats[flown, index]
         free = self._free(along, quat_along, gates_pos, gates_rot, poles)
         for i in range(1, START_TRIES):
-            a, x, p = self._start_along_guide(keys[14 + i], rows, gate_shift)
-            q = lib.quats[rows, x]
+            a, x, p, f = self._start(keys[14 + i], rows, gate_shift, scenario)
+            q = lib.quats[f, x]
             better = ~free & self._free(a, q, gates_pos, gates_rot, poles)
             along = jnp.where(better[:, None], a, along)
             index = jnp.where(better, x, index)
             passed = jnp.where(better, p, passed)
+            flown = jnp.where(better, f, flown)
             quat_along = jnp.where(better[:, None], q, quat_along)
             free = free | better
 
         on_ground = (jax.random.uniform(keys[4], (n,)) < ground) | ~free
         index = jnp.where(on_ground, 0, index)
         passed = jnp.where(on_ground, 0, passed)
+        if staged is not None:
+            flown = jnp.where(on_ground, rows + (staged.entry[scenario] <= 0).sum(axis=1), flown)
+        else:
+            flown = rows
 
         shift = spread(keys[5], DRONE_SHIFT, (n,))
         rise = DRONE_RISE * jax.random.uniform(keys[6], (n, 1))
@@ -233,7 +331,7 @@ class SceneEnv:
             velocity
         )
         scale = jax.random.uniform(keys[8], (n,), minval=0.5, maxval=1.0)
-        moving = lib.velocities[rows, index] * scale[:, None] + velocity
+        moving = lib.velocities[flown, index] * scale[:, None] + velocity
         vel = jnp.where(on_ground[:, None], takeoff, moving)
         vel = jnp.where(jnp.asarray(still) & on_ground[:, None], 0.0, vel)
 
@@ -259,9 +357,14 @@ class SceneEnv:
             J_inv=jnp.where(where[..., None], jnp.linalg.inv(inertia), data.params.J_inv),
         )
         seen_gates, seen_poles = self._in_range(pos, gates_pos, poles)
+        if staged is not None:
+            # A start along the guide has passed everything its stage knows.
+            known = staged.rank[scenario] < (flown - rows)[:, None]
+            seen_gates = seen_gates | known[:, :gates]
+            seen_poles = seen_poles | known[:, gates:]
         return SceneState(
             data.replace(states=states, params=params),
-            jnp.where(mask, rows, state.rows),
+            jnp.where(mask, flown, state.rows),
             jnp.where(mask, index, state.index),
             jnp.where(mask, passed, state.passed),
             jnp.where(mask[:, None], 0.0, state.prev),
@@ -272,6 +375,7 @@ class SceneEnv:
             jnp.where(where, poles, state.poles),
             jnp.where(mask[:, None], seen_gates, state.seen_gates),
             jnp.where(mask[:, None], seen_poles, state.seen_poles),
+            jnp.where(mask, scenario, state.scenario),
         )
 
     def _free(
@@ -297,16 +401,25 @@ class SceneEnv:
         gates = jnp.linalg.norm(pos[:, None, :2] - gates_pos[..., :2], axis=-1) < limit
         return gates, jnp.linalg.norm(pos[:, None, :2] - poles[..., :2], axis=-1) < limit
 
-    def observe(self, state: SceneState) -> jax.Array:
-        """Return the features of every world, with gates and poles as the sensor shows them."""
-        lib = self.lib
-        s = state.data.states
-        rows = state.rows
+    def shown(self, state: SceneState) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Return gates, their rotations and poles as the sensor shows them: true once revealed."""
+        lib, rows = self.lib, state.rows
         gates_pos = jnp.where(state.seen_gates[..., None], state.gates_pos, lib.gates_pos[rows])
         gates_rot = jnp.where(
             state.seen_gates[..., None, None], state.gates_rot, self.nominal_rot[rows]
         )
         poles = jnp.where(state.seen_poles[..., None], state.poles, lib.poles[rows])
+        return gates_pos, gates_rot, poles
+
+    def observe(self, state: SceneState, bend: Any = None) -> jax.Array:
+        """Return the features of every world, with gates and poles as the sensor shows them.
+
+        With a `scene_policy.Bend`, they are those of the bent guide.
+        """
+        lib = self.lib
+        s = state.data.states
+        rows = state.rows
+        gates_pos, gates_rot, poles = self.shown(state)
         return scene_features(
             s.pos[:, 0],
             s.vel[:, 0],
@@ -320,6 +433,7 @@ class SceneEnv:
             gates_rot,
             poles,
             lib,
+            bend,
         )
 
     def step(self, state: SceneState, u: jax.Array) -> tuple:
@@ -403,15 +517,21 @@ class SceneEnv:
             samples=jnp.ones(()),
         )
         gates_now, poles_now = self._in_range(pos, state.gates_pos, state.poles)
+        seen_gates, seen_poles = state.seen_gates | gates_now, state.seen_poles | poles_now
+        rows = state.rows
+        if self.staged is not None:
+            seen = jnp.concatenate((seen_gates, seen_poles), axis=1)
+            rows, index = self._follow_reveals(state.scenario, rows, index, passed, pos, seen)
         new = state._replace(
             data=data,
+            rows=rows,
             index=index,
             passed=passed,
             prev=u,
             last_pos=pos,
             ticks=ticks,
-            seen_gates=state.seen_gates | gates_now,
-            seen_poles=state.seen_poles | poles_now,
+            seen_gates=seen_gates,
+            seen_poles=seen_poles,
         )
         return new, reward, terminated, truncated, stats
 
@@ -423,26 +543,63 @@ def make_lap_check(env: SceneEnv, ticks: int) -> Any:
         state = env.initial(key, ground=1.0, still=True)
 
         def tick(carry: tuple, step: jax.Array) -> tuple:
-            state, gone, finish_time, gates = carry
+            state, gone, finish_time, gates, least = carry
             x = normalize(env.observe(state), norm)
             state, _, term, trunc, _ = env.step(state, forward(params["actor"], x))
+            s = state.data.states
+            poles, frames = scene_clearances(
+                body_center(s.pos[:, 0], s.quat[:, 0]),
+                state.gates_pos,
+                state.gates_rot,
+                state.poles,
+                env.lib,
+            )
+            gap = jnp.minimum(poles.min(axis=1), frames.min(axis=1))
+            least = jnp.where(gone, least, jnp.minimum(least, gap))
             done = state.passed >= env.lib.sequence.shape[0]
             finish_time = jnp.where(done & ~gone, (step + 1) / 50.0, finish_time)
             gates = jnp.where(gone, gates, state.passed)
             gone = gone | term | trunc
-            return (state, gone, finish_time, gates), None
+            return (state, gone, finish_time, gates, least), None
 
         zeros = jnp.zeros(env.n)
-        start = (state, jnp.zeros(env.n, dtype=bool), zeros, zeros.astype(jnp.int32))
-        (_, _, finish_time, gates), _ = jax.lax.scan(tick, start, jnp.arange(ticks))
+        start = (state, jnp.zeros(env.n, dtype=bool), zeros, zeros.astype(jnp.int32), zeros + 9.0)
+        (_, _, finish_time, gates, least), _ = jax.lax.scan(tick, start, jnp.arange(ticks))
         finished = finish_time > 0
+        laps = jnp.maximum(finished.sum(), 1)
         return {
             "finish": finished.mean(),
-            "time": jnp.sum(finish_time) / jnp.maximum(finished.sum(), 1),
+            "time": jnp.sum(finish_time) / laps,
             "gates": gates.mean(),
+            "clearance": jnp.sum(jnp.where(finished, least, 0.0)) / laps,
         }
 
     return jax.jit(lap)
+
+
+#: Reward settings of the three policies always trained side by side; see `main`'s ``style``.
+STYLES = {
+    "speed_first": dict(crash=20.0, hit_margin=0.02, obstacle=0.0, obstacle_scale=1.0, tick=0.2),
+    "middle_ground": dict(
+        crash=20.0, hit_margin=0.03, obstacle=0.02, obstacle_scale=1.0, tick=0.05
+    ),
+    "safety_first": dict(crash=60.0, hit_margin=0.05, obstacle=0.05, obstacle_scale=3.0, tick=0.05),
+}
+
+
+def style_score(style: str, lap: dict) -> float:
+    """Return how a style ranks a validation lap check: higher is kept.
+
+    ``speed_first`` ranks by lap time once 70% finish, ``middle_ground`` by finishing and then time,
+    and ``safety_first`` by finishing and then the smallest clearance of its finished laps.
+    """
+    finish, seconds = lap["finish"], lap["time"] if lap["finish"] > 0 else 30.0
+    if style == "speed_first":
+        return 10.0 * finish + (100.0 - seconds if finish >= 0.7 else 0.0)
+    if style == "safety_first":
+        return 100.0 * finish + 10.0 * lap["clearance"] + lap["gates"]
+    # Finishing comes first, then the time: 1% more finishes outweighs 0.1 s.
+    return 10.0 * finish - seconds + lap["gates"]
 
 
 def main(
@@ -450,6 +607,8 @@ def main(
     validation: str,
     level3: str | None = None,
     out: str = "scene_policy.npz",
+    staged: bool = False,
+    style: str = "middle_ground",
     iterations: int = 6000,
     worlds: int = 8192,
     horizon: int = 32,
@@ -494,6 +653,12 @@ def main(
         validation: Library of validation tracks, which choose the policy that is kept.
         level3: Library of level 3 tracks, flown and logged only.
         out: Where to write the best policy.
+        staged: ``train`` and ``validation`` are written by `scripts/solve_staged_library.py`: gates
+            and poles take each scenario's true poses, and the guide is replanned at every reveal,
+            as `RLScene` does with ``replan_on_reveal``. ``randomize`` is then not used.
+        style: ``speed_first``, ``middle_ground`` or ``safety_first``. Sets ``crash``,
+            ``hit_margin``, ``obstacle``, ``obstacle_scale`` and ``tick`` from `STYLES`, and how the
+            kept policy is chosen (`style_score`).
         iterations: PPO iterations.
         worlds: Simulated drones.
         horizon: Control steps per iteration.
@@ -538,26 +703,47 @@ def main(
     # Training on level 2 itself is only a check of the inputs and for fine-tuning: it says nothing
     # about other tracks.
     level2 = track_library(reference, rpy)
-    libraries = {
-        "train": level2 if train == "level2" else load_library(train, reference),
-        "validation": load_library(validation, reference),
-        "level2": level2,
-    }
+    if style not in STYLES:
+        raise ValueError(f"style must be one of {tuple(STYLES)}")
+    scenarios = {}
+    if staged:
+        libraries = {}
+        for name, files in (("train", train), ("validation", validation)):
+            libraries[name], scenarios[name] = load_staged_library(files, reference)
+            print(f"{name}: {scenarios[name].gates_pos.shape[0]} shifted scenarios", flush=True)
+        libraries["level2"] = level2
+    else:
+        libraries = {
+            "train": level2 if train == "level2" else load_library(train, reference),
+            "validation": load_library(validation, reference),
+            "level2": level2,
+        }
     if level3:
         libraries["level3"] = load_library(level3, reference)
     for name, lib in libraries.items():
         print(f"{name}: {lib.beads.shape[0]} tracks, {lib.beads.shape[1]} beads", flush=True)
+    weights = (
+        dict(
+            crash=crash,
+            hit_margin=hit_margin,
+            obstacle=obstacle,
+            obstacle_scale=obstacle_scale,
+            tick=tick,
+        )
+        | STYLES[style]
+    )
+    print(f"style {style}: {weights}", flush=True)
     cfg = dict(
         closer=closer,
         progress=progress,
         gate=gate,
         finish=finish,
-        crash=crash,
-        hit_margin=hit_margin,
-        obstacle=obstacle,
-        obstacle_scale=obstacle_scale,
+        crash=weights["crash"],
+        hit_margin=weights["hit_margin"],
+        obstacle=weights["obstacle"],
+        obstacle_scale=weights["obstacle_scale"],
         smooth=smooth,
-        tick=tick,
+        tick=weights["tick"],
         slow=slow,
         slow_speed=slow_speed,
         ground=ground,
@@ -591,7 +777,9 @@ def main(
 
             insert_fn_before(sim.step_pipeline, "integration", build_dynamics_disturbance_fn(push))
             sim.build_step_fn()
-        envs = {name: SceneEnv(sim, lib, cfg) for name, lib in libraries.items()}
+        envs = {
+            name: SceneEnv(sim, lib, cfg, scenarios.get(name)) for name, lib in libraries.items()
+        }
         env = envs["train"]
         checks = {n: make_lap_check(e, 1000) for n, e in envs.items() if n != "train"}
         key = jax.random.PRNGKey(seed)
@@ -622,10 +810,7 @@ def main(
                     k: float(v) for k, v in jax.device_get(check(params, norm, sub)).items()
                 }
             val = laps["validation"]
-            # Finishing comes first, then the time: 1% more finishes outweighs 0.1 s.
-            score = (
-                10.0 * val["finish"] - (val["time"] if val["finish"] > 0 else 30.0) + val["gates"]
-            )
+            score = style_score(style, val)
             kept = score > best
             save(params, norm, out + ".last.npz", yaw_max)
             if kept:
@@ -646,6 +831,7 @@ def main(
             Path(out + ".log.json").write_text(json.dumps(log))
             text = " ".join(
                 f"{n} {v['finish'] * 100:5.1f}% {v['gates']:.2f}g {v['time']:.2f}s"
+                f" {v['clearance'] * 100:.1f}cm"
                 for n, v in laps.items()
             )
             print(

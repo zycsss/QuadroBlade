@@ -37,14 +37,25 @@ from lsy_drone_racing.utils.scene_generator import (
     sample_layout,
 )
 from lsy_drone_racing.utils.scene_policy import (
+    BEND_DIM,
+    BEND_FADE,
+    BEND_POINTS,
+    BENDER_DIM,
     OBS_DIM,
+    SIDE_ACCEL,
     GuideLibrary,
     advance_scene_guide,
+    bend_offset,
+    bender_features,
     closest_frame_point,
+    make_bend,
+    reveal_order,
     scene_action,
     scene_clearances,
     scene_features,
     scene_heading,
+    staged_layout,
+    zero_bend,
 )
 
 
@@ -73,7 +84,7 @@ def _library(angle: float = 0.0) -> GuideLibrary:
     )
 
 
-def _features(lib: GuideLibrary, angle: float) -> np.ndarray:
+def _features(lib: GuideLibrary, angle: float, bend: object = None) -> np.ndarray:
     """Return the features of one drone, placed and moving as the turned scene says."""
     turn = Rotation.from_euler("z", angle)
     pos = turn.apply(np.array([[-2.5, 0.1, 1.1]]))
@@ -94,6 +105,7 @@ def _features(lib: GuideLibrary, angle: float) -> np.ndarray:
         gates_rot[None],
         lib.poles,
         lib,
+        bend,
     )
 
 
@@ -269,3 +281,152 @@ def test_faster_guides_only_raise_the_limits():
     assert {k for k in fast if fast[k] != usual[k]} == {"tilt_max", "thrust_acc_max"}
     assert FAST_GUIDE_CONFIG.tilt_max > RANDOM_TRACK_CONFIG.tilt_max
     assert FAST_GUIDE_CONFIG.thrust_acc_max > RANDOM_TRACK_CONFIG.thrust_acc_max
+
+
+def test_reveal_order_follows_the_guide():
+    beads = np.arange(200)[:, None] * np.array([0.05, 0.0, 0.0]) + np.array([0.0, 0.0, 1.0])
+    # Off the bead grid by 2 cm, so that no bead sits exactly at the sensor's range.
+    gates = np.array([[8.02, 0.0, 1.0], [3.02, 0.0, 1.0]])
+    poles = np.array([[5.02, 0.5, 1.55], [5.02, 3.0, 1.55]])
+    order, entry = reveal_order(beads, gates, poles, 0.7)
+    # Gate 1 at x 3, the near pole at x 5, gate 0 at x 8, and the far pole never comes into range.
+    assert order.tolist() == [1, 2, 0, 3]
+    assert entry[:3].tolist() == [47, 91, 147]
+    assert entry[3] >= len(beads)
+
+
+def test_a_stage_knows_the_first_objects_of_the_order():
+    nominal = (np.zeros((2, 3)), np.zeros((2, 3)), np.zeros((2, 3)))
+    true = (np.ones((2, 3)), np.full((2, 3), 0.1), np.full((2, 3), 2.0))
+    order = np.array([1, 2, 0, 3])
+    gates_pos, gates_rpy, poles = staged_layout(nominal, true, order, 2)
+    assert gates_pos.tolist() == [[0, 0, 0], [1, 1, 1]]
+    assert gates_rpy[1].tolist() == [0.1, 0.1, 0.1] and gates_rpy[0].tolist() == [0, 0, 0]
+    assert poles.tolist() == [[2, 2, 2], [0, 0, 0]]
+    # The nominal layout itself is left alone.
+    assert not nominal[0].any()
+
+
+def _bend(
+    u: np.ndarray, pos: list, vel: list, limit: float = 0.3, xp: object = np, **kw: object
+) -> object:
+    lib = _library()
+    if xp is jnp:
+        lib = GuideLibrary(*(jnp.asarray(v) for v in lib))
+    return make_bend(
+        xp.asarray(u)[None],
+        limit,
+        xp.asarray([pos], dtype=float),
+        xp.asarray([vel], dtype=float),
+        xp.array([50]),
+        xp.array([0]),
+        lib,
+        **kw,
+    )
+
+
+def test_no_bend_leaves_the_features_as_they_are():
+    lib = _library()
+    plain = _features(lib, 0.0)
+    assert np.array_equal(_features(lib, 0.0, zero_bend(np.array([50]))), plain)
+
+
+def test_a_zero_bend_of_a_drone_on_the_guide_is_the_guide():
+    # Bead 50 is at x = -2.5; the drone sits on it and flies along the guide.
+    bend = _bend(np.zeros(BEND_DIM), [-2.5, 0.0, 1.0], [2.0, 0.0, 0.0])
+    beads = np.arange(50, 200)[None]
+    assert np.allclose(bend_offset(bend, beads), 0.0)
+    assert bend.scale[0] == pytest.approx(1.0)
+
+
+def test_a_zero_bend_off_the_guide_is_still_the_guide():
+    bend = _bend(np.zeros(BEND_DIM), [-2.5, 0.1, 1.05], [2.0, 1.0, 0.0])
+    assert np.allclose(bend_offset(bend, np.arange(50, 200)[None]), 0.0)
+
+
+def test_a_bend_from_the_drone_starts_there_and_leaves_along_its_velocity():
+    bend = _bend(np.zeros(BEND_DIM), [-2.5, 0.1, 1.05], [2.0, 1.0, 0.0], from_drone=True)
+    offsets = bend_offset(bend, np.arange(50, 70)[None])[0]
+    assert offsets[0] == pytest.approx([0.0, 0.1, 0.05])
+    # Moving sideways, the bend first leads further that way, then blends back into the guide.
+    assert offsets[2, 1] > offsets[0, 1]
+    assert offsets[-1] == pytest.approx(np.zeros(3))
+
+
+def test_a_bend_keeps_the_offset_from_the_planned_guide_and_moves_what_lies_ahead():
+    lib = _library()
+    pos = np.array([[-2.5, 0.1, 1.1]])
+    bend = make_bend(
+        np.zeros((1, BEND_DIM)),
+        0.3,
+        pos,
+        np.array([[2.0, 0.3, -0.1]]),
+        np.array([50]),
+        np.array([0]),
+        lib,
+        from_drone=True,
+    )
+    first = 3 + 3 + 9 + ACT_DIM
+    plain, bent = _features(lib, 0.0), _features(lib, 0.0, bend)
+    assert bent[0, first : first + 3] == pytest.approx(plain[0, first : first + 3])
+    # The nearest point ahead (4 beads) starts at the drone, so it lies closer than on the guide.
+    near = slice(first + 3, first + 6)
+    assert np.linalg.norm(bent[0, near] - [0.2, 0.0, 0.0]) < np.linalg.norm(
+        plain[0, near] - [0.2, 0.0, 0.0]
+    )
+
+
+def test_control_points_set_the_offsets_and_fade_out():
+    u = np.zeros(BEND_DIM)
+    u[2] = 1.0  # sideways, at the third control point
+    u[4 + 3] = -0.5  # down, at the fourth
+    u[-1] = 1.0
+    bend = _bend(u, [-2.5, 0.0, 1.0], [1.0, 0.0, 0.0])
+    third, fourth = 50 + BEND_POINTS[2], 50 + BEND_POINTS[3]
+    offsets = bend_offset(bend, np.array([[third, fourth, 50 + BEND_FADE]]))[0]
+    assert offsets[0] == pytest.approx([0.0, 0.3, 0.0])
+    assert offsets[1] == pytest.approx([0.0, 0.0, -0.15])
+    assert offsets[2] == pytest.approx(np.zeros(3))
+    assert bend.scale[0] == pytest.approx(1.3)
+
+
+def test_no_offset_exceeds_what_the_drone_can_reach():
+    speed = 8.0
+    bend = _bend(np.ones(BEND_DIM), [-2.5, 0.0, 1.0], [speed, 0.0, 0.0])
+    seconds = np.array(BEND_POINTS) * 0.05 / speed
+    reach = 0.5 * SIDE_ACCEL * seconds**2
+    side = np.abs(bend.points[0, :, 1])
+    assert np.all(side <= np.minimum(reach, 0.3) + 1e-9)
+    assert side[0] < 0.3
+
+
+def test_the_bend_and_the_bender_inputs_agree_between_numpy_and_jax():
+    u = np.linspace(-1.0, 1.0, BEND_DIM)
+    pos, vel = [-2.4, 0.1, 1.1], [2.0, 0.5, -0.2]
+    a = _bend(u, pos, vel, from_drone=True)
+    b = _bend(u, pos, vel, xp=jnp, from_drone=True)
+    beads = np.arange(40, 160)[None]
+    assert np.allclose(
+        bend_offset(a, beads), np.asarray(bend_offset(b, jnp.asarray(beads))), atol=1e-5
+    )
+    lib = _library()
+    feats = _features(lib, 0.0, a)
+    args = (
+        np.asarray([pos]),
+        np.array([50]),
+        np.array([1]),
+        np.array([0]),
+        lib,
+        u[None],
+        np.array([[True, False]]),
+        np.array([[False, True]]),
+        lib.poles,
+    )
+    x = bender_features(feats, *args)
+    jlib = GuideLibrary(*(jnp.asarray(v) for v in lib))
+    jargs = tuple(jnp.asarray(v) if isinstance(v, np.ndarray) else jlib for v in args)
+    y = bender_features(jnp.asarray(feats), *jargs)
+    assert x.shape == (1, BENDER_DIM)
+    assert np.allclose(x, np.asarray(y), atol=1e-4)
+    # The flags: the next gate (gate 1, after one pass) is unseen, the one after it too.
+    assert x[0, -4:-2].tolist() == [0.0, 0.0]

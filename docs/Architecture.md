@@ -20,31 +20,39 @@ architecture changes.
                           |                   v
        +------------------+-------------------+------------------+
        |                                                         |
-  ToptMPCC (control/topt_mpcc.py)              RLRace (control/rl_race.py)
+  ToptMPCC (control/topt_mpcc.py)              RLScene (control/rl_scene.py)
   plan -> bend -> MPCC                         guide + policy network
-  for tracks with reveals (level 2)            levels 0 and 2
+  for tracks with reveals (level 2)            any track, the final controller
        |                                                         |
        +----------------> topt_planner <-------------------------+
                           time-optimal plan, cached on disk
 ```
 
 **`RLScene` (`control/rl_scene.py`) is the final controller**: every `config/level*.toml` selects
-it, so `pixi run python scripts/sim.py` flies it. Three controllers fly the race today, all using
-the same planner: the MPCC follows its plan, and the
-two RL controllers only see it as a hint. `RLRace` is trained on the track it flies. `RLScene`
-(`control/rl_scene.py`, described below) is trained on generated tracks only.
+it, so `pixi run python scripts/sim.py` flies it. On a race that shifts gates or poles (levels 2
+and 3) it defaults to the runtime planner replanned at every reveal, with the style selector
+choosing between three policies; elsewhere it flies the solved guide with `rl_scene.npz` (see "The
+RL scene controller"). Two controllers fly the race today, both using
+the same planner: the MPCC follows its plan, and `RLScene`, trained on generated tracks only, sees it
+as a hint. `RLRace`, an RL policy trained on the one track it flies, was removed in favour of
+`RLScene`; its results stay in the table for comparison, and its code is in git history up to
+a6ecd62.
 
 | Controller | File | Tested on | Result in the real environment |
 |---|---|---|---|
 | Time-optimal MPCC | `control/topt_mpcc.py` | Level 2 (its default level) | 54/64 finished at 4.40 s |
 | Time-optimal MPCC | `control/topt_mpcc.py` | Level 0 | 8/8 finished at 3.73 s |
-| RL racing policy, fixed track | `control/rl_race.py` | Level 0 | 64/64 finished at 3.33 s |
-| RL racing policy, randomized | `control/rl_race.py` | Level 2 | 64/64 finished at 4.66 s |
+| RL racing policy, fixed track (`RLRace`, removed) | `control/rl_race.py`, in git history | Level 0 | 64/64 finished at 3.33 s |
+| RL racing policy, randomized (`RLRace`, removed) | `control/rl_race.py`, in git history | Level 2 | 64/64 finished at 4.66 s |
 | RL scene policy, never saw the track | `control/rl_scene.py` | Level 0 | 64/64 finished at 4.03 s |
 | RL scene policy, never saw the track | `control/rl_scene.py` | Level 2 | 0/64 finished |
 | RL scene policy, never saw the track | `control/rl_scene.py` | Random tracks from the race's generator, level 1's conditions, no shifts | 243/256 finished at about 4.67 s |
 | RL scene policy, trained and flown on fast guides, not the default | `control/rl_scene.py`, through `scripts/race_fast_guides.py` | Same | 248/256 finished at about 4.92 s |
 | RL scene policy, trained and flown on solved guides with faster limits, not the default | `control/rl_scene.py` with `controller.fast_guides = true` | Same | 249/256 finished at about 4.46 s |
+| RL scene policy on the solved guide, the default on levels 0 and 1 | `control/rl_scene.py` with `guide_planner = "topt"` | Real level 3, seeds 9000-9127 | 2/128 finished |
+| RL scene policy on runtime guides, replanned at every reveal, not the default | `control/rl_scene.py` with `guide_planner = "fast_runtime"`, `replan_on_reveal = true` | Real level 3 / real level 2 | 55/128 at 5.39 s / 29/64 at 4.61 s |
+| RL scene policies trained on staged reveals, replanned at every reveal, not the default | `control/rl_scene.py` with `guide_planner = "fast_runtime"`, `replan_on_reveal = true`, `policy = rl_scene_<style>.npz` | Real level 3 / real level 2 | `speed_first` 88/128 at 5.72 s / 31/64 at 4.97 s; `middle_ground` 93/128 at 6.20 s / 34/64 at 5.15 s; `safety_first` 107/128 at 7.45 s / 54/64 at 6.43 s |
+| The agent choosing between those three styles in flight, **the default on levels 2 and 3** | `control/rl_scene.py` with `guide_planner = "fast_runtime"`, `replan_on_reveal = true`, `style_selector = true` | Real level 3 / real level 2 | 106/128 at 6.66 s / 54/64 at 6.09 s |
 
 ## The race environment
 
@@ -80,11 +88,12 @@ two RL controllers only see it as a hint. `RLRace` is trained on the track it fl
 Solvers are generated into `c_generated_code/` and acados lives in `acados/`, both git-ignored and
 built for the local platform.
 
-## The RL racing controller
+## The track-specific RL policy (removed), and what the scene controller builds on
 
-The current RL architecture. It picks its policy from the config: if gates or poles move,
-`rl_race_randomized.npz` (trained on moved tracks), otherwise `rl_race_level0.npz` (trained on the
-nominal track, faster there, and 0/64 on level 2).
+`RLRace` flew one track it was trained on: `rl_race_randomized.npz` when gates or poles move,
+otherwise `rl_race_level0.npz`. The controller and its policies were removed in favour of `RLScene`
+and are in git history up to a6ecd62. Its features, rules and trainer stay, because the scene
+controller below is built on them and its trainer imports them. The design is described here once.
 
 ```
 state, guide, gates, poles --> 79 inputs --> 64 --> 64 --> 7 outputs --> to_action --> attitude and thrust
@@ -92,8 +101,6 @@ state, guide, gates, poles --> 79 inputs --> 64 --> 64 --> 7 outputs --> to_acti
 
 | Part | File |
 |---|---|
-| Controller used in the race | `control/rl_race.py` |
-| Trained policies | `control/rl_race_randomized.npz`, `control/rl_race_level0.npz` |
 | Track, rules and features | `utils/race_policy.py` |
 | Attitude output, network in NumPy | `utils/path_policy.py` |
 | Training | `scripts/train_race_policy.py` |
@@ -188,6 +195,9 @@ generated layouts --> topt_planner (in advance) --> library of guides --> PPO --
 |---|---|
 | Controller used in the race | `control/rl_scene.py` |
 | Trained policy | `control/rl_scene.npz` (`level1_random_tracks_fixed_guides`), trained with nothing moving |
+| Policy for runtime guides | `control/rl_scene_runtime_guides.npz` (`level1_random_tracks_fast_guides_60steps`), trained on guides of the runtime planner, nothing moving |
+| Three styles, for levels 2 and 3 | `control/rl_scene_{speed_first,middle_ground,safety_first}.npz` (`staged_reveal_guides_*`), trained on shifted scenarios with guides that follow the reveals |
+| Style selector | `control/rl_scene_style_selector.npz` (`style_selector_hold_10_ticks_gamma_0.99`), picks one of the three styles every 0.2 s |
 | Inputs, output and guide library | `utils/scene_policy.py` |
 | Random tracks | `utils/scene_generator.py` |
 | Solving guides in advance | `scripts/solve_scene_library.py` |
@@ -198,7 +208,7 @@ gate is flown twice. Each leg is sampled on its own, and the ranges span levels 
 because level 3 keeps poles 0.8 m from gates and level 2 has them closer. The whole process is in
 [training_scenarios.md](training_scenarios.md).
 
-**Inputs (86)** are those of `RLRace`, except:
+**Inputs (86)** are those of `RLRace` above, except:
 
 - Absolute position and the share of the lap are gone, so it cannot recognize a track.
 - Added: height, the distance to the walls in four directions, the nearest gate's axis, and the vector
@@ -214,6 +224,29 @@ are redrawn. Mass, inertia and the random force follow level 2. `--randomize` sc
 poles and the start, and `rl_scene.npz` used 0. Validation tracks choose the policy that is kept;
 level 2 and level 3 laps are only logged.
 
+**Where the guide comes from**, set in the `[controller]` section of a level file:
+
+A race whose `env.randomizations` holds `gate_pos`, `gate_rpy` or `obstacle_pos` (levels 2 and 3)
+takes `SHIFTED_RACE_DEFAULTS` (runtime planner, replanned at every reveal, style selector), unless
+`[controller]` sets `guide_planner`, `policy`, `replan_on_reveal` or `style_selector` itself. Level
+files may only change the controller file and the control mode, so the choice is made in code.
+
+| Setting | Guide | Policy by default |
+|---|---|---|
+| `guide_planner = "topt"` (default) | `topt_planner`, once before the race; about 15 s on a new track | `rl_scene.npz` |
+| `guide_planner = "topt"`, `fast_guides = true` | The same with `FAST_GUIDE_CONFIG` | Set `policy` to one trained on those guides |
+| `guide_planner = "fast_runtime"` | The runtime planner, once before the race; about 20 ms | `rl_scene_runtime_guides.npz` |
+| `guide_planner = "fast_runtime"`, `replan_on_reveal = true` | The runtime planner, again whenever the sensor reveals a gate or pole | `rl_scene_runtime_guides.npz` |
+| The same, and `style_selector = true` | The same | The three styles, with the selector choosing; `selector` and `style_policies` point to other files |
+| The same, and `bender = true` | The same, each policy flying its guide as its bender bends it (`policy` and `bender_policy`, or `benders` under the selector). Tried on `safety_first`: no gain, nothing installed | Set them |
+| The same, and `replan_from_state = true` | Each replan starts at the drone's position and velocity and goes through the next `replan_gates` gates (1 by default, 0 for the rest of the lap), and also replans at every pass. Worse with today's policies: 97/128 on real level 3 for the rest of the lap, 24/128 for the next gate only | Unchanged |
+
+A replan goes through the layout as the sensor now shows it, from where the drone started, so it is
+the kind of guide the policy was trained on. The drone joins it at the nearest bead between its last
+and its next pass. A plan that fails its check isn't flown, and the previous guide stays. Each replan
+runs inside the control step and is recorded in `RLScene.replans`. All levels run in attitude mode;
+level 3 was set to state mode until this was fixed, and failed on its first step.
+
 **Limits:**
 
 - With level 2's shifts, the best run finished 8/32 on the real level 2. Every guide stays where it was
@@ -225,6 +258,11 @@ level 2 and level 3 laps are only logged.
 
 The network is plain NumPy and takes about 9 microseconds per call on one CPU core, against 20 ms per
 control step, so flight needs no GPU.
+
+**Inputs that never varied in training** keep their training value in flight (`PathPolicy`, spread
+below `CONSTANT_INPUT_STD`). Training gates stand upright, so the vertical part of a gate's axis is
+always 0 there, and its weights were never trained. Levels 2 and 3 tilt gates by up to 0.1 rad, and
+before this a tilt saturated those inputs and every flight crashed.
 
 ## Training
 
@@ -244,6 +282,53 @@ and training run the same code. Tests check that they agree.
 
 `scripts/train_scene_policy.py` uses the same PPO and reward, on a library of generated tracks instead
 of one track, at about 1.6M steps/s.
+
+**Shifted scenarios with staged guides (`--staged`)** train for levels 2 and 3. `scripts/solve_staged_library.py`
+draws the race's shifts for every track and plans, with the runtime planner, the guide at every stage
+of reveals: stage `k` knows the first `k` objects in the order the stage-0 guide reaches them
+(`scene_policy.reveal_order`, `staged_layout`, `load_staged_library`). In training a drone flies the
+guide of the stage its reveals have completed, and joins a new guide at its nearest bead close by. In
+flight `RLScene` follows the same rule with `replan_in_order = true`.
+
+**Three styles (`--style`), always trained side by side:**
+
+| Style | Crash | Hit margin | Obstacle term | Time cost per step | Kept policy chosen by |
+|---|---|---|---|---|---|
+| `speed_first` | -20 | 2 cm | 0 | 0.2 | Lap time, once 70% finish |
+| `middle_ground` | -20 | 3 cm | 0.02 x `exp(-d)` | 0.05 | Finishing, then time |
+| `safety_first` | -60 | 5 cm | 0.05 x `exp(-3 d)` | 0.05 | Finishing, then the smallest clearance |
+
+The lap check reports each style's clearance: the mean, over finished laps, of the smallest free distance
+to any gate or pole.
+
+**Bender and tracker trained together (`scripts/train_bender.py`).** A bender decides every 5 steps
+(0.1 s) on a bend of the guide ahead (`scene_policy.make_bend`). The bend has a sideways and an
+upward offset at 0.5, 1, 2 and 3 m ahead, fading out by 4 m, and a factor of 0.7-1.3 on the guide's
+speeds. Each offset is clipped to what the drone can reach at its speed, at 6 m/s^2 sideways, and
+optionally (`from_drone`) the bend starts at the drone along its velocity. The tracker sees the bent
+points ahead and the scaled speeds, but its offset from the guide as planned.
+
+The bender's 117 inputs are the tracker's 86 features, 7 more guide points up to 4 m, its last output,
+and whether the next two gates and two nearest poles have been revealed. One PPO run trains both
+networks, each with its own critic. The bender gets the style's reward, one transition per decision.
+The tracker gets the same reward minus a falling cost for leaving the bent guide.
+
+The tracker starts from a trained style and the bender from no bend. For the first 500 iterations
+only the bender learns, and the largest offset grows from 5 to 30 cm. On `safety_first` it found no
+bend that helps (see `docs/PLAN_path_rl.md`), so nothing is installed. `train_style_selector.py
+--benders` chooses between pairs in the same way.
+
+**The style selector (`scripts/train_style_selector.py`)** chooses between the three frozen styles in
+flight, so the agent itself decides how much risk to take. Every `hold` = 10 control steps it picks the
+style for the next 10, from the 86 scene features, the current style as one-hot and the 12 numbers that
+the three styles would command (`scene_policy.selector_features`, 101 inputs, 2 x 64 network, 3
+logits). PPO with a categorical output treats a decision and its held steps as one transition, with a
+discount of 0.99 per decision. The reward is the same for every style: +1 per gate, +10 to finish, -5
+for a crash at a 2 cm margin, and -0.02 per step. The kept selector scores best on validation laps by
+`10 * finish - time + gates`, and every style alone is flown on the same laps for comparison. In flight
+`RLScene._select` runs all three styles every step (about 40 microseconds in all) and records the steps
+flown in each style in `style_ticks`. Results: 106/128 at 6.66 s on real level 3 and 54/64 at 6.09 s
+on level 2, against 107/128 at 7.45 s and 54/64 at 6.43 s for `safety_first` alone.
 
 `train_path_policy.py` trains the earlier path-following policy. It is not used by a race controller
 yet; its PPO code is what `train_race_policy.py` reuses. Policies saved before the rotation matrix
@@ -266,13 +351,14 @@ merge, and long ones are split, to keep each one compact. Its input is a solved 
 
 Both are stand-alone experiments: **no controller or trainer uses them yet.**
 
-## Fast guide planner
+## Fast runtime planner
 
-`lsy_drone_racing/utils/fast_planner.py` plans a guide in milliseconds instead of seconds, for random
-tracks. **No controller uses it by default.** The policy
-`.tmp/topt/rl2/level1_random_tracks_fast_guides_60steps.npz` was trained on its guides and needs them:
-it does not fly well on solved guides, and the policy in `control/rl_scene.npz` loses finishes on fast
-ones. Results are in [PLAN_path_rl.md](PLAN_path_rl.md).
+`lsy_drone_racing/utils/fast_runtime_planner.py` plans a guide in milliseconds instead of seconds, for
+random tracks. `RLScene` uses it with `guide_planner = "fast_runtime"`, not by default. Its settings
+for flight are `RUNTIME_GUIDE_CONFIG` and `RUNTIME_VELOCITY_WINDOW`, through `runtime_plan`, and they
+match the libraries `rl_scene_runtime_guides.npz` was trained on. That policy needs these guides: it
+does not fly well on solved guides, and `rl_scene.npz` loses finishes on runtime ones. Results are in
+[PLAN_path_rl.md](PLAN_path_rl.md).
 
 | Stage | What it does |
 |---|---|
@@ -295,10 +381,11 @@ ones. Results are in [PLAN_path_rl.md](PLAN_path_rl.md).
 
 | Script | What it does |
 |---|---|
-| `scripts/compare_fast_planner.py` | Compares it with solved libraries |
+| `scripts/compare_fast_runtime_planner.py` | Compares it with solved libraries |
 | `scripts/fly_fast_guides.py` | Flies a saved policy on both kinds of guide, in the training environment |
 | `scripts/solve_fast_library.py` | Writes a library of fast guides for the tracks of a solved one, for `scripts/train_scene_policy.py` |
 | `scripts/race_fast_guides.py` | Flies `RLScene` in the real race, with fast plans in place of `topt_planner.plan` |
+| `scripts/evaluate_reveals.py` | Flies `RLScene` on real level 2 or 3 in one guide mode: solved once, runtime once, runtime replanned at every reveal (also with the style selector, `runtime_replan_selector`), or runtime through the true layout as an upper bound. Records what each crash hit, how far it had moved and how long after its reveal, and the share of time flown in each style |
 
 ## Tools
 
@@ -312,10 +399,10 @@ ones. Results are in [PLAN_path_rl.md](PLAN_path_rl.md).
 | `scripts/tune_mpcc_primitives.py` | Tune the MPCC |
 | `scripts/deploy.py` and `ros_ws/` | Fly a real drone |
 
-The other controllers in `control/` are the course's: the `Controller` base class,
-`state_controller.py` and `attitude_controller.py`, which the environment tests fly, and
-`attitude_mpc.py` with the `*_multi.py` pair, which the multi-drone configurations and their tests
-use. Earlier work (the A*/B-spline path planner and its MPCC `my_controller.py`, the characterisation
+From the course, `control/` keeps only the `Controller` base class, which every controller inherits
+from, and `state_controller.py`, which the environment tests fly. Its attitude-mode examples
+(`attitude_controller.py`, `attitude_mpc.py` and their `*_multi.py` versions) were removed, with the
+tests that flew them. Earlier work (the A*/B-spline path planner and its MPCC `my_controller.py`, the characterisation
 scenarios and the course's PPO example) was removed and is kept in git history.
 
 ## Environment
@@ -326,7 +413,7 @@ scenarios and the course's PPO example) was removed and is kept in git history.
 - **CPU runs on the GPU install:** set `JAX_PLATFORMS=cpu`.
 
 ```bash
-pixi run -e gpu python scripts/sim.py --config level0.toml --controller rl_race.py
+pixi run -e gpu python scripts/sim.py --config level0.toml
 ```
 
 ```bash
