@@ -34,7 +34,11 @@ LEVEL3_CONTROLLER: dict[str, object] = {}
 #: Level 3 overrides of the level 2 planner configuration (`PathConfig` fields).
 LEVEL3_PATH: dict[str, object] = {}
 #: Level 3 only planner settings (`Level3Settings` fields).
-LEVEL3_PLANNER: dict[str, object] = {"bounds_margin": 0.25, "floor": 0.15}
+LEVEL3_PLANNER: dict[str, object] = {
+    "bounds_margin": 0.25,
+    "floor": 0.15,
+    "backside_lateral": 0.7,
+}
 #: Stall watchdog: re-seed the solver along the path when progress over ``stall_window`` seconds
 #: stays below ``stall_progress`` metres. Zero window disables it.
 LEVEL3_STALL = {"stall_window": 0.6, "stall_progress": 0.05}

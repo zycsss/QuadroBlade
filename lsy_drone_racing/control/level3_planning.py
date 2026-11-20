@@ -42,6 +42,8 @@ class Level3Settings:
     cusp_chord: float = 0.15
     relax_iterations: int = 200
     gate_protect: float = 0.25
+    backside_lateral: float = 0.0
+    backside_depth: float = 0.35
 
 
 def gate_post_segments(gates_pos: NDArray, gates_quat: NDArray) -> tuple[NDArray, NDArray]:
@@ -142,6 +144,38 @@ class Level3Planner(ClearancePlanner):
                 span = np.maximum(np.linalg.norm(direction, axis=1, keepdims=True), 1e-9)
                 pts[close, :2] = nearest_xy[close] + clearance * direction / span
         return pts
+
+    def _insert_detours(self, blocks, pass_pos, pass_normals, pass_y_axes, pass_z_axes):
+        """Add the level 2 detours, then route around the frame of a gate entered from behind.
+
+        When the point before a pass lies on the exit side of that gate (a re-pass, or a gate
+        that faces away from the previous one), the route has to swing around the frame. Two
+        side waypoints ``backside_lateral`` beside the centre, ``backside_depth`` in front of
+        and behind the plane, on the side the route comes from, make the turn explicit instead
+        of leaving a hairpin next to a post.
+        """
+        out = super()._insert_detours(blocks, pass_pos, pass_normals, pass_y_axes, pass_z_axes)
+        lateral = self.settings.backside_lateral
+        if lateral <= 0:
+            return out
+        n_points = self.config.num_intermediate_points
+        result = []
+        pass_index = 0
+        for i, block in enumerate(out):
+            if i >= 2 and len(block) == n_points and pass_index < len(pass_pos):
+                centre, normal = pass_pos[pass_index], pass_normals[pass_index]
+                y_axis = pass_y_axes[pass_index]
+                previous = result[-1][-1]
+                rel = previous - centre
+                if rel @ normal > -0.05:
+                    side = 1.0 if rel @ y_axis >= 0 else -1.0
+                    depth = self.settings.backside_depth
+                    exit_side = centre + side * lateral * y_axis + depth * normal
+                    entry_side = centre + side * lateral * y_axis - depth * normal
+                    result.append(np.vstack([exit_side, entry_side]))
+                pass_index += 1
+            result.append(block)
+        return result
 
     # region level 3 final pass
 
