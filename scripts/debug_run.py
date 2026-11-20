@@ -416,7 +416,7 @@ def episode_arrays(ep: dict[str, Any]) -> dict[str, Any]:
     plans = ep["plan_log"]
     arrays["plan_reason"] = np.array([plan["reason"] for plan in plans], dtype="<U120")
     for key in ("t", "tick", "theta", "length", "n_waypoints", "ms"):
-        arrays[f"plan_{key}"] = np.array([plan[key] for plan in plans], dtype=float)
+        arrays[f"plan_{key}"] = np.array([plan.get(key, np.nan) for plan in plans], dtype=float)
     arrays["plan_drone_pos"] = np.array([plan["drone_pos"] for plan in plans], dtype=float)
     arrays["plan_points"] = np.array([plan["points"] for plan in plans], dtype=float)
     failure = ep["failure"]
@@ -591,7 +591,7 @@ def run_and_save(
             )
             if log:
                 solver_ms = ep["record"].get("solver_ms", np.zeros(0))
-                plan_ms = [entry["ms"] for entry in ep["plan_log"]]
+                plan_ms = [entry.get("ms", np.nan) for entry in ep["plan_log"]]
                 print(
                     f"          log  -> {log_path}  ({len(ep['plan_log'])} plans, "
                     f"{len(ep['record']['t'])} steps, plan {np.mean(plan_ms):.1f} ms mean, "
