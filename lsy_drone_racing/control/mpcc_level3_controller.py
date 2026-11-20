@@ -30,7 +30,7 @@ from lsy_drone_racing.control.mpcc_reliable_sprint_controller import MPCCReliabl
 
 #: Level 3 controller settings. Each applies only when ``env.track.randomize`` is true and the
 #: ``[controller]`` section does not name the key itself.
-LEVEL3_CONTROLLER: dict[str, object] = {}
+LEVEL3_CONTROLLER: dict[str, object] = {"a_lat_max": 14.0}
 #: Level 3 overrides of the level 2 planner configuration (`PathConfig` fields).
 LEVEL3_PATH: dict[str, object] = {}
 #: Level 3 only planner settings (`Level3Settings` fields).
