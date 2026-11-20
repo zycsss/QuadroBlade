@@ -42,6 +42,9 @@ LEVEL3_PLANNER: dict[str, object] = {
 #: Stall watchdog: re-seed the solver along the path when progress over ``stall_window`` seconds
 #: stays below ``stall_progress`` metres. Zero window disables it.
 LEVEL3_STALL = {"stall_window": 0.6, "stall_progress": 0.05}
+#: Speed cap [m/s] while the next gate in the sequence is unseen and within ``target_radius``
+#: metres (XY). Zero disables it; the level 2 unseen-object cap stays active either way.
+LEVEL3_TARGET = {"target_speed": 1.8, "target_radius": 1.4}
 
 
 class MPCCLevel3Controller(MPCCReliableSprintController):
@@ -72,6 +75,7 @@ class MPCCLevel3Controller(MPCCReliableSprintController):
             self._l3_settings = Level3Settings(**settings)
         self._stall = {k: float(tuned.controller.get(f"l3_{k}", v)) for k, v in LEVEL3_STALL.items()}
         self.reseeds = 0
+        self._target = {k: float(tuned.controller.get(f"l3_{k}", v)) for k, v in LEVEL3_TARGET.items()}
         super().__init__(obs, info, tuned)
         self._theta_hist: deque[float] = deque(maxlen=max(1, int(self._stall["stall_window"] * self._freq)))
 
@@ -116,6 +120,24 @@ class MPCCLevel3Controller(MPCCReliableSprintController):
                 self.reseeds += 1
                 hist.clear()
         return action
+
+    def risk_speed_limit(self, obs: dict) -> float | None:
+        """Add a level 3 cap while the next gate is unseen and close."""
+        limit = super().risk_speed_limit(obs)
+        if not self._level3 or self._target["target_speed"] <= 0:
+            return limit
+        sequence = np.asarray(obs["gate_sequence"], dtype=int).ravel()
+        passed = int(np.asarray(obs.get("n_gates_passed", 0)).ravel()[0])
+        target = int(sequence[passed]) if 0 <= passed < len(sequence) else -1
+        visited = np.asarray(obs.get("gates_visited", []), dtype=bool).ravel()
+        if 0 <= target < len(visited) and not visited[target]:
+            gate = np.asarray(obs["gates_pos"], dtype=float)[target]
+            if np.linalg.norm(gate[:2] - np.asarray(obs["pos"], float)[:2]) < self._target[
+                "target_radius"
+            ]:
+                cap = self._target["target_speed"]
+                limit = cap if limit is None else min(limit, cap)
+        return limit
 
     def _reseed(self, obs: dict) -> None:
         """Reset the solver and warm-start it on the path ahead of the current progress."""
