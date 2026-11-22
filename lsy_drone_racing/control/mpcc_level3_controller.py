@@ -38,6 +38,8 @@ LEVEL3_PLANNER: dict[str, object] = {
     "bounds_margin": 0.25,
     "floor": 0.15,
     "backside_lateral": 0.7,
+    "block_openings": True,
+    "detour_flip": True,
 }
 #: Stall watchdog: re-seed the solver along the path when progress over ``stall_window`` seconds
 #: stays below ``stall_progress`` metres. Zero window disables it.
