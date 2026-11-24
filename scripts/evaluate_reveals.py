@@ -49,7 +49,7 @@ import numpy as np
 from gymnasium.wrappers.jax_to_numpy import JaxToNumpy
 from scipy.spatial.transform import Rotation
 
-from lsy_drone_racing.control.rl_scene import RLScene
+from lsy_drone_racing.control.rl_scene import STYLE_SETS, RLScene
 from lsy_drone_racing.utils import load_config
 from lsy_drone_racing.utils.race_policy import body_center
 from lsy_drone_racing.utils.scene_policy import scene_clearances
@@ -214,6 +214,7 @@ def fly(job: tuple) -> dict:
         "replans_failed": sum(not r["clear"] for r in controller.replans),
         "replan_ms": replan_ms,
         "style_ticks": controller.style_ticks.tolist(),
+        "last_style": int(controller._style),
     }
 
 
@@ -231,6 +232,7 @@ def main(
     styles: str | tuple[str, ...] = (),
     replan_gates: int | None = None,
     benders: str | tuple[str, ...] = (),
+    style_set: str | None = None,
 ):
     """Fly `count` seeds of a level in one mode, and summarize how they ended.
 
@@ -251,6 +253,8 @@ def main(
             this many gates, and again at every pass; 0 plans the rest of the lap.
         benders: Benders from `scripts/train_bender.py`, comma separated: one for ``policy``, or
             one per style with ``runtime_replan_selector``.
+        style_set: With ``runtime_replan_selector``, the installed styles to fly, ``"stable"`` or
+            ``"fast"`` (`rl_scene.STYLE_SETS`); the controller's default if not given.
     """
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}")
@@ -263,6 +267,10 @@ def main(
         benders = tuple(b for b in benders.split(",") if b)
     if isinstance(styles, str):
         styles = tuple(s for s in styles.split(",") if s)
+    if style_set is not None:
+        if styles:
+            raise ValueError("give styles or style_set, not both")
+        styles = tuple(str(f) for f in STYLE_SETS[style_set])
     jobs = [
         (first_seed + i, level, mode, policy, tuple(without), limit)
         + (tuple(styles), replan_gates, tuple(benders))

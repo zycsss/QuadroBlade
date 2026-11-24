@@ -114,7 +114,7 @@ class Benders(NamedTuple):
 
 
 class Pilots(NamedTuple):
-    """Every world's bend of each style's guide, and each bender's last output ``(n, 3, 9)``."""
+    """Every world's bend of each style's guide, and each bender's last output ``(n, 3, d)``."""
 
     bends: tuple[Bend, ...]
     u: jax.Array
@@ -188,6 +188,16 @@ def propose(
     return feats, style_actions(styles, jnp.stack(bent, axis=1)), Pilots(tuple(bends), u)
 
 
+def chosen_bend(pilots: Pilots | None, style: jax.Array) -> Bend | None:
+    """Return every world's bend of the style it flies, whose frame its command is in."""
+    if pilots is None:
+        return None
+    bend = pilots.bends[0]
+    for i in range(1, N_STYLES):
+        bend = where_bend(style == i, pilots.bends[i], bend)
+    return bend
+
+
 def drop_bends(pilots: Pilots | None, new: Any, old: Any, ended: jax.Array) -> Pilots | None:
     """Drop the bends of worlds on a new guide or a new episode; forget outputs of a new episode."""
     if pilots is None:
@@ -249,7 +259,7 @@ def make_flight(env: SceneEnv, styles: Styles, cfg: dict, benders: Benders | Non
     def step(state: Any, style: jax.Array, pilots: Pilots | None) -> tuple:
         _, proposals, pilots = propose(env, styles, benders, state, pilots)
         u = proposals[jnp.arange(env.n), style]
-        new, _, term, trunc, _ = env.step(state, u)
+        new, _, term, trunc, _ = env.step(state, u, chosen_bend(pilots, style))
         finished = new.passed >= count
         crashed = term & ~finished
         reward = (

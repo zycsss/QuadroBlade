@@ -31,7 +31,7 @@ architecture changes.
 **`RLScene` (`control/rl_scene.py`) is the final controller**: every `config/level*.toml` selects
 it, so `pixi run python scripts/sim.py` flies it. On a race that shifts gates or poles (levels 2
 and 3) it defaults to the runtime planner replanned at every reveal, with the style selector
-choosing between three policies; elsewhere it flies the solved guide with `rl_scene.npz` (see "The
+choosing between three policies of the `stable` set (`controller.style_set`, or `fast`); elsewhere it flies the solved guide with `rl_scene.npz` (see "The
 RL scene controller"). Two controllers fly the race today, both using
 the same planner: the MPCC follows its plan, and `RLScene`, trained on generated tracks only, sees it
 as a hint. `RLRace`, an RL policy trained on the one track it flies, was removed in favour of
@@ -51,8 +51,10 @@ a6ecd62.
 | RL scene policy, trained and flown on solved guides with faster limits, not the default | `control/rl_scene.py` with `controller.fast_guides = true` | Same | 249/256 finished at about 4.46 s |
 | RL scene policy on the solved guide, the default on levels 0 and 1 | `control/rl_scene.py` with `guide_planner = "topt"` | Real level 3, seeds 9000-9127 | 2/128 finished |
 | RL scene policy on runtime guides, replanned at every reveal, not the default | `control/rl_scene.py` with `guide_planner = "fast_runtime"`, `replan_on_reveal = true` | Real level 3 / real level 2 | 55/128 at 5.39 s / 29/64 at 4.61 s |
-| RL scene policies trained on staged reveals, replanned at every reveal, not the default | `control/rl_scene.py` with `guide_planner = "fast_runtime"`, `replan_on_reveal = true`, `policy = rl_scene_<style>.npz` | Real level 3 / real level 2 | `speed_first` 88/128 at 5.72 s / 31/64 at 4.97 s; `middle_ground` 93/128 at 6.20 s / 34/64 at 5.15 s; `safety_first` 107/128 at 7.45 s / 54/64 at 6.43 s |
-| The agent choosing between those three styles in flight, **the default on levels 2 and 3** | `control/rl_scene.py` with `guide_planner = "fast_runtime"`, `replan_on_reveal = true`, `style_selector = true` | Real level 3 / real level 2 | 106/128 at 6.66 s / 54/64 at 6.09 s |
+| RL scene policies of the `fast` set, trained on staged reveals, replanned at every reveal, not the default | `control/rl_scene.py` with `guide_planner = "fast_runtime"`, `replan_on_reveal = true`, `policy = rl_scene_fast_<style>.npz` | Real level 3 / real level 2 | `speed_first` 88/128 at 5.72 s / 31/64 at 4.97 s; `middle_ground` 93/128 at 6.20 s / 34/64 at 5.15 s; `safety_first` 107/128 at 7.45 s / 54/64 at 6.43 s |
+| RL scene policies of the `stable` set, also trained on poles popping up on the guide, not the default alone | `control/rl_scene.py` with the same and `policy = rl_scene_stable_<style>.npz` | Real level 3 / real level 2 | `speed_first` 88/128 at 5.79 s / 36/64 at 4.98 s; `middle_ground` 91/128 at 6.17 s / 42/64 at 5.35 s; `safety_first` 112/128 at 7.52 s / 53/64 at 6.76 s |
+| The agent choosing between the `fast` styles in flight | `control/rl_scene.py` with `guide_planner = "fast_runtime"`, `replan_on_reveal = true`, `style_selector = true`, `style_set = "fast"` | Real level 3 / real level 2 | 106/128 at 6.66 s / 54/64 at 6.09 s |
+| The agent choosing between the `stable` styles in flight, **the default on levels 2 and 3** | The same with `style_set = "stable"` (default) | Real level 3 / real level 2 | 114/128 at 7.01 s / 56/64 at 6.45 s |
 
 ## The race environment
 
@@ -196,8 +198,9 @@ generated layouts --> topt_planner (in advance) --> library of guides --> PPO --
 | Controller used in the race | `control/rl_scene.py` |
 | Trained policy | `control/rl_scene.npz` (`level1_random_tracks_fixed_guides`), trained with nothing moving |
 | Policy for runtime guides | `control/rl_scene_runtime_guides.npz` (`level1_random_tracks_fast_guides_60steps`), trained on guides of the runtime planner, nothing moving |
-| Three styles, for levels 2 and 3 | `control/rl_scene_{speed_first,middle_ground,safety_first}.npz` (`staged_reveal_guides_*`), trained on shifted scenarios with guides that follow the reveals |
-| Style selector | `control/rl_scene_style_selector.npz` (`style_selector_hold_10_ticks_gamma_0.99`), picks one of the three styles every 0.2 s |
+| Three styles, `stable` set, the default on levels 2 and 3 | `control/rl_scene_stable_{speed_first,middle_ground,safety_first}.npz` (`staged_reveal_guides_with_half_poles_popping_up_on_guide_*`), trained on shifted scenarios with guides that follow the reveals, a third of them with poles popping up on the guide |
+| Three styles, `fast` set | `control/rl_scene_fast_{speed_first,middle_ground,safety_first}.npz` (`staged_reveal_guides_*`), the same without poles popping up |
+| Style selector | `control/rl_scene_style_selector.npz` (`style_selector_hold_10_ticks_gamma_0.99`), trained over the `fast` set, picks one of the three styles of either set every 0.2 s |
 | Inputs, output and guide library | `utils/scene_policy.py` |
 | Random tracks | `utils/scene_generator.py` |
 | Solving guides in advance | `scripts/solve_scene_library.py` |
@@ -237,7 +240,7 @@ files may only change the controller file and the control mode, so the choice is
 | `guide_planner = "topt"`, `fast_guides = true` | The same with `FAST_GUIDE_CONFIG` | Set `policy` to one trained on those guides |
 | `guide_planner = "fast_runtime"` | The runtime planner, once before the race; about 20 ms | `rl_scene_runtime_guides.npz` |
 | `guide_planner = "fast_runtime"`, `replan_on_reveal = true` | The runtime planner, again whenever the sensor reveals a gate or pole | `rl_scene_runtime_guides.npz` |
-| The same, and `style_selector = true` | The same | The three styles, with the selector choosing; `selector` and `style_policies` point to other files |
+| The same, and `style_selector = true` | The same | The three styles of `style_set` (`"stable"` by default, or `"fast"`), with the selector choosing; `selector` and `style_policies` point to other files |
 | The same, and `bender = true` | The same, each policy flying its guide as its bender bends it (`policy` and `bender_policy`, or `benders` under the selector). Tried on `safety_first`: no gain, nothing installed | Set them |
 | The same, and `replan_from_state = true` | Each replan starts at the drone's position and velocity and goes through the next `replan_gates` gates (1 by default, 0 for the rest of the lap), and also replans at every pass. Worse with today's policies: 97/128 on real level 3 for the rest of the lap, 24/128 for the next gate only | Unchanged |
 
@@ -290,6 +293,14 @@ of reveals: stage `k` knows the first `k` objects in the order the stage-0 guide
 guide of the stage its reveals have completed, and joins a new guide at its nearest bead close by. In
 flight `RLScene` follows the same rule with `replan_in_order = true`.
 
+`--pop_up` gives every pole that chance of being moved onto the stage-0 guide, as far as the shift
+allows (`scene_policy.pop_up_poles`), so that training sees more reveals of a pole on the guide:
+with 0.5, 25% of poles stand within 5 cm of it instead of 4%. The `stable` styles trained on the
+usual scenarios plus such ones (2 draws per training track, a third of 9138 scenarios), validated on
+both; the `fast` styles on the usual ones only. Under the same selector the `stable` set finishes
+114/128 at 7.01 s on real level 3 and 56/64 at 6.45 s on real level 2, against 106/128 at 6.66 s and
+54/64 at 6.09 s for `fast`, with fewer pole crashes (10 against 18, 6 against 9).
+
 **Three styles (`--style`), always trained side by side:**
 
 | Style | Crash | Hit margin | Obstacle term | Time cost per step | Kept policy chosen by |
@@ -302,21 +313,39 @@ The lap check reports each style's clearance: the mean, over finished laps, of t
 to any gate or pole.
 
 **Bender and tracker trained together (`scripts/train_bender.py`).** A bender decides every 5 steps
-(0.1 s) on a bend of the guide ahead (`scene_policy.make_bend`). The bend has a sideways and an
-upward offset at 0.5, 1, 2 and 3 m ahead, fading out by 4 m, and a factor of 0.7-1.3 on the guide's
-speeds. Each offset is clipped to what the drone can reach at its speed, at 6 m/s^2 sideways, and
-optionally (`from_drone`) the bend starts at the drone along its velocity. The tracker sees the bent
-points ahead and the scaled speeds, but its offset from the guide as planned.
+(0.1 s) on a bend of the guide ahead (`scene_policy.make_bend`). The bend has a forward, a sideways
+and an upward offset, in the frame of the guide where it is made, at the drone's own bead and at 0.5,
+1, 2, 3 and 4 m ahead, linear in between and fading out by 5 m, and a factor of 0.7-1.3 on the
+guide's speeds. No offset exceeds the largest offset `limit`. Optionally (`from_drone`) the bend also
+starts at the drone along its velocity. The tracker sees the bent guide as it sees a planned one: its
+offset from it, the points ahead and the scaled speeds, all in the bent guide's frame
+(`scene_heading(..., bend)`), and its command is turned into an attitude in that frame too.
 
-The bender's 117 inputs are the tracker's 86 features, 7 more guide points up to 4 m, its last output,
+The bend took this shape in Step 0 of "Plan: a bender taught by the replanner" (`docs/PLAN_path_rl.md`).
+There a teacher bent the guide planned once onto the guide replanned at every reveal, and the
+`safety_first` tracker flew it. With the earlier bend (sideways and up only, at 0.5-3 m, zero at the
+drone, in the planned guide's frame) that finished 5-6% of validation laps, against 44% flying the
+replanned guides themselves. The point at the drone and the frame of the bent guide brought it to
+19-28%.
+
+The bender's inputs are the tracker's 86 features, 7 more guide points up to 4 m, its last output,
 and whether the next two gates and two nearest poles have been revealed. One PPO run trains both
 networks, each with its own critic. The bender gets the style's reward, one transition per decision.
 The tracker gets the same reward minus a falling cost for leaving the bent guide.
 
 The tracker starts from a trained style and the bender from no bend. For the first 500 iterations
-only the bender learns, and the largest offset grows from 5 to 30 cm. On `safety_first` it found no
-bend that helps (see `docs/PLAN_path_rl.md`), so nothing is installed. `train_style_selector.py
---benders` chooses between pairs in the same way.
+only the bender learns, and the largest offset grows from `limit_start` to `limit_end`. With
+`--replan=False` the guide is planned once and only the bender reacts to reveals. With the earlier
+bend that gave 70/128 on real level 3 and 16/64 on level 2, against 14/128 and 6/64 without a bender
+and 106/128 and 54/64 for the replanned default. Three options help it learn:
+- `imitate`: a cost on how far its bend leaves the replanned guide (`scene_policy.replanned_gap`),
+  fading out over `imitate_fade` iterations;
+- `clearance` and `bender_gamma`: a cost for closeness to what has been revealed, and a shorter
+  discount for the bender alone;
+- `teacher_check`: only fly the validation laps with the teacher's bends (`scene_policy.teacher_bend`).
+
+Bender files of the earlier bend no longer load. Nothing is installed. `train_style_selector.py
+--benders` chooses between pairs in the same way, each command turned in its own pilot's frame.
 
 **The style selector (`scripts/train_style_selector.py`)** chooses between the three frozen styles in
 flight, so the agent itself decides how much risk to take. Every `hold` = 10 control steps it picks the
@@ -328,7 +357,9 @@ for a crash at a 2 cm margin, and -0.02 per step. The kept selector scores best 
 `10 * finish - time + gates`, and every style alone is flown on the same laps for comparison. In flight
 `RLScene._select` runs all three styles every step (about 40 microseconds in all) and records the steps
 flown in each style in `style_ticks`. Results: 106/128 at 6.66 s on real level 3 and 54/64 at 6.09 s
-on level 2, against 107/128 at 7.45 s and 54/64 at 6.43 s for `safety_first` alone.
+on level 2 over the `fast` styles, against 107/128 at 7.45 s and 54/64 at 6.43 s for their
+`safety_first` alone. Over the `stable` styles it flies `safety_first` more (59% and 79% of the
+time) and finishes 114/128 at 7.01 s and 56/64 at 6.45 s.
 
 `train_path_policy.py` trains the earlier path-following policy. It is not used by a race controller
 yet; its PPO code is what `train_race_policy.py` reuses. Policies saved before the rotation matrix

@@ -809,6 +809,363 @@ scales the speeds.
 - Use fewer outputs, such as one sideways offset at the next gate and a speed scale.
 - Train it on the race reward alone, with no follow term for the tracker.
 
+### Results: the bender in place of replanning (2026-11-18)
+
+Asked for: the bender bends the guide instead of the planner replanning it. `SceneEnv` takes
+`cfg["replan"]` (`scripts/train_bender.py --replan=False`). A drone then keeps the guide planned
+through the layout as reported for the whole episode, while gates and poles stand at their true poses
+and are revealed as usual. Only the bender can react.
+
+The run is `joint_bender_tracker_safety_first_guide_planned_once`: 4000 iterations from
+`rl_scene_safety_first.npz`, with the largest offset growing from 10 to 30 cm over 1000 iterations.
+Validation rose from 0% to **28.4% at 8.09 s** and was still rising at the end, with bends of about
+5 cm on average.
+
+| Guide planned once, never replanned | Real level 3 (128 seeds) | Real level 2 (64 seeds) |
+|---|---|---|
+| `safety_first`, no bender | 14/128 at 7.18 s (64 next gate, 31 other gate, 15 pole) | 6/64 at 6.21 s (36 pole, 19 next gate) |
+| `safety_first` with its bender | **70/128 at 8.43 s** (39 pole, 15 other gate) | **16/64 at 7.69 s** (48 pole) |
+| Default, replanned at every reveal, with the selector | 106/128 at 6.66 s | 54/64 at 6.09 s |
+
+- **The bender does the replanner's work for gates.** Crashes into the next gate fell from 64 to 2 on
+  level 3, and finishes went up five times.
+- **It doesn't yet steer around poles.** Poles end 39 of its 58 failed level 3 flights and 48 of 48 on
+  level 2, where poles stand closer to the gates. A pole moved across the guide needs a sideways bend
+  well before the drone reaches it. The bender sees only the two nearest poles, and only once they are
+  revealed, 0.7 m away.
+- **It is slower,** at 8.43 s against 7.45 s for the style replanned. It holds back where it isn't sure.
+- **Not yet better than replanning.** Next steps, cheapest first:
+  - Train longer: it was still rising at 4000 iterations.
+  - Train the other two styles and the selector over the pairs.
+  - Give the bender the poles' offsets from the guide, not only from the drone.
+
+### Results: training four times longer (2026-11-18)
+
+Same set-up as above, 16000 iterations, with the largest offset growing over 4000 iterations.
+
+| Run | Validation at 1000 | at 4000 | at 16000 |
+|---|---|---|---|
+| `..._safety_first_guide_planned_once` (4000 iterations) | 15.8% | 28.4% at 8.09 s | — |
+| `..._safety_first_guide_planned_once_16000_iterations` | 12.9% | 24.0% | **32.8% at 7.36 s** |
+| `..._speed_first_guide_planned_once_16000_iterations` | | | 32.9% at 5.60 s (stopped at about 14000) |
+
+`middle_ground` was not started. The last 4000 iterations of `safety_first` gained 2 points, so more
+iterations alone are not worth it. Neither pair was raced. The bender learns slowly because it starts
+from no bend and has to find from crashes and gate rewards which way to bend. Those come seldom, and a
+bend that just misses a pole earns the same as one that clears it well.
+
+The no-bender baselines of the other two styles, guide planned once: `speed_first` 11/128 at 5.72 s on
+level 3 and 8/64 at 4.96 s on level 2; `middle_ground` 10/128 at 5.95 s and 7/64 at 5.14 s.
+
+## Plan: a bender taught by the replanner, rewarded for what is near
+
+**Status: built (2026-11-23). Steps 0 and 1 done, results below; Steps 2-4 not started.** Follows "Results: training four times longer" above.
+
+**Goal:** a bender that learns in 1000 iterations what now takes 16000, and then does better: with the
+guide planned once, at least 90/128 on real level 3, aiming at the replanned default's 106/128.
+
+**Two changes, tried apart and together:**
+
+1. **A teacher.** The staged libraries already hold the guide the planner makes at every reveal stage.
+   The gap between that guide and the guide planned once is what the bender should learn to bend. It is
+   a label for every state, so the bender no longer has to find it by trial.
+2. **A local reward.** The bender's reward judges a bend by what happens while it acts, near the drone,
+   and grades how close it comes to what has been revealed. The tracker keeps the style's lap reward.
+
+### The teacher's bend
+
+- **The guide it copies.** For each drone, the row of the stage its reveals have reached, counted as
+  `SceneEnv._follow_reveals` counts it, but without moving the drone onto that row. That row is the
+  guide the default controller would be flying.
+- **Matching beads.** A bead of the guide planned once is matched to the replanned guide at the same
+  share of the way between the same two gate crossings (`lib.crossings`). It is cheap and doesn't jump
+  between nearby parts of the track as a nearest-bead search can.
+- **Fitting the bend.** The offsets of the beads from the first to the last control point ahead (10
+  to 60 beads) are fitted by least squares with the bend's own shape. Before and after that stretch a
+  bend can't follow an offset, and fitting there made it overshoot by a quarter in between: the hat weights of `bend_offset`, which are linear in the
+  four control points. That gives the best bend the bend can express, sideways and up, divided by each
+  point's reach cap and clipped to [-1, 1]. The speed scale isn't taught, and PPO learns it.
+- **How much it can express.** Level 2 and 3 shifts are at most 15 cm sideways and 10 cm up, inside
+  the 30 cm limit. The four control points over 80 beads can't follow every turn of a replanned guide,
+  and Step 0 measures how much of the gap is left.
+
+### The local reward
+
+- **The bender only:** the style's reward, plus a graded clearance cost from each revealed pole and gate
+  frame, rising linearly from zero at 15 cm to the full cost at the hit margin. Unrevealed objects
+  don't count, since the bender cannot know where they are.
+- **A shorter horizon:** a bender discount `bender_gamma` of 0.97 per control step, about 0.7 s, which
+  is about how far a bend reaches. Today both networks use 0.99 (2 s).
+- **The tracker is unchanged.** It still flies the whole lap on the style's reward and its follow cost.
+
+### Code
+
+- `utils/scene_policy.py`: `teacher_bend(...)` and `matched_beads(...)`, in NumPy and JAX, with tests
+  that a guide bent by it lands within 5 mm of a shifted guide between the control points.
+- `scripts/train_scene_policy.py`: `SceneEnv.reached_rows(state)`, the stage row without the switch,
+  sharing `_stage_rows` with `_follow_reveals`.
+- `scripts/train_bender.py`, new options:
+  - `imitate`: the weight of a squared error between the bender's mean and the teacher's output. It is
+    added to the bender's PPO loss on the states the bender itself visits, and fades to 0 by
+    `imitate_fade` iterations. The bender already learns from the first iteration; `bender_only`
+    still holds only the tracker's actor.
+  - `clearance` and `clearance_far`: the local cost's weight and where it starts.
+    `bender_gamma`: the bender's discount.
+  - `teacher_check`: only fly the validation laps with the teacher's bends.
+
+### Results of Step 0 (2026-11-23): the bend had to change before training
+
+Flown with the `safety_first` tracker on the 628 validation scenarios, guide planned once:
+
+| What the tracker flies | Finished |
+|---|---|
+| The guide planned once, no bend | 0% |
+| The teacher's bends, the bend as it was (sideways and up at 0.5-3 m, zero at the drone) | 5-6% |
+| The same, fitted from the drone's bead, or with `here` from the bent guide | 5-7% |
+| Six control points, each free in 3D, one at the drone's bead (30 cm limit) | 13.7% |
+| The same with a point every 10 beads, the replanned speeds, or a bead not held at the crossing | 13-16% |
+| **The same in the bent guide's frame** (30 / 50 / 100 cm limit) | **19.0 / 25.0 / 27.6%** |
+| The same, bent at every step instead of every 5 | 21.7-32.1% |
+| The tracker shown the replanned guide exactly, its command in the planned guide's frame | 28.7% |
+| The tracker shown the replanned guide exactly, in its frame | 44.0% |
+| The replanned guides themselves | 44.1% |
+
+- **The shape.** Where the replanned guide differs, the guide planned once lies 15 cm from it on
+  average. The old bend could only bring that to 10 cm, and 5.4 cm even with its points free in 3D:
+  the replanned guide is already 12 cm away (median) at the drone's own bead, where the old bend was
+  always zero. Six points free in 3D, from the drone's bead to 4 m, leave 2.0 cm.
+- **The frame.** The tracker reads everything in a frame along its guide, and its command is turned
+  back into the world in that frame. A bent guide flown in the planned guide's frame looks to it like
+  a guide at an angle. Taking the frame from the bent guide (`scene_heading(..., bend)`) is worth 6 to
+  15 points.
+- **Joining.** The teacher compares the bead `k` ahead of the drone with the bead `k` ahead of where
+  the drone would join the replanned guide (`joined_bead`, as `SceneEnv` joins a new stage), so the
+  bent guide shows the tracker what the replanned one would.
+- **What is left** to 44%: the 0.1 s between bends and the speeds, which a bend scales only as a whole.
+- **Not code:** the scratch scripts that tested each step are not kept.
+
+### Steps
+
+### Results of Step 1 (2026-11-23)
+
+Four `safety_first` runs, 4000 iterations each, guide planned once, the reshaped bend with a 50 cm
+limit from the start. Names start `joint_bender_tracker_safety_first_guide_planned_once_six_3d_points_`.
+
+| Run | Validation at 1000 / 2000 / 3000 / 4000 | Kept | Real level 3 | Real level 2 |
+|---|---|---|---|---|
+| `no_teacher` | 21.1 / 25.6 / 27.8 / 33.2% | 33.2% at 7.67 s | 69/128 at 7.95 s (37 pole) | 20/64 at 7.11 s (42 pole) |
+| `imitate_replanner` | 20.0 / 28.4 / 32.5 / 34.5% | 36.6% at 7.65 s | **80/128 at 7.90 s** (29 pole) | 12/64 at 7.05 s (52 pole) |
+| `local_reward_gamma_0.97` | 0 / 0 / 0 / 0% | — | not raced | not raced |
+| `imitate_replanner_local_reward_gamma_0.97` | 20.5 / 27.4 / 31.4 / 36.6% | 36.6% at 7.35 s | 68/128 at 7.55 s (30 pole) | 14/64 at 7.35 s (50 pole) |
+| Earlier bend, 4000 iterations | 15.8 / — / — / 28.4% | 28.4% at 8.09 s | 70/128 at 8.43 s | 16/64 at 7.69 s |
+| Default, replanned, with the selector | | | 106/128 at 6.66 s | 54/64 at 6.09 s |
+
+- **The reshaped bend is most of the gain.** Without a teacher it already beats the earlier bend on
+  validation (33.2% against 28.4%) and is 0.5 s faster in real races.
+- **The teacher helps on validation and on level 3** (80/128, the best without replanning so far), but
+  not on level 2, where poles end almost every failed flight.
+- **The local reward as built is wrong.** Its cost counts gate frames within 15 cm, and passing through
+  a gate means coming that close to its frame: alone, the bender learned to keep away from gates and
+  passed none. With the teacher it trained, faster, but raced worse.
+- **Poles are now the problem.** They end 29 of 48 failed level 3 flights and 52 of 52 on level 2,
+  where poles stand closer to the gates. The teacher's guide does go around revealed poles, but a pole
+  is revealed only 0.7 m ahead, and the teacher fades out after 1000 iterations. Step 4 (the poles'
+  offsets from the bent guide as inputs) and a local cost for poles only are next.
+
+**Step 0: how good is the teacher? (about 15 minutes, no training)**
+Fly the validation lap check with the teacher's bends and the `safety_first` tracker as it is. Also
+record how much of the replanned guide's offset the fit leaves, and how often a control point is
+clipped.
+- If the teacher flies close to the replanned guides, the bend can express the replanner, and
+  imitation is worth it.
+- If it falls well short, the bend itself is what limits us: more control points or a longer fade come
+  before any training.
+
+**Step 1: three runs on `safety_first`, 4000 iterations each, one at a time (about 45 minutes)**
+Each run is compared at equal iterations with `joint_bender_tracker_safety_first_guide_planned_once`
+(15.8% at 1000, 28.4% at 4000).
+
+| Run | Teacher | Local reward |
+|---|---|---|
+| `joint_bender_tracker_safety_first_guide_planned_once_imitate_replanner` | yes, fading over 1000 | no |
+| `joint_bender_tracker_safety_first_guide_planned_once_local_reward_gamma_0.97` | no | yes |
+| `joint_bender_tracker_safety_first_guide_planned_once_imitate_replanner_local_reward_gamma_0.97` | yes | yes |
+
+The run to keep is the one that is better by iteration 1000 and doesn't fall back after the teacher
+fades. It is then raced on real levels 3 (128 seeds) and 2 (64).
+
+**Step 2: the other two styles (about 30 minutes)**
+The kept recipe for `speed_first` and `middle_ground`, then real races of all three.
+
+**Step 3: the selector over the three bent pairs**
+`scripts/train_style_selector.py --benders`, then real races against the replanned default.
+
+**Step 4: only if poles still end most failed flights**
+Give the bender each revealed pole's offset from the bent guide ahead, not only from the drone.
+
+### Risks
+
+- **The bender copies the planner and stops there.** Fading the imitation out lets PPO keep improving
+  on it. If finishes fall once it has faded, the imitation should fade more slowly or stay at a small
+  weight.
+- **The tracker's `here` input is still the offset from the planned guide.** With the teacher's bends
+  the drone flies about where the replanned guide lies, so `here` is larger than the tracker saw in
+  its own training. Step 0 shows whether this hurts.
+- **A short horizon lines up a bad next approach.** It would show as more next-gate crashes. If so,
+  `bender_gamma` should go back towards 0.99.
+
+## Poles revealed on the guide (2026-11-23 and 24)
+
+Most pole crashes on levels 2 and 3 come right after the sensor reveals a pole on or next to the
+guide: the replanned guide is clear, but the drone, at about 2.6 m/s, can't get onto it in time.
+These were tried and removed again, with their code:
+
+| Tried | Real level 3 | Real level 2 |
+|---|---|---|
+| Default then (`fast` styles) | 106/128 at 6.66 s | 54/64 at 6.09 s |
+| Selector told where hidden poles could be (`pole_doubt` inputs) | 100/128 | 54/64 |
+| A slower `safety_first` with a cost near poles and above 2.5 m/s | 108/128 alone | 52/64 alone |
+| Guides planned clear of the whole square a hidden pole can stand in | 107/128 | 42/64 |
+| A replanned guide faded in from the drone over 6 beads | 105/128 | 52/64 |
+| A separate swerve controller, trained on toy scenarios, handed over to at a reveal | 63/128 at best | 21/64 at best |
+| A selector over the `stable` styles retrained (crash -5) | 107/128 at 6.82 s | 56/64 at 6.03 s |
+| The same with a crash reward of -10 | 113/128 at 7.02 s | 55/64 at 6.38 s |
+| A crash reward of -10 over the `fast` styles | 105/128 at 7.02 s | 56/64 at 6.18 s |
+
+The swerve controller worked on its toy scenarios (97% past the pole and back on the guide), but
+not in races: it knew neither the gates nor where the guide curved.
+
+### Training the styles on poles that pop up on the guide (2026-11-24)
+
+What did help. The styles already train on staged reveals, but a revealed pole seldom stands on the
+guide: in the usual scenarios 4% of poles end up within 5 cm of the stage-0 guide (median 27 cm).
+
+`scripts/solve_staged_library.py --pop_up 0.5` gives every pole an even chance to pop up: it moves in
+x and y towards the stage-0 guide's nearest bead, as far as the race's +-0.15 m allows, and lands
+within 2 cm of it when it is that close (`scene_policy.pop_up_poles`). Gates are drawn as usual.
+With it 25% of poles stand within 5 cm of the guide (median 19 cm).
+
+Solved: 2 draws per track of the level 3 and generated training tracks (1884 + 1162 scenarios) and 4
+per level 3 validation track (628), in about 2 minutes.
+
+Trained: the three styles with the installed recipe (8000 iterations, the same rewards), on the usual
+staged scenarios plus the pop-up ones (a third of 9138), validated on both
+(`staged_reveal_guides_with_half_poles_popping_up_on_guide_<style>`). One run now takes 14 GB of the
+GPU, so they train one after another.
+
+Results, raced on seeds 9000-9127 (level 3) and 1000-1063 (level 2), replanned at every reveal:
+
+| Controller | Real level 3 | Real level 2 |
+|---|---|---|
+| `fast` styles (the earlier ones) under the selector | 106/128 at 6.66 s, 18 poles | 54/64 at 6.09 s, 9 poles |
+| `stable` styles under the same selector | **114/128 at 7.01 s, 10 poles** | **56/64 at 6.45 s, 6 poles** |
+| `stable` `speed_first` alone (`fast`) | 88/128 at 5.79 s (88 at 5.72) | 36/64 at 4.98 s (31 at 4.97) |
+| `stable` `middle_ground` alone (`fast`) | 91/128 at 6.17 s (93 at 6.20) | 42/64 at 5.35 s (34 at 5.15) |
+| `stable` `safety_first` alone (`fast`) | 112/128 at 7.52 s (107 at 7.45) | 53/64 at 6.76 s (54 at 6.43) |
+
+- Race by race against the `fast` set, the `stable` set finishes 14 races it doesn't and loses 6 on
+  level 3; on level 2, 6 and 4.
+- Laps are slower: 6.98 s instead of 6.66 s on races both finish on level 3, 6.41 s instead of 6.07 s
+  on level 2. The selector, trained on the `fast` styles, picks `safety_first` 59% and 79% of the
+  time, and the new `safety_first` is itself the better one.
+
+**Installed** as two sets under the same selector (`controller.style_set`): `stable`, the default,
+and `fast`, the earlier styles (`rl_scene_{stable,fast}_<style>.npz`).
+
+## Plan: a steadier controller on the real drone
+
+**Status: planned, not built.** Reported from real tests: the drone wobbles.
+
+**Goal:** the default controller (`RLScene`, selector over three styles) flies the real drone without
+visible wobble. Measured: roll and pitch rate below 5 Hz carry as large a share as in simulation, with
+no finish rate or more than 0.1 s of lap time lost in simulation.
+
+### What we know
+
+- **In simulation it barely wobbles.** Over the 100-seed replay logs (`logs/selector_100_seeds/`) the
+  median roll and pitch rate is 2.4 rad/s on level 3 and 2.3 on level 2. Only 5-6% of it lies above
+  5 Hz, and its sign flips about 4.5 times a second. So the wobble comes from what training and
+  simulation leave out, or from something only the deployed controller does.
+- **Training leaves out:**
+  - delay between the state measured and the command flown (estimation, radio, the 50 Hz loop);
+  - noise in the measured position, velocity, attitude and rates;
+  - an attitude response other than the simulator's. `scripts/identify_attitude.py` fits the
+    simulator's, not the real drone's.
+  - Mass, inertia and random forces are already varied.
+- **The deployed controller switches what drives it, at once:**
+  - the selector can change style every 0.2 s, and the three styles are three networks that command
+    different attitudes for the same state;
+  - a replan changes the guide, and with it the frame the tracker's command is expressed in
+    (`scene_heading`);
+  - the bender's control points jump every `hold` steps.
+- **Nothing records a real flight.** `scripts/deploy.py` logs only the lap time.
+
+### What may be causing it, and how each would show
+
+| Cause | Shows as |
+|---|---|
+| Delay the policy never trained with | an oscillation at a fixed frequency, roughly 2-5 Hz, growing in fast turns |
+| Measurement noise | fast jitter of the command, above 10 Hz, also in hover |
+| Real attitude response slower or less damped | overshoot after each change of command |
+| Style switches | a jump of the command at a switch, then a swing |
+| Replans and bends | a jump of the command at a replan or a new bend |
+
+### Step 0: record real flights (one session at the lab)
+
+- `scripts/deploy.py` writes the same `.npz` as `scripts/debug_run.py`, plus every command, style,
+  replan and bend tick and the loop's time, so a real flight opens in `replay_site`.
+- Fly level 2 three times with the default, three times with `safety_first` alone (no selector), and
+  hover for 10 s with each.
+- **Result:** the frequency of the wobble, whether it lines up with switches, replans or bends, and
+  the delay. The delay is measured from a step in the command to the response of the measured
+  attitude, as `identify_attitude.py` does in simulation.
+
+### Step 1: reproduce it in simulation (about 2 hours)
+
+`scripts/evaluate_reveals.py` takes `--delay` (control steps), `--obs_noise` and `--attitude_lag`. It
+then flies levels 2 and 3 with each one at a time, at the values Step 0 measured. The cause is the one
+that brings the simulated spectrum close to the real one. Step 0 decides where to start. Without
+real logs, try delays of 1, 2 and 3 steps (20-60 ms) and the noise of the motion-capture system.
+
+### Step 2: fixes that need no training (about 2 hours, each an option of `RLScene`)
+
+- **Blending styles:** at a switch, blend the old and the new style's command over 5 steps (0.1 s),
+  and keep a style for at least 0.4 s unless the selector's preference for the new one is clear.
+- **Blending guides:** after a replan, blend the frame and the guide points the tracker sees from the
+  old guide into the new over 0.1 s. The same applies to a new bend: blend its control points from
+  the last bend's.
+- **Limiting the command:** a cap on how fast the commanded roll and pitch may change per step, set
+  just above what the policy uses in simulation (the 99th percentile), so that only jitter is cut.
+
+Each is checked on levels 2 and 3 in simulation first. It is kept only if it costs no finishes, and
+then on the real drone.
+
+### Step 3: training for what the real drone does (about 1 day for three styles)
+
+Only for causes Steps 1 and 2 leave.
+- `SceneEnv` gets a random delay of 0 to 3 steps per episode, noise on what the policy measures, and
+  a random attitude response around the one Step 0 measured.
+- **A smoother policy:**
+  - raise the cost on the change of command (`smooth`, now 0.02) and add one on the roll and pitch
+    rate;
+  - CAPS-style terms, which penalize a command that changes much between nearby states.
+- The styles are fine-tuned from today's files, not trained anew, then the selector over them.
+  Run names: `staged_reveal_guides_<style>_delay_0_to_3_steps_obs_noise`, and so on.
+
+### Step 4: test
+
+- **Simulation:** levels 2 and 3 with the conditions of Step 1 switched on, against today's default.
+- **Real drone:** the flights of Step 0 again, then the comparison of spectra and lap times.
+
+### Risks
+
+- **The cause isn't in our controller.** A loose propeller or a badly tuned onboard attitude
+  controller wobbles under any controller. Step 0's hover and `safety_first` flights show it.
+- **Smoother costs speed.** Every fix is checked against finishes and lap time in simulation before
+  it reaches the drone.
+- **Training with delay may make the policy timid.** Fine-tuning from today's styles and a delay drawn
+  per episode, including 0, keeps that small.
+
 ## Plan: real level 3, with a guide that follows what has been revealed
 
 **Status: Steps 0, 1 and 2 done, with replanning in flight from Step 3 in a first form, and a selector that picks the style in flight (Step 2b). Results below.** Supersedes "Plan: perturbed arenas" below, which was written

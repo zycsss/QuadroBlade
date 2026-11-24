@@ -21,9 +21,13 @@ differently by default:
 1. The guide comes from a 30 ms planner (`utils/fast_runtime_planner.py`) and is planned again
    whenever the sensor reveals a gate or pole.
 2. Three policies trained in different styles, `speed_first`, `middle_ground` and `safety_first`,
-   are flown by turns: every 0.2 s a selector network picks the style that flies next. The weights
-   are `control/rl_scene_{speed_first,middle_ground,safety_first}.npz` and
-   `control/rl_scene_style_selector.npz`.
+   are flown by turns: every 0.2 s a selector network picks the style that flies next. There are
+   two sets of styles, chosen with `controller.style_set`:
+   - `stable` (default): also trained on poles that the sensor reveals right on the guide. It
+     finishes more races. Weights: `control/rl_scene_stable_{speed_first,middle_ground,safety_first}.npz`.
+   - `fast`: the earlier set, with quicker laps. Weights: `control/rl_scene_fast_<style>.npz`.
+
+   Both fly under the same selector, `control/rl_scene_style_selector.npz`.
 
 Because the policy never sees anything that identifies a track, the same network flies level 0 and
 generated level 3 tracks. How it is built and trained is described in
@@ -33,7 +37,10 @@ generated level 3 tracks. How it is built and trained is described in
 |---|---|
 | Level 0 | 64/64 finished, 4.03 s |
 | Random tracks (level 3 generator, level 1 conditions) | 243/256 finished, about 4.67 s |
-| Level 2 (moved gates and poles) | 0/64 finished: the guide is not yet re-planned after a reveal |
+| Level 2 (moved gates and poles), `stable` styles (default) | 56/64 finished, 6.45 s |
+| Level 2, `fast` styles | 54/64 finished, 6.09 s |
+| Level 3 (moved gates and poles, random tracks), `stable` styles (default) | 114/128 finished, 7.01 s |
+| Level 3, `fast` styles | 106/128 finished, 6.66 s |
 
 ## Quickstart
 

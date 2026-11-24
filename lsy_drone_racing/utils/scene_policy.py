@@ -232,6 +232,32 @@ def staged_layout(
     return gates_pos, gates_rpy, poles
 
 
+def pop_up_poles(
+    beads: np.ndarray, poles: np.ndarray, shift: np.ndarray, rng: np.random.Generator, share: float
+) -> np.ndarray:
+    """Return true pole tops with a share of them moved onto the guide, the rest drawn at random.
+
+    A pole that pops up moves in x and y towards the guide's nearest bead, as far as ``shift``
+    allows, and lands within 2 cm of it when it is that close. Its height is drawn as usual.
+
+    Args:
+        beads: The stage-0 guide ``(m, 3)``.
+        poles: Reported pole tops ``(p, 3)``.
+        shift: The largest shift in x, y and z ``(3,)``.
+        rng: Random numbers.
+        share: Chance of every pole to pop up.
+    """
+    true = poles + rng.uniform(-shift, shift, poles.shape)
+    if share <= 0.0:
+        return true
+    nearest = np.linalg.norm(beads[None, :, :2] - poles[:, None, :2], axis=2).argmin(axis=1)
+    target = beads[nearest, :2] + rng.uniform(-0.02, 0.02, (len(poles), 2))
+    moved = poles[:, :2] + np.clip(target - poles[:, :2], -shift[:2], shift[:2])
+    pops = rng.uniform(size=len(poles)) < share
+    true[pops, :2] = moved[pops]
+    return true
+
+
 def load_staged_library(
     files: str | Sequence[str], reference: RaceTrack
 ) -> tuple[GuideLibrary, StagedScenarios]:
@@ -383,11 +409,22 @@ def advance_scene_guide(
     return new, xp.linalg.norm(lib.beads[rows, new] - pos, axis=-1)
 
 
-def scene_heading(index: NDArray, rows: NDArray, lib: GuideLibrary) -> tuple[NDArray, NDArray]:
-    """Return the cosine and sine of the angle of the frame: the way the guide leads from here."""
+def scene_heading(
+    index: NDArray, rows: NDArray, lib: GuideLibrary, bend: Bend | None = None
+) -> tuple[NDArray, NDArray]:
+    """Return the cosine and sine of the angle of the frame: the way the guide leads from here.
+
+    Under a bend it is the way the bent guide leads. A tracker sees the guide and turns its command
+    in this frame, and flies a bent guide as it flies one planned that way only if both are the bent
+    guide's: with the planned guide's frame, a teacher that bends the guide exactly onto a replanned
+    one finished 29% of validation laps instead of 44%.
+    """
     xp = _xp(index)
     last = lib.beads.shape[1] - 1
-    chord = lib.beads[rows, xp.minimum(index + HEADING_CHORD, last)] - lib.beads[rows, index]
+    ahead = xp.minimum(index + HEADING_CHORD, last)
+    chord = lib.beads[rows, ahead] - lib.beads[rows, index]
+    if bend is not None:
+        chord = chord + bend_offset(bend, ahead) - bend_offset(bend, index)
     # On a guide that goes straight up the frame is arbitrary; pointing along x keeps it defined.
     norm = xp.sqrt(chord[:, 0] ** 2 + chord[:, 1] ** 2 + 1e-12)
     flat = norm < 1e-5
@@ -453,14 +490,14 @@ def scene_features(
         gates_rot: Rotations of those gates ``(n, g, 3, 3)``.
         poles: Poles as the sensor shows them ``(n, p, 3)``.
         lib: The library.
-        bend: A bend of the guide, from `make_bend`: the policy then sees the bent guide ahead,
-            and its speeds scaled. Its offset from the guide and the frame stay those of the guide
-            as planned.
+        bend: A bend of the guide, from `make_bend`: the policy then sees the bent guide, both
+            its offset from it and the guide ahead, and its speeds scaled. The frame stays that of
+            the guide as planned.
     """
     xp = _xp(pos)
     n = pos.shape[0]
     worlds = xp.arange(n)
-    c, s = scene_heading(index, rows, lib)
+    c, s = scene_heading(index, rows, lib, bend)
     m = lib.beads.shape[1]
     matrix = rotation_matrix(quat)
     # The frame turns the world, which is the same as multiplying the attitude from the left.
@@ -477,9 +514,9 @@ def scene_features(
         point = lib.beads[rows, j]
         return point if bend is None else point + bend_offset(bend, j)
 
-    # The offset from the guide as planned, also under a bend: a bend starts at the drone, so its
-    # own offset there is always zero and would hide how far the drone has drifted.
-    here = _turn(pos - lib.beads[rows, index], c, s)
+    # The offset from the guide as bent: a bend moves the guide where the drone is too, as a plan
+    # made again after a reveal does.
+    here = _turn(pos - bead(index), c, s)
     ahead = [_turn(bead(xp.minimum(index + k, m - 1)) - pos, c, s) for k in LOOK_AHEAD]
     scale = 1.0 if bend is None else bend.scale[:, None]
     wanted = [lib.speeds[rows, xp.minimum(index + k, m - 1)][:, None] * scale for k in SPEED_AHEAD]
@@ -566,18 +603,19 @@ def scene_action(u: NDArray, c: NDArray, s: NDArray) -> NDArray:
 
 # region bend
 
-#: Beads ahead of where a bend is made at which it sets an offset: 0.5, 1, 2 and 3 m.
-BEND_POINTS = (10, 20, 40, 60)
+#: Beads ahead of where a bend is made at which it sets an offset: at the drone's own bead, then
+#: 0.5, 1, 2, 3 and 4 m on. A guide the planner makes again after a reveal is already off the old
+#: one where the drone is (12 cm in the median), so a bend has to be able to move that bead too.
+BEND_POINTS = (0, 10, 20, 40, 60, 80)
 #: Beads ahead at which a bend has faded back to the guide.
-BEND_FADE = 80
+BEND_FADE = 100
 #: Beads over which a bend's start at the drone blends into its control points.
 BEND_START = 10
-#: A bender's output: a sideways and an upward offset per control point, then the speed scale.
-BEND_DIM = 2 * len(BEND_POINTS) + 1
+#: A bender's output: a forward, a sideways and an upward offset per control point, in the frame of
+#: the guide where the bend is made, then the speed scale.
+BEND_DIM = 3 * len(BEND_POINTS) + 1
 #: Largest change of the guide's speeds, as a share.
 SPEED_SCALE = 0.3
-#: Sideways acceleration a bend may ask for when it limits its offsets to what is reachable [m/s^2].
-SIDE_ACCEL = 6.0
 #: Points of the guide that a bender sees beyond the tracker's, in beads ahead (up to 4 m).
 BENDER_AHEAD = (6, 10, 25, 35, 50, 70, 80)
 BENDER_DIM = OBS_DIM + 3 * len(BENDER_AHEAD) + BEND_DIM + 4
@@ -586,16 +624,16 @@ BENDER_DIM = OBS_DIM + 3 * len(BENDER_AHEAD) + BEND_DIM + 4
 class Bend(NamedTuple):
     """A bend of every drone's guide, tied to the beads after where it was made.
 
-    The offset at bead ``j`` is that of ``k = j - anchor`` beads past the anchor. It starts at the
-    drone (``start``), leaves along the drone's velocity (``drift``, sideways metres per metre
-    along),
-    blends into the control points by `BEND_START`, and fades back to the guide by `BEND_FADE`.
+    The offset at bead ``j`` is that of ``k = j - anchor`` beads past the anchor: linear between
+    the control points, fading back to the guide from the last one to `BEND_FADE`. With
+    ``from_drone`` it also starts at the drone (``start``), leaves along the drone's velocity
+    (``drift``, sideways metres per metre along) and blends into the control points by `BEND_START`.
 
     Attributes:
         anchor: Bead at which the bend was made ``(n,)``.
         start: Where the drone was, relative to that bead ``(n, 3)``.
         drift: The drone's velocity across the guide, per unit of its speed ``(n, 3)``.
-        points: Offsets at `BEND_POINTS` ``(n, 4, 3)``, in the world.
+        points: Offsets at `BEND_POINTS` ``(n, p, 3)``, in the world.
         scale: Factor on the guide's speeds ``(n,)``.
     """
 
@@ -614,6 +652,28 @@ def zero_bend(index: NDArray) -> Bend:
     return Bend(index, zeros, zeros, xp.zeros((n, len(BEND_POINTS), 3)), xp.ones(n))
 
 
+def _bend_frame(
+    limit: float | NDArray, vel: NDArray, index: NDArray, rows: NDArray, lib: GuideLibrary
+) -> tuple[NDArray, NDArray]:
+    """Return the frame of a bend and the largest offset of each control point ``(n, p)``.
+
+    The frame ``(n, 3, 3)`` has rows forward along the guide's heading, sideways, and up.
+    """
+    xp = _xp(vel)
+    c, s = scene_heading(index, rows, lib)
+    zero = xp.zeros_like(c)
+    frame = xp.stack(
+        (
+            xp.stack((c, s, zero), axis=-1),
+            xp.stack((-s, c, zero), axis=-1),
+            xp.stack((zero, zero, xp.ones_like(c)), axis=-1),
+        ),
+        axis=1,
+    )
+    cap = xp.zeros((c.shape[0], len(BEND_POINTS))) + limit
+    return frame, cap
+
+
 def make_bend(
     u: NDArray,
     limit: float | NDArray,
@@ -627,8 +687,9 @@ def make_bend(
     """Return the bend a bender's output asks for, given the drone's state.
 
     Args:
-        u: The bender's output ``(n, BEND_DIM)``, clipped to [-1, 1]: sideways offsets in the frame,
-            upward offsets, and the speed scale.
+        u: The bender's output ``(n, BEND_DIM)``, clipped to [-1, 1]: the forward, then the
+            sideways, then the upward offsets of the control points, in the frame of the guide here,
+            and the speed scale.
         limit: Largest offset [m].
         pos: Positions ``(n, 3)``.
         vel: Velocities ``(n, 3)``.
@@ -641,20 +702,14 @@ def make_bend(
             finishes.
 
     Returns:
-        The bend. No offset exceeds what the drone can reach by then at `SIDE_ACCEL`.
+        The bend. No offset along an axis of the frame exceeds ``limit``.
     """
     xp = _xp(pos)
     u = xp.clip(u, -1.0, 1.0)
-    c, s = scene_heading(index, rows, lib)
     count = len(BEND_POINTS)
-    side = xp.stack((-s, c, xp.zeros_like(c)), axis=-1)
-    up = xp.asarray([0.0, 0.0, 1.0])
+    frame, cap = _bend_frame(limit, vel, index, rows, lib)
+    points = xp.einsum("npc,ncd->npd", _frame_offsets(u, cap), frame)
     speed = xp.maximum(xp.linalg.norm(vel, axis=-1), 0.5)
-    seconds = xp.asarray(BEND_POINTS, dtype=float)[None] * SPACING / speed[:, None]
-    cap = xp.minimum(limit, 0.5 * SIDE_ACCEL * seconds**2)
-    points = (u[:, :count] * cap)[..., None] * side[:, None] + (u[:, count : 2 * count] * cap)[
-        ..., None
-    ] * up
     last = lib.beads.shape[1] - 1
     tangent = lib.beads[rows, xp.minimum(index + 1, last)] - lib.beads[rows, index]
     tangent = tangent / xp.maximum(xp.linalg.norm(tangent, axis=-1, keepdims=True), 1e-9)
@@ -665,8 +720,30 @@ def make_bend(
         on * (pos - lib.beads[rows, index]),
         on * across / speed[:, None],
         points,
-        1.0 + SPEED_SCALE * u[:, 2 * count],
+        1.0 + SPEED_SCALE * u[:, 3 * count],
     )
+
+
+def _frame_offsets(u: NDArray, cap: NDArray) -> NDArray:
+    """Return the offsets that outputs ``u`` set at the control points, in the bend's frame."""
+    xp = _xp(u)
+    count = len(BEND_POINTS)
+    axes = (u[:, :count], u[:, count : 2 * count], u[:, 2 * count : 3 * count])
+    return xp.stack(axes, axis=-1) * cap[..., None]
+
+
+def _hats(k: NDArray, xp: object) -> NDArray:
+    """Return the weight of every control point ``(..., p)`` at ``k`` beads past a bend's anchor."""
+    knots = (*BEND_POINTS, BEND_FADE)
+    weights = []
+    for i in range(len(BEND_POINTS)):
+        fall = (knots[i + 1] - k) / (knots[i + 1] - knots[i])
+        if i == 0:
+            weights.append(xp.clip(fall, 0.0, 1.0))
+            continue
+        rise = (k - knots[i - 1]) / (knots[i] - knots[i - 1])
+        weights.append(xp.clip(xp.minimum(rise, fall), 0.0, 1.0))
+    return xp.stack(weights, axis=-1)
 
 
 def bend_offset(bend: Bend, j: NDArray) -> NDArray:
@@ -679,15 +756,111 @@ def bend_offset(bend: Bend, j: NDArray) -> NDArray:
     blend = blend * blend * (3.0 - 2.0 * blend)
     lead = bend.start[:, None] + bend.drift[:, None] * (k * SPACING)[..., None]
     lead = lead * (1.0 - blend)[..., None]
-    knots = (0, *BEND_POINTS, BEND_FADE)
-    weights = []
-    for i in range(1, len(knots) - 1):
-        rise = (k - knots[i - 1]) / (knots[i] - knots[i - 1])
-        fall = (knots[i + 1] - k) / (knots[i + 1] - knots[i])
-        weights.append(xp.clip(xp.minimum(rise, fall), 0.0, 1.0))
-    curve = xp.einsum("nkp,npd->nkd", xp.stack(weights, axis=-1), bend.points)
+    curve = xp.einsum("nkp,npd->nkd", _hats(k, xp), bend.points)
     out = lead + curve
     return out[:, 0] if flat else out
+
+
+#: Beads ahead where a bend is compared with the replanned guide it should carry the guide onto:
+#: from the drone's own to the last control point. After it a bend fades back to the guide.
+TEACH_AHEAD = np.arange(BEND_POINTS[-1] + 1)
+
+
+def _bend_weights() -> np.ndarray:
+    """Return the weights of the control points at the beads `TEACH_AHEAD` ahead ``(k, p)``."""
+    return _hats(TEACH_AHEAD.astype(float), np)
+
+
+#: Control points by least squares from offsets at the beads `TEACH_AHEAD` ahead ``(p, k)``.
+_BEND_FIT = np.linalg.pinv(_bend_weights())
+
+
+def joined_bead(
+    pos: NDArray, index: NDArray, passed: NDArray, other: NDArray, lib: GuideLibrary
+) -> NDArray:
+    """Return the bead of guides ``other`` nearest to the drones, as flight joins a new plan.
+
+    The search runs from 40 beads before the current bead ``index`` to 80 after it, between the last
+    and the next pass of ``other``, so that it doesn't snap to another part of the lap.
+    """
+    xp = _xp(pos)
+    count = lib.sequence.shape[0]
+    low = xp.where(passed > 0, lib.crossings[other, xp.maximum(passed - 1, 0)], 0)
+    high = lib.crossings[other, xp.minimum(passed, count - 1)]
+    window = xp.clip(index[:, None] + xp.arange(-40, 81), low[:, None], high[:, None])
+    d = xp.linalg.norm(lib.beads[other[:, None], window] - pos[:, None], axis=2)
+    return window[xp.arange(pos.shape[0]), d.argmin(axis=1)]
+
+
+def replanned_gap(
+    limit: float | NDArray,
+    pos: NDArray,
+    vel: NDArray,
+    index: NDArray,
+    passed: NDArray,
+    rows: NDArray,
+    reached: NDArray,
+    lib: GuideLibrary,
+) -> tuple[NDArray, NDArray]:
+    """Return how far guides ``reached`` lie from guides ``rows`` along the beads a bend covers.
+
+    ``reached`` are the guides the planner makes once the reveals so far are known: the path a
+    bender is taught to bend the guide planned once onto. A drone flying ``reached`` would be on its
+    bead nearest the drone (`joined_bead`), so the bead ``k`` ahead of ``index`` is compared with
+    the bead ``k`` ahead of that one: the bent guide then shows the tracker what the replanned one
+    would, bead for bead.
+
+    Returns:
+        The offsets at the beads `TEACH_AHEAD` ahead, forward, sideways and up in the frame of the
+        bend ``(n, k, 3)`` [m], and the largest offset of every control point ``(n, p)`` [m].
+    """
+    xp = _xp(vel)
+    last = lib.beads.shape[1] - 1
+    ahead = xp.asarray(TEACH_AHEAD)
+    there = joined_bead(pos, index, passed, reached, lib)
+    j = xp.minimum(index[:, None] + ahead, last)
+    gap = lib.beads[reached[:, None], xp.minimum(there[:, None] + ahead, last)]
+    gap = gap - lib.beads[rows[:, None], j]
+    frame, cap = _bend_frame(limit, vel, index, rows, lib)
+    return xp.einsum("nkd,ncd->nkc", gap, frame), cap
+
+
+def bend_path(u: NDArray, cap: NDArray) -> NDArray:
+    """Return the offsets that outputs ``u`` set at the beads `TEACH_AHEAD` ahead ``(n, k, 3)``.
+
+    The same as `bend_offset` of `make_bend` for a bend made on the guide, in the bend's frame.
+    """
+    xp = _xp(u)
+    return xp.einsum("kp,npc->nkc", xp.asarray(_bend_weights()), _frame_offsets(u, cap))
+
+
+def teacher_bend(
+    limit: float | NDArray,
+    pos: NDArray,
+    vel: NDArray,
+    index: NDArray,
+    passed: NDArray,
+    rows: NDArray,
+    reached: NDArray,
+    lib: GuideLibrary,
+) -> tuple[NDArray, NDArray, NDArray]:
+    """Return the bender's output whose bend comes closest to carrying ``rows`` onto ``reached``.
+
+    The offsets of `replanned_gap` are fitted by least squares with the bend's own shape, then
+    clipped to the largest offset. The speed scale is left at 1.
+
+    Returns:
+        The output ``(n, BEND_DIM)`` in [-1, 1]; the mean distance the clipped bend leaves [m]
+        ``(n,)``; and the share of control point offsets clipped ``(n,)``.
+    """
+    xp = _xp(vel)
+    gap, cap = replanned_gap(limit, pos, vel, index, passed, rows, reached, lib)
+    raw = xp.einsum("pk,nkc->npc", xp.asarray(_BEND_FIT), gap) / cap[..., None]
+    u = xp.clip(raw, -1.0, 1.0)
+    parts = (u[..., 0], u[..., 1], u[..., 2], xp.zeros((u.shape[0], 1)))
+    out = xp.concatenate(parts, axis=-1)
+    left = xp.linalg.norm(gap - bend_path(out, cap), axis=-1).mean(axis=1)
+    return out, left, (xp.abs(raw) > 1.0).mean(axis=(1, 2))
 
 
 def bender_features(
@@ -782,6 +955,7 @@ __all__ = [
     "scene_clearances",
     "scene_features",
     "scene_heading",
+    "pop_up_poles",
     "selector_features",
     "staged_layout",
     "track_library",
