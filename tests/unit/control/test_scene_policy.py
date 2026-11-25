@@ -42,19 +42,24 @@ from lsy_drone_racing.utils.scene_policy import (
     BEND_POINTS,
     BENDER_DIM,
     OBS_DIM,
-    SIDE_ACCEL,
+    TEACH_AHEAD,
     GuideLibrary,
     advance_scene_guide,
     bend_offset,
+    bend_path,
     bender_features,
     closest_frame_point,
+    joined_bead,
     make_bend,
+    pop_up_poles,
+    replanned_gap,
     reveal_order,
     scene_action,
     scene_clearances,
     scene_features,
     scene_heading,
     staged_layout,
+    teacher_bend,
     zero_bend,
 )
 
@@ -353,23 +358,18 @@ def test_a_bend_from_the_drone_starts_there_and_leaves_along_its_velocity():
     assert offsets[-1] == pytest.approx(np.zeros(3))
 
 
-def test_a_bend_keeps_the_offset_from_the_planned_guide_and_moves_what_lies_ahead():
+def test_a_bend_moves_the_guide_where_the_drone_is_and_what_lies_ahead():
     lib = _library()
-    pos = np.array([[-2.5, 0.1, 1.1]])
-    bend = make_bend(
-        np.zeros((1, BEND_DIM)),
-        0.3,
-        pos,
-        np.array([[2.0, 0.3, -0.1]]),
-        np.array([50]),
-        np.array([0]),
-        lib,
-        from_drone=True,
-    )
+    u = np.zeros((1, BEND_DIM))
+    u[0, len(BEND_POINTS)] = 1.0 / 3.0  # sideways 0.1 m at the drone's own bead
+    pos = np.array([[-2.5, 0.1, 1.0]])
+    bend = make_bend(u, 0.3, pos, np.array([[2.0, 0.0, 0.0]]), np.array([50]), np.array([0]), lib)
     first = 3 + 3 + 9 + ACT_DIM
     plain, bent = _features(lib, 0.0), _features(lib, 0.0, bend)
-    assert bent[0, first : first + 3] == pytest.approx(plain[0, first : first + 3])
-    # The nearest point ahead (4 beads) starts at the drone, so it lies closer than on the guide.
+    # `_features` places the drone 0.1 m to the side of the planned guide and 0.1 m above it: the
+    # bent guide runs under it.
+    assert plain[0, first : first + 3] == pytest.approx([0.0, 0.1, 0.1], abs=1e-6)
+    assert bent[0, first : first + 3] == pytest.approx([0.0, 0.0, 0.1], abs=1e-6)
     near = slice(first + 3, first + 6)
     assert np.linalg.norm(bent[0, near] - [0.2, 0.0, 0.0]) < np.linalg.norm(
         plain[0, near] - [0.2, 0.0, 0.0]
@@ -377,27 +377,25 @@ def test_a_bend_keeps_the_offset_from_the_planned_guide_and_moves_what_lies_ahea
 
 
 def test_control_points_set_the_offsets_and_fade_out():
+    count = len(BEND_POINTS)
     u = np.zeros(BEND_DIM)
-    u[2] = 1.0  # sideways, at the third control point
-    u[4 + 3] = -0.5  # down, at the fourth
+    u[2] = 1.0  # forward, at the third control point
+    u[count + 2] = 1.0  # sideways, at the third
+    u[2 * count + 3] = -0.5  # down, at the fourth
     u[-1] = 1.0
     bend = _bend(u, [-2.5, 0.0, 1.0], [1.0, 0.0, 0.0])
     third, fourth = 50 + BEND_POINTS[2], 50 + BEND_POINTS[3]
-    offsets = bend_offset(bend, np.array([[third, fourth, 50 + BEND_FADE]]))[0]
-    assert offsets[0] == pytest.approx([0.0, 0.3, 0.0])
-    assert offsets[1] == pytest.approx([0.0, 0.0, -0.15])
-    assert offsets[2] == pytest.approx(np.zeros(3))
+    offsets = bend_offset(bend, np.array([[50, third, fourth, 50 + BEND_FADE]]))[0]
+    assert offsets[0] == pytest.approx(np.zeros(3))
+    assert offsets[1] == pytest.approx([0.3, 0.3, 0.0])
+    assert offsets[2] == pytest.approx([0.0, 0.0, -0.15])
+    assert offsets[3] == pytest.approx(np.zeros(3))
     assert bend.scale[0] == pytest.approx(1.3)
 
 
-def test_no_offset_exceeds_what_the_drone_can_reach():
-    speed = 8.0
-    bend = _bend(np.ones(BEND_DIM), [-2.5, 0.0, 1.0], [speed, 0.0, 0.0])
-    seconds = np.array(BEND_POINTS) * 0.05 / speed
-    reach = 0.5 * SIDE_ACCEL * seconds**2
-    side = np.abs(bend.points[0, :, 1])
-    assert np.all(side <= np.minimum(reach, 0.3) + 1e-9)
-    assert side[0] < 0.3
+def test_no_offset_exceeds_the_limit():
+    bend = _bend(np.full(BEND_DIM, 5.0), [-2.5, 0.0, 1.0], [8.0, 0.0, 0.0], limit=0.2)
+    assert np.all(np.abs(bend.points) <= 0.2 + 1e-9)
 
 
 def test_the_bend_and_the_bender_inputs_agree_between_numpy_and_jax():
@@ -430,3 +428,89 @@ def test_the_bend_and_the_bender_inputs_agree_between_numpy_and_jax():
     assert np.allclose(x, np.asarray(y), atol=1e-4)
     # The flags: the next gate (gate 1, after one pass) is unseen, the one after it too.
     assert x[0, -4:-2].tolist() == [0.0, 0.0]
+
+
+def _two_guides(beads: np.ndarray, crossings: list[int]) -> GuideLibrary:
+    """Return the straight library with a second row: guide ``beads`` passing at ``crossings``."""
+    lib = _library()
+    return lib._replace(
+        beads=np.concatenate((lib.beads, beads[None])),
+        speeds=np.ones((2, 200)),
+        velocities=np.tile(lib.velocities, (2, 1, 1)),
+        quats=np.tile(lib.quats, (2, 1, 1)),
+        crossings=np.array([lib.crossings[0], crossings]),
+        starts=np.tile(lib.starts, (2, 1)),
+        gates_pos=np.tile(lib.gates_pos, (2, 1, 1)),
+        gates_rpy=np.tile(lib.gates_rpy, (2, 1, 1)),
+        poles=np.tile(lib.poles, (2, 1, 1)),
+    )
+
+
+def _teach(lib: GuideLibrary, reached: int, xp: object = np) -> tuple:
+    if xp is jnp:
+        lib = GuideLibrary(*(jnp.asarray(v) for v in lib))
+    pos, vel = xp.asarray([[-2.5, 0.0, 1.0]]), xp.asarray([[2.0, 0.0, 0.0]])
+    index, passed, rows = xp.asarray([50]), xp.asarray([1]), xp.asarray([0])
+    return teacher_bend(0.3, pos, vel, index, passed, rows, xp.asarray([reached]), lib)
+
+
+def test_the_teacher_does_not_bend_a_guide_onto_itself():
+    lib = _two_guides(_library().beads[0], [40, 100])
+    u, left, clipped = _teach(lib, 0)
+    assert np.allclose(u, 0.0) and left[0] == pytest.approx(0.0) and clipped[0] == 0.0
+
+
+def test_a_drone_joins_the_other_guide_at_its_nearest_bead():
+    # The second guide is the first one 10 beads later.
+    later = np.concatenate((np.repeat(_library().beads[0, :1], 10, axis=0), _library().beads[0]))
+    lib = _two_guides(later[:200], [50, 110])
+    pos = np.array([[-2.5, 0.02, 1.0]])  # bead 50 of the first guide, bead 60 of the second
+    assert joined_bead(pos, np.array([50]), np.array([1]), np.array([1]), lib).tolist() == [60]
+
+
+def test_the_teacher_bends_the_guide_onto_a_shifted_one():
+    shift = np.array([0.0, 0.1, 0.05])
+    lib = _two_guides(_library().beads[0] + shift, [40, 100])
+    u, left, clipped = _teach(lib, 1)
+    assert clipped[0] == 0.0 and u[0, -1] == 0.0  # the speed scale isn't taught
+    assert left[0] == pytest.approx(0.0, abs=1e-6)
+    vel, index, rows = np.array([[2.0, 0.0, 0.0]]), np.array([50]), np.array([0])
+    pos, passed = np.array([[-2.5, 0.0, 1.0]]), np.array([1])
+    gap, cap = replanned_gap(0.3, pos, vel, index, passed, rows, np.array([1]), lib)
+    assert np.allclose(gap[0], shift)  # the guide runs along x: its frame is the world's
+    # The bend `make_bend` makes carries the guide onto the other, from the drone's bead on.
+    bend = make_bend(u, 0.3, pos, vel, index, rows, lib)
+    offsets = bend_offset(bend, index[:, None] + TEACH_AHEAD)[0]
+    assert np.allclose(offsets, shift, atol=1e-9)
+    assert np.allclose(bend_path(u, cap)[0], offsets, atol=1e-9)
+    ju, jleft, _ = _teach(lib, 1, jnp)
+    assert np.allclose(u, np.asarray(ju), atol=1e-5)
+    assert float(jleft[0]) == pytest.approx(0.0, abs=1e-5)
+
+
+def test_the_frame_follows_the_bent_guide():
+    count = len(BEND_POINTS)
+    u = np.zeros(BEND_DIM)
+    u[count + 2] = 1.0  # 0.3 m to the left at the third control point, 20 beads (1 m) on
+    bend = _bend(u, [-2.5, 0.0, 1.0], [2.0, 0.0, 0.0])
+    lib = _library()
+    c, s = scene_heading(np.array([50]), np.array([0]), lib)
+    assert (c[0], s[0]) == pytest.approx((1.0, 0.0))
+    c, s = scene_heading(np.array([50]), np.array([0]), lib, bend)
+    # The chord of 20 beads now leads 1 m on and 0.3 m to the left.
+    assert np.arctan2(s[0], c[0]) == pytest.approx(np.arctan2(0.3, 1.0))
+
+
+def test_pop_up_poles_move_onto_the_guide_within_the_shift():
+    beads = np.c_[np.linspace(0.0, 3.0, 61), np.zeros(61), np.ones(61)]
+    # One pole 0.1 m beside the guide, one 0.4 m beside it.
+    poles = np.array([[1.0, 0.1, 1.5], [2.0, -0.4, 1.5]])
+    shift = np.array([0.15, 0.15, 0.05])
+    true = pop_up_poles(beads, poles, shift, np.random.default_rng(0), share=1.0)
+    assert abs(true[0, 1]) <= 0.02  # within reach: lands on the guide
+    np.testing.assert_allclose(true[1, 1], -0.25)  # out of reach: as close as the shift allows
+    assert np.all(np.abs(true - poles) <= shift + 1e-12)
+    # No share draws the race's shifts, with the same random numbers as before.
+    rng = np.random.default_rng(1)
+    expected = poles + np.random.default_rng(1).uniform(-shift, shift, poles.shape)
+    np.testing.assert_allclose(pop_up_poles(beads, poles, shift, rng, share=0.0), expected)

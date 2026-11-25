@@ -9,13 +9,16 @@ import pytest
 from ml_collections import ConfigDict
 
 from lsy_drone_racing.control.rl_scene import (
+    DEFAULT_STYLE_SET,
     SHIFTED_RACE_DEFAULTS,
+    STYLE_SETS,
     RLScene,
     _controller_settings,
     _index_between_gates,
     _reported_track,
     _revealed,
 )
+from lsy_drone_racing.utils.path_policy import PathPolicy
 from lsy_drone_racing.utils.race_policy import RUN_OUT_BEADS
 
 
@@ -146,6 +149,17 @@ def test_the_style_selector_needs_the_runtime_planner_and_no_single_policy():
     section = {"style_selector": True, "guide_planner": "fast_runtime", "policy": "other.npz"}
     config = ConfigDict({"controller": section, "env": {"track": {}}})
     with pytest.raises(ValueError, match="style_policies"):
+        RLScene(_obs((False, False), (False,)), {}, config)
+
+
+def test_stable_styles_fly_by_default_and_fast_ones_on_request():
+    assert DEFAULT_STYLE_SET == "stable"
+    for files in STYLE_SETS.values():
+        # Every installed style loads and reads the same inputs as the selector expects.
+        assert len({PathPolicy(f).mean.shape for f in files}) == 1
+    section = {"style_selector": True, "guide_planner": "fast_runtime", "style_set": "quick"}
+    config = ConfigDict({"controller": section, "env": {"track": {}}})
+    with pytest.raises(ValueError, match="style_set"):
         RLScene(_obs((False, False), (False,)), {}, config)
 
 

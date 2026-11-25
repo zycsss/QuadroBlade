@@ -73,6 +73,7 @@ from lsy_drone_racing.utils.scene_policy import (  # noqa: E402
     GuideLibrary,
     StagedScenarios,
     advance_scene_guide,
+    joined_bead,
     load_library,
     load_staged_library,
     scene_action,
@@ -120,7 +121,9 @@ class SceneEnv:
     """Many drones in one simulator, each on a track of a library, as pure functions.
 
     With ``staged`` scenarios, gates and poles take a scenario's true poses, and a drone flies the
-    guide of the stage its reveals have reached: the guide flight plans again at every reveal.
+    guide of the stage its reveals have reached: the guide flight plans again at every reveal. With
+    ``cfg["replan"]`` false it keeps the stage-0 guide, planned through the layout as reported, for
+    the whole episode, while gates and poles are still where they truly are.
     """
 
     def __init__(
@@ -213,7 +216,7 @@ class SceneEnv:
         of the stage reached by then, at the same share of its length.
         """
         along, index, passed = self._start_along_guide(key, rows, gate_shift)
-        if self.staged is None:
+        if self.staged is None or not self.cfg.get("replan", True):
             return along, index, passed, rows
         lib = self.lib
         stage = (self.staged.entry[scenario] <= index[:, None]).sum(axis=1)
@@ -224,6 +227,23 @@ class SceneEnv:
         passed = (lib.crossings[moved] <= mapped[:, None]).sum(axis=1)
         along = along - lib.beads[rows, index] + lib.beads[moved, mapped]
         return along, mapped, passed, moved
+
+    def _stage_rows(self, scenario: jax.Array, seen: jax.Array) -> jax.Array:
+        """Return the rows of the stages that reveals ``seen`` reach, counted in reveal order."""
+        st = self.staged
+        in_order = jnp.take_along_axis(seen, st.order[scenario], axis=1).astype(jnp.int32)
+        return scenario * st.stages + jnp.cumprod(in_order, axis=1).sum(axis=1)
+
+    def reached_rows(self, state: SceneState) -> jax.Array:
+        """Return the guide flight would fly after replanning at every reveal so far.
+
+        With ``cfg["replan"]`` that is the guide the drone flies. Without it, the drone keeps the
+        stage-0 guide, and this is the guide a teacher bends it towards.
+        """
+        if self.staged is None:
+            return state.rows
+        seen = jnp.concatenate((state.seen_gates, state.seen_poles), axis=1)
+        return self._stage_rows(state.scenario, seen)
 
     def _follow_reveals(
         self,
@@ -240,15 +260,8 @@ class SceneEnv:
         drone joins the new guide at its nearest bead close to where it was, between its last and
         its next pass.
         """
-        st, lib, n = self.staged, self.lib, self.n
-        in_order = jnp.take_along_axis(seen, st.order[scenario], axis=1).astype(jnp.int32)
-        new_rows = scenario * st.stages + jnp.cumprod(in_order, axis=1).sum(axis=1)
-        count = lib.sequence.shape[0]
-        low = jnp.where(passed > 0, lib.crossings[new_rows, jnp.maximum(passed - 1, 0)], 0)
-        high = lib.crossings[new_rows, jnp.minimum(passed, count - 1)]
-        window = jnp.clip(index[:, None] + jnp.arange(-40, 81), low[:, None], high[:, None])
-        d = jnp.linalg.norm(lib.beads[new_rows[:, None], window] - pos[:, None], axis=2)
-        joined = window[jnp.arange(n), d.argmin(axis=1)]
+        new_rows = self._stage_rows(scenario, seen)
+        joined = joined_bead(pos, index, passed, new_rows, self.lib)
         return new_rows, jnp.where(new_rows != rows, joined, index)
 
     def reset(
@@ -316,7 +329,14 @@ class SceneEnv:
         index = jnp.where(on_ground, 0, index)
         passed = jnp.where(on_ground, 0, passed)
         if staged is not None:
-            flown = jnp.where(on_ground, rows + (staged.entry[scenario] <= 0).sum(axis=1), flown)
+            # The stage reached by the start: what the sensor has revealed by then.
+            reached = jnp.where(
+                on_ground,
+                (staged.entry[scenario] <= 0).sum(axis=1),
+                (staged.entry[scenario] <= index[:, None]).sum(axis=1),
+            )
+            replan = self.cfg.get("replan", True)
+            flown = jnp.where(on_ground, rows + reached, flown) if replan else rows
         else:
             flown = rows
 
@@ -359,7 +379,7 @@ class SceneEnv:
         seen_gates, seen_poles = self._in_range(pos, gates_pos, poles)
         if staged is not None:
             # A start along the guide has passed everything its stage knows.
-            known = staged.rank[scenario] < (flown - rows)[:, None]
+            known = staged.rank[scenario] < reached[:, None]
             seen_gates = seen_gates | known[:, :gates]
             seen_poles = seen_poles | known[:, gates:]
         return SceneState(
@@ -436,8 +456,8 @@ class SceneEnv:
             bend,
         )
 
-    def step(self, state: SceneState, u: jax.Array) -> tuple:
-        """Advance one control step.
+    def step(self, state: SceneState, u: jax.Array, bend: Any = None) -> tuple:
+        """Advance one control step, with output ``u`` in the frame of the guide, or of its bend.
 
         Returns:
             The new state, the reward, terminated (crash or finish), truncated and the statistics of
@@ -445,7 +465,7 @@ class SceneEnv:
         """
         cfg, lib = self.cfg, self.lib
         u = jnp.clip(u, -1.0, 1.0)
-        c, s = scene_heading(state.index, state.rows, lib)
+        c, s = scene_heading(state.index, state.rows, lib, bend)
         action = scene_action(u, c, s)
         data = F.attitude_control(state.data, action[:, None])
         data = self.sim._step(data, n_steps=SUBSTEPS)
@@ -519,7 +539,7 @@ class SceneEnv:
         gates_now, poles_now = self._in_range(pos, state.gates_pos, state.poles)
         seen_gates, seen_poles = state.seen_gates | gates_now, state.seen_poles | poles_now
         rows = state.rows
-        if self.staged is not None:
+        if self.staged is not None and self.cfg.get("replan", True):
             seen = jnp.concatenate((seen_gates, seen_poles), axis=1)
             rows, index = self._follow_reveals(state.scenario, rows, index, passed, pos, seen)
         new = state._replace(

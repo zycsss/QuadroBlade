@@ -57,12 +57,18 @@ from lsy_drone_racing.utils.scene_policy import (  # noqa: E402
     OBS_DIM,
     Bend,
     bend_offset,
+    bend_path,
     bender_features,
     load_staged_library,
     make_bend,
+    replanned_gap,
     scene_clearances,
+    teacher_bend,
     zero_bend,
 )
+
+#: Offset from the replanned guide that costs an imitation weight of 1 [m].
+PATH_SCALE = 0.1
 
 
 class Scaling(NamedTuple):
@@ -126,16 +132,46 @@ def value(net: dict, x: jax.Array) -> jax.Array:
 
 
 def ppo_loss(
-    net: dict, batch: dict, clip: float, log_std_min: float, actor_scale: jax.Array
+    net: dict,
+    batch: dict,
+    clip: float,
+    log_std_min: float,
+    actor_scale: jax.Array,
+    imitate: jax.Array = 0.0,
 ) -> jax.Array:
-    """Return PPO's clipped objective and value loss; an ``actor_scale`` of 0 trains the critic."""
+    """Return PPO's clipped objective and value loss; an ``actor_scale`` of 0 trains the critic.
+
+    With ``gap`` and ``cap`` in the batch, ``imitate`` weighs how far the bend of the actor's mean
+    leaves the guide from the replanned one (`replanned_gap`): per `PATH_SCALE`, squared, and
+    averaged over the beads the bend covers.
+    """
     log_std = jnp.maximum(net["log_std"], log_std_min)
     mean = forward(net["actor"], batch["obs"])
     ratio = jnp.exp(log_prob(mean, log_std, batch["act"]) - batch["logp"])
     adv = (batch["adv"] - batch["adv"].mean()) / (batch["adv"].std() + 1e-8)
     pg = -jnp.mean(jnp.minimum(ratio * adv, jnp.clip(ratio, 1 - clip, 1 + clip) * adv))
     vf = 0.5 * jnp.mean((value(net, batch["obs"]) - batch["ret"]) ** 2)
-    return actor_scale * pg + 0.5 * vf
+    loss = actor_scale * pg + 0.5 * vf
+    if "gap" in batch:
+        miss = bend_path(jnp.clip(mean, -1.0, 1.0), batch["cap"]) - batch["gap"]
+        loss = loss + imitate * jnp.mean(jnp.sum(miss**2, axis=-1)) / PATH_SCALE**2
+    return loss
+
+
+def revealed_closeness(state: Any, lib: Any, margin: float, far: float) -> jax.Array:
+    """Return how close drones are to what has been revealed, summed over poles and gate frames.
+
+    Each counts 0 at ``far`` and beyond, rising linearly to 1 at ``margin``.
+    """
+    s = state.data.states
+    poles, frames = scene_clearances(
+        body_center(s.pos[:, 0], s.quat[:, 0]), state.gates_pos, state.gates_rot, state.poles, lib
+    )
+
+    def near(d: jax.Array, seen: jax.Array) -> jax.Array:
+        return jnp.where(seen, jnp.clip((far - d) / (far - margin), 0.0, 1.0), 0.0).sum(axis=1)
+
+    return near(poles, state.seen_poles) + near(frames, state.seen_gates)
 
 
 def where_bend(mask: jax.Array, a: Bend, b: Bend) -> Bend:
@@ -204,6 +240,8 @@ def make_train_step(
     """Return one compiled iteration: ``horizon`` decisions in every world, then both updates."""
     hold, horizon = cfg["hold"], cfg["horizon"]
     gamma, lam, log_std_min = cfg["gamma"], cfg["lam"], cfg["log_std_min"]
+    bender_gamma = cfg["bender_gamma"]
+    teach = cfg["imitate"] > 0.0
     grad = jax.grad(ppo_loss)
 
     def decide(c: tuple, _: None) -> tuple:
@@ -219,9 +257,14 @@ def make_train_step(
         ub = mean_b + jnp.exp(log_std_b) * jax.random.normal(k_b, mean_b.shape)
         lp_b, v_b = log_prob(mean_b, log_std_b, ub), value(bender, xb)
         state = carry.state
-        bend = make_bend(
-            ub, limit, pos, vel, state.index, state.rows, env.lib, cfg["from_drone"]
-        )
+        bend = make_bend(ub, limit, pos, vel, state.index, state.rows, env.lib, cfg["from_drone"])
+        if teach:
+            reached = env.reached_rows(state)
+            target = replanned_gap(
+                limit, pos, vel, state.index, state.passed, state.rows, reached, env.lib
+            )
+        else:
+            target = ()
 
         def tick(t: tuple, k: jax.Array) -> tuple:
             state, bend, bend_u, ret, disc, done, stats = t
@@ -232,15 +275,19 @@ def make_train_step(
             log_std_t = jnp.maximum(tracker["log_std"], log_std_min)
             a = mean_t + jnp.exp(log_std_t) * jax.random.normal(k_a, mean_t.shape)
             lp_t, v_t = log_prob(mean_t, log_std_t, a), value(tracker, xt)
-            new, r, term, trunc, step_stats = env.step(state, a)
+            new, r, term, trunc, step_stats = env.step(state, a, bend)
             r = jnp.nan_to_num(r)
             p = new.data.states.pos[:, 0]
             on_bend = env.lib.beads[new.rows, new.index] + bend_offset(bend, new.index)
             away = jnp.minimum(jnp.linalg.norm(p - on_bend, axis=-1), 0.5)
             r_t = jnp.nan_to_num(r - follow * away)
+            r_b = r
+            if cfg["clearance"] > 0.0:
+                near = revealed_closeness(new, env.lib, cfg["hit_margin"], cfg["clearance_far"])
+                r_b = r - cfg["clearance"] * near
             ended = term | trunc
-            ret = ret + jnp.where(done, 0.0, disc * r)
-            disc = disc * gamma
+            ret = ret + jnp.where(done, 0.0, disc * r_b)
+            disc = disc * bender_gamma
             stats = jax.tree.map(jnp.add, stats, step_stats)
             # A new guide (a reveal's stage) or episode drops the bend until the next decision.
             moved = new.rows != state.rows
@@ -264,11 +311,17 @@ def make_train_step(
             tick, start, jax.random.split(k_ticks, hold)
         )
         carry = Carry(state, bend, bend_u)
-        out = (xb, ub, lp_b, v_b, ret, done.astype(jnp.float32))
+        out = (xb, ub, lp_b, v_b, ret, done.astype(jnp.float32), target)
         return (params, norm, carry, sched, stats, key), (out, track)
 
     def update(
-        net: dict, opt: Any, tx: Any, data: dict, key: jax.Array, actor_scale: jax.Array
+        net: dict,
+        opt: Any,
+        tx: Any,
+        data: dict,
+        key: jax.Array,
+        actor_scale: jax.Array,
+        imitate: jax.Array = 0.0,
     ) -> tuple:
         size = data["obs"].shape[0]
         batch = size // cfg["minibatches"]
@@ -279,7 +332,7 @@ def make_train_step(
             def minibatch(c: tuple, idx: jax.Array) -> tuple:
                 net, opt = c
                 part = {name: v[idx] for name, v in data.items()}
-                g = grad(net, part, cfg["clip"], log_std_min, actor_scale)
+                g = grad(net, part, cfg["clip"], log_std_min, actor_scale, imitate)
                 updates, opt = tx.update(g, opt, net)
                 return (optax.apply_updates(net, updates), opt), None
 
@@ -298,7 +351,7 @@ def make_train_step(
         sched: jax.Array,
     ) -> tuple:
         c = (params, norm, carry, sched, stats, key)
-        c, ((xb, ub, lp_b, v_b, ret_b, done_b), track) = jax.lax.scan(
+        c, ((xb, ub, lp_b, v_b, ret_b, done_b, target), track) = jax.lax.scan(
             decide, c, None, length=horizon
         )
         params, norm, carry, _, stats, key = c
@@ -310,7 +363,7 @@ def make_train_step(
         adv_t, ret_t = _gae(r_t, v_t, done_t, last_t, gamma, lam)
         obs_b, _, _ = _bender_input(env, carry)
         last_b = value(params["bender"], normalize(obs_b, norm))
-        adv_b, target_b = _gae(ret_b, v_b, done_b, last_b, gamma**hold, lam)
+        adv_b, target_b = _gae(ret_b, v_b, done_b, last_b, bender_gamma**hold, lam)
         key, k_b, k_t = jax.random.split(key, 3)
         bender_data = {
             "obs": xb.reshape(-1, BENDER_DIM),
@@ -319,6 +372,10 @@ def make_train_step(
             "adv": adv_b.ravel(),
             "ret": target_b.ravel(),
         }
+        if teach:
+            gap, cap = target
+            bender_data["gap"] = gap.reshape(-1, *gap.shape[2:])
+            bender_data["cap"] = cap.reshape(-1, cap.shape[-1])
         tracker_data = {
             "obs": xt.reshape(-1, OBS_DIM),
             "act": a.reshape(-1, ACT_DIM),
@@ -326,7 +383,9 @@ def make_train_step(
             "adv": adv_t.ravel(),
             "ret": ret_t.ravel(),
         }
-        bender, opt_b = update(params["bender"], opts[0], tx_bender, bender_data, k_b, 1.0)
+        bender, opt_b = update(
+            params["bender"], opts[0], tx_bender, bender_data, k_b, 1.0, sched[3]
+        )
         tracker, opt_t = update(params["tracker"], opts[1], tx_tracker, tracker_data, k_t, sched[2])
         params = {"bender": bender, "tracker": tracker}
         return params, (opt_b, opt_t), norm, carry, stats, key
@@ -334,8 +393,14 @@ def make_train_step(
     return train_step
 
 
-def make_lap_check(env: SceneEnv, scaling: Scaling, cfg: dict, decisions: int) -> Any:
-    """Return compiled laps from the ground at rest, both networks without noise."""
+def make_lap_check(
+    env: SceneEnv, scaling: Scaling, cfg: dict, decisions: int, teacher: bool = False
+) -> Any:
+    """Return compiled laps from the ground at rest, both networks without noise.
+
+    With ``teacher`` the bends are the teacher's (`teacher_bend`) in place of the bender's, and the
+    laps also report the offset the teacher's bends leave and the share of their points clipped.
+    """
     hold = cfg["hold"]
 
     def lap(params: dict, norm: Norm, key: jax.Array, limit: jax.Array) -> dict:
@@ -343,19 +408,27 @@ def make_lap_check(env: SceneEnv, scaling: Scaling, cfg: dict, decisions: int) -
         carry = Carry(state, zero_bend(state.index), jnp.zeros((env.n, BEND_DIM)))
 
         def decide(c: tuple, d: jax.Array) -> tuple:
-            carry, gone, finish_time, gates, least, size = c
+            carry, gone, finish_time, gates, least, size, fit = c
             obs, pos, vel = _bender_input(env, carry)
-            ub = forward(params["bender"]["actor"], normalize(obs, norm))
             state = carry.state
+            if teacher:
+                reached = env.reached_rows(state)
+                ub, left, clipped = teacher_bend(
+                    limit, pos, vel, state.index, state.passed, state.rows, reached, env.lib
+                )
+                fit = fit + jnp.where(gone[:, None], 0.0, jnp.stack((left, clipped), axis=1))
+            else:
+                ub = forward(params["bender"]["actor"], normalize(obs, norm))
             bend = make_bend(
-            ub, limit, pos, vel, state.index, state.rows, env.lib, cfg["from_drone"]
-        )
+                ub, limit, pos, vel, state.index, state.rows, env.lib, cfg["from_drone"]
+            )
             size = size + jnp.where(gone, 0.0, jnp.linalg.norm(bend.points, axis=-1).mean(axis=1))
 
             def tick(t: tuple, k: jax.Array) -> tuple:
                 state, bend, gone, finish_time, gates, least = t
                 x = tracker_input(env.observe(state, bend), scaling)
-                new, _, term, trunc, _ = env.step(state, forward(params["tracker"]["actor"], x))
+                a = forward(params["tracker"]["actor"], x)
+                new, _, term, trunc, _ = env.step(state, a, bend)
                 s = new.data.states
                 poles, frames = scene_clearances(
                     body_center(s.pos[:, 0], s.quat[:, 0]),
@@ -377,22 +450,34 @@ def make_lap_check(env: SceneEnv, scaling: Scaling, cfg: dict, decisions: int) -
                 tick, t0, jnp.arange(hold)
             )
             carry = Carry(state, bend, jnp.clip(ub, -1.0, 1.0))
-            return (carry, gone, finish_time, gates, least, size), None
+            return (carry, gone, finish_time, gates, least, size, fit), None
 
         zeros = jnp.zeros(env.n)
-        start = (carry, zeros.astype(bool), zeros, zeros.astype(jnp.int32), zeros + 9.0, zeros)
-        (_, _, finish_time, gates, least, size), _ = jax.lax.scan(
+        start = (
+            carry,
+            zeros.astype(bool),
+            zeros,
+            zeros.astype(jnp.int32),
+            zeros + 9.0,
+            zeros,
+            jnp.zeros((env.n, 2)),
+        )
+        (_, _, finish_time, gates, least, size, fit), _ = jax.lax.scan(
             decide, start, jnp.arange(decisions)
         )
         finished = finish_time > 0
         laps = jnp.maximum(finished.sum(), 1)
-        return {
+        out = {
             "finish": finished.mean(),
             "time": jnp.sum(finish_time) / laps,
             "gates": gates.mean(),
             "clearance": jnp.sum(jnp.where(finished, least, 0.0)) / laps,
             "bend": size.mean() / decisions,
         }
+        if teacher:
+            out["fit_left"] = fit[:, 0].mean() / decisions
+            out["clipped"] = fit[:, 1].mean() / decisions
+        return out
 
     return jax.jit(lap)
 
@@ -451,6 +536,13 @@ def main(
     follow_start: float = 1.0,
     follow_end: float = 0.2,
     from_drone: bool = False,
+    replan: bool = True,
+    imitate: float = 0.0,
+    imitate_fade: int = 1000,
+    clearance: float = 0.0,
+    clearance_far: float = 0.15,
+    bender_gamma: float | None = None,
+    teacher_check: bool = False,
     tracker_std: float = 0.1,
     log_std_min: float = -2.3,
     hidden: tuple[int, ...] = (128, 128),
@@ -491,6 +583,18 @@ def main(
         follow_start: The tracker's cost per metre from the bent guide, per step, at the start.
         follow_end: That cost at the end.
         from_drone: Start every bend at the drone, along its velocity, instead of on the guide.
+        replan: Fly the guide of the stage that the reveals have reached, as flight does when it
+            replans at every reveal. False keeps the guide planned through the layout as reported
+            for the whole episode, so that only the bender adapts to what is revealed.
+        imitate: Weight of how far the bender's bend leaves the guide from the one replanned at
+            every reveal so far, over the beads the bend covers (`replanned_gap`). It fades
+            linearly to 0 by ``imitate_fade`` iterations. Needs ``replan=False``.
+        imitate_fade: Iterations over which the imitation fades out.
+        clearance: Weight of the bender's local cost for closeness to what has been revealed: per
+            pole and gate frame, 0 at ``clearance_far`` and beyond, 1 at the hit margin.
+        clearance_far: Distance at which that cost starts [m].
+        bender_gamma: The bender's discount per control step; the tracker's ``gamma`` if None.
+        teacher_check: Only fly the validation laps with the teacher's bends, print them and stop.
         tracker_std: Action noise of the tracker at the start.
         log_std_min: Floor on the log of both networks' action noise.
         hidden: Hidden layers of the bender.
@@ -504,6 +608,8 @@ def main(
     """
     if style not in STYLES:
         raise ValueError(f"style must be one of {tuple(STYLES)}")
+    if (imitate > 0.0 or teacher_check) and replan:
+        raise ValueError("the teacher bends a guide planned once: pass --replan=False")
     race = load_config(Path(__file__).parents[1] / "config" / "level2.toml")
     reference = build_track(race.env.track)
     libraries, scenarios = {}, {}
@@ -536,6 +642,11 @@ def main(
             minibatches=minibatches,
             log_std_min=log_std_min,
             from_drone=from_drone,
+            replan=replan,
+            imitate=imitate,
+            clearance=clearance,
+            clearance_far=clearance_far,
+            bender_gamma=gamma if bender_gamma is None else bender_gamma,
         )
         | STYLES[style]
     )
@@ -568,6 +679,18 @@ def main(
             init, tracker, tuple(hidden), tuple(critic_hidden), tracker_std
         )
         check = make_lap_check(check_env, scaling, cfg, 1000 // hold)
+        if teacher_check:
+            taught = make_lap_check(check_env, scaling, cfg, 1000 // hold, teacher=True)
+            for limit in (limit_end, 1.0):
+                lap = jax.device_get(taught(params, Norm(0, 1, 1), base, jnp.asarray(limit)))
+                lap = {k: float(v) for k, v in lap.items()}
+                print(
+                    f"teacher, limit {limit * 100:.0f} cm: {lap['finish'] * 100:5.1f}%"
+                    f" {lap['gates']:.2f}g {lap['time']:.2f}s {lap['clearance'] * 100:.1f}cm"
+                    f" bend {lap['bend'] * 100:.1f}cm left {lap['fit_left'] * 100:.1f}cm"
+                    f" clipped {lap['clipped'] * 100:.1f}%",
+                    flush=True,
+                )
         tx_bender = optax.chain(optax.clip_by_global_norm(0.5), optax.adam(lr, eps=1e-5))
         tx_tracker = optax.chain(optax.clip_by_global_norm(0.5), optax.adam(tracker_lr, eps=1e-5))
         opts = (tx_bender.init(params["bender"]), tx_tracker.init(params["tracker"]))
@@ -586,13 +709,16 @@ def main(
             f" score {style_score(style, unbent):.2f}",
             flush=True,
         )
+        if teacher_check:
+            return
         timer = time.time()
         for it in range(iterations + 1):
             ramp = min(it / max(limit_ramp, 1), 1.0)
             limit = limit_start + (limit_end - limit_start) * ramp
             follow = follow_start + (follow_end - follow_start) * min(it / iterations, 1.0)
             actor = 0.0 if it < bender_only else 1.0
-            sched = jnp.asarray([limit, follow, actor])
+            taught = imitate * max(1.0 - it / max(imitate_fade, 1), 0.0)
+            sched = jnp.asarray([limit, follow, actor, taught])
             params, opts, norm, carry, stats, key = train_step(
                 params, opts, norm, carry, stats, key, sched
             )

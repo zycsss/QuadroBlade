@@ -30,8 +30,10 @@ with ``rl_scene.npz``. Setting ``guide_planner``, ``policy``, ``replan_on_reveal
 With ``controller.style_selector = true`` (runtime planner only) the controller flies three
 policies, ``speed_first``, ``middle_ground`` and ``safety_first``, and a selector trained by
 `scripts/train_style_selector.py` picks which one flies, every ``hold`` control steps, from the
-scene and what each style would command. ``controller.selector`` and ``controller.style_policies``
-point to other files.
+scene and what each style would command. ``controller.style_set`` chooses the styles:
+``"stable"`` (default), trained with poles that pop up on the guide when revealed, or ``"fast"``,
+the earlier set, which finishes fewer races but laps faster. Both fly under the same selector.
+``controller.selector`` and ``controller.style_policies`` point to other files.
 
 With ``controller.bender = true`` (runtime planner only) each policy flies with its own bender,
 trained with it by `scripts/train_bender.py`: every few steps the bender bends the guide ahead,
@@ -81,9 +83,18 @@ if TYPE_CHECKING:
 DEFAULT_POLICY = Path(__file__).parent / "rl_scene.npz"
 #: The policy trained on guides of the runtime planner.
 RUNTIME_POLICY = Path(__file__).parent / "rl_scene_runtime_guides.npz"
-#: The selector and the three styles it chooses from, in the order of `STYLE_NAMES`.
+#: The selector, which chooses between the three styles of either set.
 SELECTOR_POLICY = Path(__file__).parent / "rl_scene_style_selector.npz"
-STYLE_POLICIES = tuple(Path(__file__).parent / f"rl_scene_{name}.npz" for name in STYLE_NAMES)
+#: The two sets of three styles, each in the order of `STYLE_NAMES`, chosen with
+#: ``controller.style_set``. ``stable`` was trained with half the poles popping up on the guide in a
+#: third of its scenarios, and finishes more races; ``fast`` was not, and laps are quicker.
+STYLE_SETS = {
+    style_set: tuple(
+        Path(__file__).parent / f"rl_scene_{style_set}_{name}.npz" for name in STYLE_NAMES
+    )
+    for style_set in ("stable", "fast")
+}
+DEFAULT_STYLE_SET = "stable"
 #: The three styles trained together with a bender, and those benders.
 BENT_POLICIES = tuple(
     Path(__file__).parent / f"rl_scene_{name}_bent_tracker.npz" for name in STYLE_NAMES
@@ -218,7 +229,11 @@ class RLScene(Controller):
             file = section.get("selector", BENT_SELECTOR_POLICY if bent else SELECTOR_POLICY)
             self._hold = int(np.load(file)["hold"])
             self._selector = PathPolicy(file)
-            files = section.get("style_policies", BENT_POLICIES if bent else STYLE_POLICIES)
+            style_set = section.get("style_set", DEFAULT_STYLE_SET)
+            if style_set not in STYLE_SETS:
+                raise ValueError(f"style_set must be one of {tuple(STYLE_SETS)}")
+            styles = BENT_POLICIES if bent else STYLE_SETS[style_set]
+            files = section.get("style_policies", styles)
             benders = section.get("benders", BENDERS) if bent else (None,) * len(files)
             if len(files) != len(STYLE_NAMES) or len(benders) != len(STYLE_NAMES):
                 raise ValueError(f"style_policies needs one file per style of {STYLE_NAMES}")
@@ -391,13 +406,13 @@ class RLScene(Controller):
             {"ms": (time.perf_counter() - t0) * 1e3, "clear": clear, "revealed": sum(known)}
         )
         if clear:
-            self._library = library
             # A guide planned from the drone starts at it.
             self._index = (
                 np.zeros(1, dtype=int)
                 if self._from_state
                 else _index_between_gates(library, pos[0], passed)
             )
+            self._library = library
 
     def _select(self, x: NDArray, proposals: NDArray) -> NDArray:
         """Return the action of the style flying now, deciding again every ``hold`` steps."""
@@ -489,6 +504,8 @@ class RLScene(Controller):
         u = proposals[:, 0] if self._selector is None else self._select(x, proposals)
         self._tick += 1
         self.style_ticks[self._style] += 1
+        # The command is in the frame of the guide its pilot flies, bent or not.
+        pilot = self._pilots[0 if self._selector is None else self._style]
+        c, s = scene_heading(self._index, self._rows, lib, pilot.bend)
         self._previous = u.astype(np.float32)
-        c, s = scene_heading(self._index, self._rows, lib)
         return scene_action(u, c, s)[0].astype(np.float32)

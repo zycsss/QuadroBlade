@@ -11,6 +11,10 @@ The shifts are the race's: gates +-0.15 m in x and y, +-0.1 m in z, +-0.05, +-0.
 roll, pitch and yaw; poles +-0.15 m in x and y and +-0.05 m in z. A stage whose plan fails its check
 keeps the guide of the stage before, as flight does.
 
+With ``pop_up`` a share of the poles is not drawn at random but moved towards the stage-0 guide,
+as far as the shift allows (`pop_up_poles`). The sensor then reveals a pole standing on or next to
+the guide the drone is flying, the event behind most pole crashes in races.
+
 Example::
 
     $ pixi run -e gpu python scripts/solve_staged_library.py \
@@ -37,7 +41,7 @@ from scipy.spatial.transform import Rotation
 from lsy_drone_racing.control.topt_planner import Track
 from lsy_drone_racing.utils.fast_runtime_planner import runtime_plan
 from lsy_drone_racing.utils.race_policy import TAKEOFF_LIFT, TAKEOFF_SPEED, guide_arrays
-from lsy_drone_racing.utils.scene_policy import reveal_order, staged_layout
+from lsy_drone_racing.utils.scene_policy import pop_up_poles, reveal_order, staged_layout
 
 SEQUENCE = np.array([0, 1, 2, 3, 1])
 DIRECTIONS = np.ones(5)
@@ -66,9 +70,9 @@ def _plan(
     return trajectory, planned.clear
 
 
-def solve(job: tuple[dict, int, int]) -> tuple[list[dict], int]:
+def solve(job: tuple[dict, int, int, float]) -> tuple[list[dict], int]:
     """Return the scenarios of one track, and how many stage plans failed their check."""
-    layout, draws, seed = job
+    layout, draws, seed, pop_up = job
     nominal = (layout["gates_pos"], layout["gates_rpy"], layout["poles"])
     first, clear = _plan(*nominal, layout["start"])
     if not clear:
@@ -82,7 +86,7 @@ def solve(job: tuple[dict, int, int]) -> tuple[list[dict], int]:
         true = (
             layout["gates_pos"] + rng.uniform(-GATE_SHIFT, GATE_SHIFT, (gates, 3)),
             layout["gates_rpy"] + rng.uniform(-GATE_TURN, GATE_TURN, (gates, 3)),
-            layout["poles"] + rng.uniform(-POLE_SHIFT, POLE_SHIFT, (poles, 3)),
+            pop_up_poles(beads, layout["poles"], POLE_SHIFT, rng, pop_up),
         )
         plans = [first]
         for stage in range(1, gates + poles + 1):
@@ -96,7 +100,9 @@ def solve(job: tuple[dict, int, int]) -> tuple[list[dict], int]:
     return scenarios, failed
 
 
-def main(library: str, out: str, draws: int = 4, seed: int = 0, workers: int = 14):
+def main(
+    library: str, out: str, draws: int = 4, seed: int = 0, workers: int = 14, pop_up: float = 0.0
+):
     """Solve every track of a library under ``draws`` draws of shifts.
 
     Args:
@@ -105,11 +111,12 @@ def main(library: str, out: str, draws: int = 4, seed: int = 0, workers: int = 1
         draws: Draws of shifts per track.
         seed: Seed of the shifts.
         workers: Processes.
+        pop_up: Chance of every pole to be moved towards the stage-0 guide (`pop_up_poles`).
     """
     t0 = time.time()
     with np.load(library) as data:
         layouts = [{k: data[f"{k}_{i}"] for k in LAYOUT} for i in range(int(data["count"]))]
-    jobs = [(layout, draws, seed * 1_000_003 + i) for i, layout in enumerate(layouts)]
+    jobs = [(layout, draws, seed * 1_000_003 + i, pop_up) for i, layout in enumerate(layouts)]
     arrays, kept, failed = {}, 0, 0
     with mp.get_context("spawn").Pool(workers) as pool:
         for done, (scenarios, fails) in enumerate(pool.imap(solve, jobs, chunksize=4), 1):
